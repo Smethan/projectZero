@@ -21,13 +21,15 @@ static int esp_console_cmd_register(const esp_console_cmd_t *c){return 0;}
 typedef int portMUX_TYPE;
 #define portENTER_CRITICAL(x) ((void)0)
 #define portEXIT_CRITICAL(x) ((void)0)
-typedef struct {int size,count,head;uint8_t *data;} StaticQueue_t;
+typedef struct {int size,count,head,capacity;uint8_t *data;} StaticQueue_t;
 typedef StaticQueue_t *QueueHandle_t;
 static int64_t test_clock;
 static int64_t esp_timer_get_time(void){return test_clock*1000;}
-static QueueHandle_t xQueueCreateStatic(int n,int size,uint8_t *data,StaticQueue_t *q){*q=(StaticQueue_t){.size=size,.data=data};return q;}
-static int xQueueSend(QueueHandle_t q,const void *p,int ticks){if(q->count>=64)return 0;memcpy(q->data+((q->head+q->count)%64)*q->size,p,q->size);q->count++;return 1;}
-static int xQueueReceive(QueueHandle_t q,void *p,int ticks){test_clock+=ticks;if(!q->count)return 0;memcpy(p,q->data+q->head*q->size,q->size);q->head=(q->head+1)%64;q->count--;return 1;}
+static QueueHandle_t xQueueCreateStatic(int n,int size,uint8_t *data,StaticQueue_t *q){*q=(StaticQueue_t){.size=size,.data=data,.capacity=n};return q;}
+static QueueHandle_t xQueueCreate(int n,int size){QueueHandle_t q=malloc(sizeof(*q));return xQueueCreateStatic(n,size,calloc(n,size),q);}
+static void vQueueDelete(QueueHandle_t q){free(q->data);free(q);}
+static int xQueueSend(QueueHandle_t q,const void *p,int ticks){if(q->count>=q->capacity)return 0;memcpy(q->data+((q->head+q->count)%q->capacity)*q->size,p,q->size);q->count++;return 1;}
+static int xQueueReceive(QueueHandle_t q,void *p,int ticks){test_clock+=ticks;if(!q->count)return 0;memcpy(p,q->data+q->head*q->size,q->size);q->head=(q->head+1)%q->capacity;q->count--;return 1;}
 static int uxQueueMessagesWaiting(QueueHandle_t q){return q->count;}
 static void xQueueReset(QueueHandle_t q){q->head=q->count=0;}
 static void (*test_task)(void*);
@@ -36,7 +38,9 @@ static int xTaskCreate(void (*f)(void*),const char *name,int stack,void *arg,int
 static void vTaskDelay(int ms){test_clock+=ms;}
 static void vTaskDelete(void *task){}
 #define WIFI_PKT_MGMT 0
+#define WIFI_PKT_DATA 1
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
+#define WIFI_PROMIS_FILTER_MASK_DATA 2
 typedef int wifi_promiscuous_pkt_type_t;
 typedef struct {int filter_mask;} wifi_promiscuous_filter_t;
 typedef struct {struct {int sig_len;uint8_t channel;int8_t rssi;}rx_ctrl;uint8_t payload[512];}wifi_promiscuous_pkt_t;

@@ -6501,6 +6501,7 @@ bool sw_prepare(void) { return cmd_stop(0, NULL) == 0; }
 static wifi_band_mode_t sw_saved_band;
 static wifi_promiscuous_filter_t sw_saved_filter;
 static bool sw_saved_radio;
+static wifi_mode_t sw_saved_mode;
 bool sw_radio_start(void) {
     /* Console ownership gate prevents new operations during this transition. */
     if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
@@ -6509,7 +6510,15 @@ bool sw_radio_start(void) {
     sw_saved_radio = true;
     esp_wifi_get_band_mode(&sw_saved_band);
     esp_wifi_get_promiscuous_filter(&sw_saved_filter);
+    esp_wifi_get_mode(&sw_saved_mode);
+    if (sw_hs_mode()) {
+        /* NULL mode has no STA/AP traffic: no probes, association or deauth.
+         * The serial ownership gate keeps other radio commands out. */
+        if (nimble_initialized) bt_stop_scan();
+        if (esp_wifi_set_mode(WIFI_MODE_NULL) != ESP_OK) return false;
+    }
     if (esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO) != ESP_OK) return false;
+    if (sw_hs_mode()) return true;
     if (bt_nimble_init() != ESP_OK) return false;
     return bt_start_scan_coex() == 0;
 }
@@ -6525,6 +6534,7 @@ void sw_radio_stop(void) {
     if (nimble_initialized) bt_stop_scan();
     esp_wifi_set_promiscuous_filter(&sw_saved_filter);
     esp_wifi_set_band_mode(sw_saved_band);
+    if (sw_hs_mode()) esp_wifi_set_mode(sw_saved_mode);
     sw_saved_radio = false;
 }
 
@@ -24155,5 +24165,4 @@ static bool is_bssid_whitelisted(const uint8_t *bssid) {
     
     return false;
 }
-
 

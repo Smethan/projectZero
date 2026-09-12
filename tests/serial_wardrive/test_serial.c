@@ -43,5 +43,26 @@ int main(void){
     fresh();char *bad[]={"wardrive_keepalive","other"};assert(keepalive(2,bad)==1);
     test_clock+=500;char *good[]={"wardrive_keepalive","fixture"};assert(keepalive(2,good)==0);assert(atomic_load(&lease)==test_clock);
     atomic_store(&stopping,true);test_task(NULL);assert(!strstr(output_capture,"started"));assert(strstr(output_capture,"stopped"));
-    puts("PASS: WiFi/BLE framing, management roles, malformed frames, dedup updates, queue overflow, age drops, backpressure, lease, partial startup, stop during start");
+    char *hs_args[]={"start_hs_sniff_serial","passive"};
+    assert(start(2,hs_args)==0 && sw_hs_mode());
+    atomic_store(&collecting,true);output_capture[0]=0;
+    wifi_promiscuous_pkt_t hs={.rx_ctrl={.sig_len=340,.channel=6,.rssi=-50}};
+    hs.payload[0]=0x08;hs.payload[1]=2;
+    uint8_t llc[]={0xaa,0xaa,3,0,0,0,0x88,0x8e};memcpy(hs.payload+24,llc,8);
+    hs.payload[32]=2;hs.payload[33]=3;hs.payload[34]=1;hs.payload[35]=44;
+    assert(hs_capture_kind(hs.payload,336)==2);
+    assert(hs_capture_kind(hs.payload,335)==0); /* truncated declared EAPOL */
+    hs.payload[1]|=0x40;assert(!hs_capture_kind(hs.payload,336));hs.payload[1]=2;
+    hs_wifi_cb(&hs,WIFI_PKT_DATA);hs_observation raw;assert(xQueueReceive(hs_queue,&raw,0));
+    assert(raw.len==336);hs_emit(&raw);
+    assert(strstr(output_capture,"\"kind\":\"hs_packet\"") && strstr(output_capture,"\"offset\":240"));
+    assert(!strstr(output_capture,"\"kind\":\"ble\""));
+    hs.payload[30]=0x08;assert(!hs_capture_kind(hs.payload,336));hs.payload[30]=0x88;
+    for(int i=0;i<10;i++) hs_wifi_cb(&hs,WIFI_PKT_DATA);
+    assert(uxQueueMessagesWaiting(hs_queue)==8 && atomic_load(&drops)>=2);
+    atomic_store(&stopping,true);test_task(NULL);assert(!sw_active() && hs_queue==NULL);
+    assert(strstr(output_capture,"stopped"));
+    task_ok=0;assert(start(2,hs_args)==1 && hs_queue==NULL && !sw_active());task_ok=1;
+    fresh();assert(!sw_hs_mode());atomic_store(&stopping,true);test_task(NULL);
+    puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, mode transitions");
 }

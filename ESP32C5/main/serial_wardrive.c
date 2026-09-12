@@ -1,5 +1,6 @@
 /* Host-owned GPS/SD-free coexistence capture. No allocations or I/O in callbacks. */
 #include "serial_wardrive.h"
+#include "hs_capture.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -15,6 +16,18 @@
 #define QLEN 64
 #define CACHE 128
 static atomic_bool active, stopping, collecting;
+static bool passive_hs;
+bool sw_hs_mode(void) { return passive_hs; }
+#define HS_MAX_FRAME 2304
+typedef struct {
+    int64_t at;
+    uint16_t len;
+    uint8_t channel;
+    int8_t rssi;
+    uint8_t data[HS_MAX_FRAME];
+} hs_observation;
+static QueueHandle_t hs_queue;
+static unsigned packet_id;
 static atomic_uint drops, wifi_count, ble_count, producers;
 static atomic_llong lease;
 static StaticQueue_t queue_storage;
@@ -106,6 +119,7 @@ static void wifi_cb(void *buf,wifi_promiscuous_pkt_type_t type) {
     atomic_fetch_add(&wifi_count,1); offer(&o);
 }
 void sw_ble(const uint8_t *addr,uint8_t type,int rssi,uint8_t event,const uint8_t *data,size_t len) {
+    if (passive_hs) return;
     observation o={.kind=2,.addr_type=type,.rssi=rssi,.event=event,.len=len>62?62:len};
     for(int i=0;i<6;i++) o.addr[i]=addr[5-i]; /* NimBLE is little-endian */
     memcpy(o.data,data,o.len); atomic_fetch_add(&ble_count,1); offer(&o);
@@ -129,17 +143,66 @@ static void emit(const observation *o) {
         }
     }
 }
+static void hs_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!atomic_load(&collecting) || !buf ||
+        (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA)) return;
+    atomic_fetch_add(&producers, 1);
+    const wifi_promiscuous_pkt_t *p = buf;
+    /* sig_len includes the four-byte FCS; PCAP uses plain 802.11 without FCS. */
+    unsigned n = p->rx_ctrl.sig_len;
+    if (n < 4) goto done;
+    n -= 4;
+    int kind = hs_capture_kind(p->payload, n);
+    if (!kind) goto done;
+    if (n > HS_MAX_FRAME) { atomic_fetch_add(&drops, 1); goto done; }
+    /* Limit repeated beacons, but never suppress EAPOL or association frames. */
+    unsigned subtype = p->payload[0] >> 4;
+    if (kind == 1 && (subtype == 8 || subtype == 5)) {
+        uint32_t hash = 2166136261u;
+        /* Ignore timestamp/sequence changes; include BSSID and tagged fields. */
+        for (unsigned i = 10; i < 22; i++) hash = (hash ^ p->payload[i]) * 16777619u;
+        for (unsigned i = 36; i < n; i++) hash = (hash ^ p->payload[i]) * 16777619u;
+        unsigned slot = hash % CACHE;
+        int64_t now = now_ms();
+        if (seen[slot].hash == hash && now - seen[slot].at < 10000) goto done;
+        seen[slot].hash = hash; seen[slot].at = now;
+    }
+    hs_observation o = {.at=now_ms(), .len=n, .channel=p->rx_ctrl.channel, .rssi=p->rx_ctrl.rssi};
+    memcpy(o.data, p->payload, n);
+    if (xQueueSend(hs_queue, &o, 0) != pdTRUE) atomic_fetch_add(&drops, 1);
+    else atomic_fetch_add(&wifi_count, 1);
+done:
+    atomic_fetch_sub(&producers, 1);
+}
+static void hs_emit(const hs_observation *o) {
+    unsigned id = ++packet_id;
+    for (unsigned offset = 0; offset < o->len; offset += 240) {
+        int64_t age = now_ms() - o->at;
+        if (age > 2000) { atomic_fetch_add(&drops, 1); return; }
+        unsigned size = o->len-offset < 240 ? o->len-offset : 240;
+        char data[481], body[900];
+        hex(data, o->data+offset, size);
+        snprintf(body, sizeof(body), "{\"v\":1,\"kind\":\"hs_packet\",\"session\":\"%s\",\"seq\":%u,\"packet\":%u,\"offset\":%u,\"total\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"channel\":%u,\"rssi\":%d,\"data_hex\":\"%s\"}",
+                 session, ++seq, id, offset, o->len, (long long)o->at, (long long)age, o->channel, o->rssi, data);
+        output(body);
+    }
+}
 static void worker(void *unused) {
     bool ready=sw_radio_start();
-    wifi_promiscuous_filter_t filter={.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT};
-    if(ready) ready=esp_wifi_set_promiscuous_filter(&filter)==ESP_OK && esp_wifi_set_promiscuous_rx_cb(wifi_cb)==ESP_OK && esp_wifi_set_promiscuous(true)==ESP_OK;
+    wifi_promiscuous_filter_t filter={.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT | (passive_hs ? WIFI_PROMIS_FILTER_MASK_DATA : 0)};
+    if(ready) ready=esp_wifi_set_promiscuous_filter(&filter)==ESP_OK && esp_wifi_set_promiscuous_rx_cb(passive_hs ? hs_wifi_cb : wifi_cb)==ESP_OK && esp_wifi_set_promiscuous(true)==ESP_OK;
     if(ready && !atomic_load(&stopping)) {
         atomic_store(&collecting,true); status("started","");
         int64_t stats=now_ms(),hop=0; unsigned index=0;
         while(!atomic_load(&stopping) && now_ms()-atomic_load(&lease)<15000) {
             if(now_ms()-hop>=160) { sw_radio_hop(index++); hop=now_ms(); }
-            observation o;
-            if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) emit(&o);
+            if (passive_hs) {
+                hs_observation o;
+                if(xQueueReceive(hs_queue,&o,pdMS_TO_TICKS(10))==pdTRUE) hs_emit(&o);
+            } else {
+                observation o;
+                if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) emit(&o);
+            }
             if(now_ms()-stats>=2000) { status("stats",""); stats=now_ms(); }
         }
     } else if(!ready) status("error",",\"message\":\"radio_start_failed\"");
@@ -147,8 +210,16 @@ static void worker(void *unused) {
     sw_radio_stop();
     /* Radio callbacks never wait, so outstanding copies finish promptly. */
     while(atomic_load(&producers)) vTaskDelay(1);
-    unsigned discarded=uxQueueMessagesWaiting(queue);
-    atomic_fetch_add(&drops,discarded); xQueueReset(queue);
+    if (passive_hs) {
+        int64_t deadline = now_ms() + 1500;
+        hs_observation o;
+        while (now_ms() < deadline && xQueueReceive(hs_queue, &o, 0) == pdTRUE) hs_emit(&o);
+        atomic_fetch_add(&drops, uxQueueMessagesWaiting(hs_queue));
+        vQueueDelete(hs_queue); hs_queue = NULL;
+    } else {
+        unsigned discarded=uxQueueMessagesWaiting(queue);
+        atomic_fetch_add(&drops,discarded); xQueueReset(queue);
+    }
     status("stopped","");
     atomic_store(&active,false);
     vTaskDelete(NULL);
@@ -164,12 +235,18 @@ static int start(int argc,char **argv) {
     for(char *p=argv[1];*p;p++) if(!isalnum((unsigned char)*p) && *p!='-' && *p!='_') return 1;
     if(sw_active()) return 1;
     if(!sw_prepare()) return 1;
+    passive_hs = !strcmp(argv[0], "start_hs_sniff_serial");
+    if (passive_hs) {
+        hs_queue = xQueueCreate(8, sizeof(hs_observation));
+        if (!hs_queue) return 1;
+    }
     if(!queue) queue=xQueueCreateStatic(QLEN,sizeof(observation),queue_bytes,&queue_storage);
     xQueueReset(queue); memset(seen,0,sizeof(seen));
-    strcpy(session,argv[1]); seq=0;
+    strcpy(session,argv[1]); seq=0; packet_id=0;
     atomic_store(&drops,0); atomic_store(&wifi_count,0); atomic_store(&ble_count,0);
     atomic_store(&lease,now_ms()); atomic_store(&stopping,false); atomic_store(&active,true);
-    if(xTaskCreate(worker,"serial_wardrive",6144,NULL,4,NULL)!=pdPASS) {
+    if(xTaskCreate(worker,"serial_wardrive",passive_hs ? 10240 : 6144,NULL,4,NULL)!=pdPASS) {
+        if (hs_queue) { vQueueDelete(hs_queue); hs_queue = NULL; }
         status("error",",\"message\":\"task_allocation_failed\""); atomic_store(&active,false); return 1;
     }
     return 0;
@@ -179,7 +256,7 @@ static int keepalive(int argc,char **argv) {
     atomic_store(&lease,now_ms()); return 0;
 }
 static int capabilities(int argc,char **argv) {
-    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"hs_sniff_serial_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 /* All main console commands share an ownership gate, including attack commands.
  * Registration retains the original handlers and changes no idle behavior. */
@@ -203,7 +280,8 @@ esp_err_t sw_register_command(const esp_console_cmd_t *cmd) {
 void sw_register(void) {
     const esp_console_cmd_t cmds[]={
         {.command="start_wardrive_serial",.help="WiFi + BLE over serial, no GPS/SD: <session>",.func=start},
+        {.command="start_hs_sniff_serial",.help="Passive EAPOL/PMKID and management PCAP over serial, no SD: <session>",.func=start},
         {.command="wardrive_keepalive",.help="Renew serial session lease: <session>",.func=keepalive},
         {.command="get_capabilities",.help="Machine-readable serial capabilities",.func=capabilities}};
-    for(unsigned i=0;i<3;i++) ESP_ERROR_CHECK(sw_register_command(&cmds[i]));
+    for(unsigned i=0;i<sizeof(cmds)/sizeof(cmds[0]);i++) ESP_ERROR_CHECK(sw_register_command(&cmds[i]));
 }
