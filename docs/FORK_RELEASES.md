@@ -13,8 +13,8 @@ value into the binary metadata. Update `docs/RELEASE_NOTES.md` before tagging.
 git switch main
 git pull --ff-only
 # Edit JANOS_VERSION and release notes; commit and push the source changes.
-git tag v1.7.2
-git push origin v1.7.2
+git tag v1.7.3
+git push origin v1.7.3
 ```
 
 A manual workflow dispatch on main builds and checks both boards without

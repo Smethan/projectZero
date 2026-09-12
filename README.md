@@ -1,12 +1,20 @@
-# projectZero (LOCOSP fork)
+# projectZero (Smethan fork of LOCOSP)
+
+Custom WDG features and update configuration live on **main**. See
+[fork release instructions](docs/FORK_RELEASES.md) for the free GitHub Actions
+workflow and [Smethan WatchDogsGo](https://github.com/Smethan/WatchDogsGo) for
+the uConsole host application.
 
 > Fork of [C5Lab/projectZero](https://github.com/C5Lab/projectZero) with additional features for headless (no SD card) operation and serial-based data streaming, built for use with [JanOS-app](https://github.com/LOCOSP/JanOS-app) TUI.
 
 ## Downloads
-- **Latest firmware:** [GitHub Releases](https://github.com/LOCOSP/projectZero/releases/latest)
+- **Latest firmware:** [GitHub Releases](https://github.com/Smethan/projectZero/releases/latest)
 - **Upstream project:** [C5Lab/projectZero](https://github.com/C5Lab/projectZero)
 
 ### What this fork adds
+- **All Wardrive** — host-owned Wi-Fi/BLE scanning over serial without ESP GPS/SD.
+- **Passive HS Sniff** — EAPOL/PMKID packets streamed to WDG without deauth or SD.
+- **Fork updates** — versioned XIAO/standard release packages and matching onboard OTA.
 - **Handshake capture without SD card** — PCAP/HCCAPX streamed as base64 over serial, saved on the host machine
 - **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
 - **SSID with spaces** in `start_portal` command
