@@ -1,4 +1,4 @@
-idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c" 
+idf_component_register(SRCS "oled_display.c" "main.c" "serial_wardrive.c" "attack_handshake.c" 
                        INCLUDE_DIRS .
                        REQUIRES esp_timer esp_wifi esp_event esp_psram nvs_flash 
                                 console driver fatfs mbedtls esp-tls esp_http_server 
@@ -6,7 +6,7 @@ idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
                                 lwip sdmmc espressif__led_strip bt
                                 frame_analyzer hccapx_serializer pcap_serializer sniffer
                                 nrf24_jammer zig_recon
-                                esp_driver_uart esp_driver_gpio esp_driver_spi esp_driver_sdspi
+                                esp_driver_usb_serial_jtag esp_driver_uart esp_driver_gpio esp_driver_spi esp_driver_sdspi
                                 esp_lcd esp_driver_i2c)
 
 # Suppress strict null-pointer warnings from GCC 15 in IDF v6.0

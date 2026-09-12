@@ -1,3 +1,4 @@
+#include "serial_wardrive.h"
 // main.c
 #include <stdio.h>
 #include <string.h>
@@ -6496,6 +6497,37 @@ cleanup:
     vTaskDelete(NULL);
 }
 
+bool sw_prepare(void) { return cmd_stop(0, NULL) == 0; }
+static wifi_band_mode_t sw_saved_band;
+static wifi_promiscuous_filter_t sw_saved_filter;
+static bool sw_saved_radio;
+bool sw_radio_start(void) {
+    /* Console ownership gate prevents new operations during this transition. */
+    if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
+        handshake_attack_active || antisurv_active) return false;
+    if (!ensure_wifi_mode()) return false;
+    sw_saved_radio = true;
+    esp_wifi_get_band_mode(&sw_saved_band);
+    esp_wifi_get_promiscuous_filter(&sw_saved_filter);
+    if (esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO) != ESP_OK) return false;
+    if (bt_nimble_init() != ESP_OK) return false;
+    return bt_start_scan_coex() == 0;
+}
+void sw_radio_hop(unsigned index) {
+    static const uint8_t channels[] = {1,6,11,2,3,4,5,7,8,9,10,12,13,
+        36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+    esp_wifi_set_channel(channels[index % sizeof(channels)], WIFI_SECOND_CHAN_NONE);
+}
+void sw_radio_stop(void) {
+    if (!sw_saved_radio) return;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (nimble_initialized) bt_stop_scan();
+    esp_wifi_set_promiscuous_filter(&sw_saved_filter);
+    esp_wifi_set_band_mode(sw_saved_band);
+    sw_saved_radio = false;
+}
+
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
     (void)argc; (void)argv;
     wardrive_promisc_trace_enabled = trace_enabled;
@@ -11435,6 +11467,7 @@ static int cmd_start_beacon_spam_ssids(int argc, char **argv) {
 }
 
 static int cmd_stop(int argc, char **argv) {
+    if (!sw_stop()) { printf("Serial stop timed out; retry stop.\n"); return 1; }
     (void)argc; (void)argv;
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
@@ -19651,6 +19684,10 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     struct ble_gap_disc_desc *desc = &event->disc;
+    if (sw_active()) {
+        sw_ble(desc->addr.val, desc->addr.type, desc->rssi, desc->event_type, desc->data, desc->length_data);
+        return 0;
+    }
     
     // MAC tracking mode - update RSSI and name for tracked device
     if (bt_tracking_mode) {
@@ -20384,7 +20421,7 @@ static void register_commands(void)
         .func = &cmd_scan_networks,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&scan_cmd));
 
     const esp_console_cmd_t show_scan_cmd = {
         .command = "show_scan_results",
@@ -20393,7 +20430,7 @@ static void register_commands(void)
         .func = &cmd_show_scan_results,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_scan_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_scan_cmd));
 
     const esp_console_cmd_t inspect_cmd = {
         .command = "inspect_network",
@@ -20402,7 +20439,7 @@ static void register_commands(void)
         .func = &cmd_inspect_network,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&inspect_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&inspect_cmd));
     
 
     const esp_console_cmd_t sniffer_cmd = {
@@ -20412,7 +20449,7 @@ static void register_commands(void)
         .func = &cmd_start_sniffer,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sniffer_cmd));
 
     const esp_console_cmd_t sniffer_noscan_cmd = {
         .command = "start_sniffer_noscan",
@@ -20421,7 +20458,7 @@ static void register_commands(void)
         .func = &cmd_start_sniffer_noscan,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sniffer_noscan_cmd));
 
     const esp_console_cmd_t packet_monitor_cmd = {
         .command = "packet_monitor",
@@ -20430,9 +20467,9 @@ static void register_commands(void)
         .func = &cmd_packet_monitor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&packet_monitor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&packet_monitor_cmd));
 
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ap_locator_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ap_locator_cmd));
 
     const esp_console_cmd_t channel_view_cmd = {
         .command = "channel_view",
@@ -20441,7 +20478,7 @@ static void register_commands(void)
         .func = &cmd_channel_view,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&channel_view_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&channel_view_cmd));
 
 
     const esp_console_cmd_t show_sniffer_cmd = {
@@ -20451,7 +20488,7 @@ static void register_commands(void)
         .func = &cmd_show_sniffer_results,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_sniffer_cmd));
     const esp_console_cmd_t show_sniffer_vendor_cmd = {
         .command = "show_sniffer_results_vendor",
         .help = "Shows sniffer results sorted by client count with vendors",
@@ -20459,7 +20496,7 @@ static void register_commands(void)
         .func = &cmd_show_sniffer_results_vendor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_vendor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_sniffer_vendor_cmd));
 
     const esp_console_cmd_t clear_sniffer_cmd = {
         .command = "clear_sniffer_results",
@@ -20468,7 +20505,7 @@ static void register_commands(void)
         .func = &cmd_clear_sniffer_results,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&clear_sniffer_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&clear_sniffer_cmd));
 
     const esp_console_cmd_t show_probes_cmd = {
         .command = "show_probes",
@@ -20477,7 +20514,7 @@ static void register_commands(void)
         .func = &cmd_show_probes,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_probes_cmd));
     const esp_console_cmd_t show_probes_vendor_cmd = {
         .command = "show_probes_vendor",
         .help = "Shows captured probe requests with SSIDs and vendors",
@@ -20485,7 +20522,7 @@ static void register_commands(void)
         .func = &cmd_show_probes_vendor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_vendor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_probes_vendor_cmd));
 
     const esp_console_cmd_t list_probes_cmd = {
         .command = "list_probes",
@@ -20494,7 +20531,7 @@ static void register_commands(void)
         .func = &cmd_list_probes,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_probes_cmd));
     const esp_console_cmd_t list_probes_vendor_cmd = {
         .command = "list_probes_vendor",
         .help = "Lists probe requests with index, SSID, and vendor",
@@ -20502,7 +20539,7 @@ static void register_commands(void)
         .func = &cmd_list_probes_vendor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_vendor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_probes_vendor_cmd));
 
     const esp_console_cmd_t sniffer_debug_cmd = {
         .command = "sniffer_debug",
@@ -20511,7 +20548,7 @@ static void register_commands(void)
         .func = &cmd_sniffer_debug,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_debug_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sniffer_debug_cmd));
 
     const esp_console_cmd_t sniffer_dog_cmd = {
         .command = "start_sniffer_dog",
@@ -20520,7 +20557,7 @@ static void register_commands(void)
         .func = &cmd_start_sniffer_dog,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_dog_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sniffer_dog_cmd));
 
     const esp_console_cmd_t deauth_detector_cmd = {
         .command = "deauth_detector",
@@ -20529,7 +20566,7 @@ static void register_commands(void)
         .func = &cmd_deauth_detector,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_detector_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&deauth_detector_cmd));
 
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
@@ -20538,7 +20575,7 @@ static void register_commands(void)
         .func = &cmd_select_networks,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&select_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&select_cmd));
 
     const esp_console_cmd_t unselect_cmd = {
         .command = "unselect_networks",
@@ -20547,7 +20584,7 @@ static void register_commands(void)
         .func = &cmd_unselect_networks,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&unselect_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&unselect_cmd));
 
     const esp_console_cmd_t select_stations_cmd = {
         .command = "select_stations",
@@ -20556,7 +20593,7 @@ static void register_commands(void)
         .func = &cmd_select_stations,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&select_stations_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&select_stations_cmd));
 
     const esp_console_cmd_t unselect_stations_cmd = {
         .command = "unselect_stations",
@@ -20565,7 +20602,7 @@ static void register_commands(void)
         .func = &cmd_unselect_stations,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&unselect_stations_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&unselect_stations_cmd));
 
     const esp_console_cmd_t start_cmd = {
         .command = "start_evil_twin",
@@ -20574,7 +20611,7 @@ static void register_commands(void)
         .func = &cmd_start_evil_twin,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&start_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&start_cmd));
 
     const esp_console_cmd_t deauth_cmd = {
         .command = "start_deauth",
@@ -20583,7 +20620,7 @@ static void register_commands(void)
         .func = &cmd_start_deauth,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&deauth_cmd));
 
     const esp_console_cmd_t handshake_cmd = {
         .command = "start_handshake",
@@ -20592,7 +20629,7 @@ static void register_commands(void)
         .func = &cmd_start_handshake,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&handshake_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&handshake_cmd));
 
     const esp_console_cmd_t save_handshake_cmd = {
         .command = "save_handshake",
@@ -20601,7 +20638,7 @@ static void register_commands(void)
         .func = &cmd_save_handshake,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&save_handshake_cmd));
 
     const esp_console_cmd_t handshake_serial_cmd = {
         .command = "start_handshake_serial",
@@ -20610,7 +20647,7 @@ static void register_commands(void)
         .func = &cmd_start_handshake_serial,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&handshake_serial_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&handshake_serial_cmd));
 
     const esp_console_cmd_t wpasec_key_cmd = {
         .command = "wpasec_key",
@@ -20619,7 +20656,7 @@ static void register_commands(void)
         .func = &cmd_wpasec_key,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_key_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wpasec_key_cmd));
 
     const esp_console_cmd_t wpasec_upload_cmd = {
         .command = "wpasec_upload",
@@ -20628,7 +20665,7 @@ static void register_commands(void)
         .func = &cmd_wpasec_upload,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_upload_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wpasec_upload_cmd));
 
     const esp_console_cmd_t wigle_key_cmd = {
         .command = "wigle_key",
@@ -20637,7 +20674,7 @@ static void register_commands(void)
         .func = &cmd_wigle_key,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_key_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wigle_key_cmd));
 
     const esp_console_cmd_t wigle_upload_cmd = {
         .command = "wigle_upload",
@@ -20646,7 +20683,7 @@ static void register_commands(void)
         .func = &cmd_wigle_upload,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_upload_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wigle_upload_cmd));
 
     const esp_console_cmd_t wdgwars_key_cmd = {
         .command = "wdgwars_key",
@@ -20655,7 +20692,7 @@ static void register_commands(void)
         .func = &cmd_wdgwars_key,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_key_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wdgwars_key_cmd));
 
     const esp_console_cmd_t wdgwars_upload_cmd = {
         .command = "wdgwars_upload",
@@ -20664,7 +20701,7 @@ static void register_commands(void)
         .func = &cmd_wdgwars_upload,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_upload_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wdgwars_upload_cmd));
 
     const esp_console_cmd_t upload_state_cmd = {
         .command = "upload_state",
@@ -20673,7 +20710,7 @@ static void register_commands(void)
         .func = &cmd_upload_state,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&upload_state_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&upload_state_cmd));
 
     const esp_console_cmd_t wardrive_files_cmd = {
         .command = "wardrive_files",
@@ -20682,7 +20719,7 @@ static void register_commands(void)
         .func = &cmd_wardrive_files,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_files_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_files_cmd));
 
     const esp_console_cmd_t wardrive_cleanup_cmd = {
         .command = "wardrive_cleanup",
@@ -20691,7 +20728,7 @@ static void register_commands(void)
         .func = &cmd_wardrive_cleanup,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cleanup_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_cleanup_cmd));
 
     const esp_console_cmd_t wardrive_fix_cmd = {
         .command = "wardrive_fix",
@@ -20700,7 +20737,7 @@ static void register_commands(void)
         .func = &cmd_wardrive_fix,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_fix_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_fix_cmd));
 
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
@@ -20709,7 +20746,7 @@ static void register_commands(void)
         .func = &cmd_start_sae_overflow,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sae_overflow_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sae_overflow_cmd));
 
     const esp_console_cmd_t blackout_cmd = {
         .command = "start_blackout",
@@ -20718,7 +20755,7 @@ static void register_commands(void)
         .func = &cmd_start_blackout,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&blackout_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&blackout_cmd));
 
     const esp_console_cmd_t beacon_spam_cmd = {
         .command = "start_beacon_spam",
@@ -20727,7 +20764,7 @@ static void register_commands(void)
         .func = &cmd_start_beacon_spam,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&beacon_spam_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&beacon_spam_cmd));
 
     const esp_console_cmd_t beacon_spam_ssids_cmd = {
         .command = "start_beacon_spam_ssids",
@@ -20736,7 +20773,7 @@ static void register_commands(void)
         .func = &cmd_start_beacon_spam_ssids,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&beacon_spam_ssids_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&beacon_spam_ssids_cmd));
 
     const esp_console_cmd_t gps_raw_cmd = {
         .command = "start_gps_raw",
@@ -20745,7 +20782,7 @@ static void register_commands(void)
         .func = &cmd_start_gps_raw,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&gps_raw_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&gps_raw_cmd));
 
     const esp_console_cmd_t gps_set_cmd = {
         .command = "gps_set",
@@ -20754,7 +20791,7 @@ static void register_commands(void)
         .func = &cmd_gps_set,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&gps_set_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&gps_set_cmd));
 
     const esp_console_cmd_t set_gps_position_cmd = {
         .command = "set_gps_position",
@@ -20763,7 +20800,7 @@ static void register_commands(void)
         .func = &cmd_set_gps_position,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_gps_position_cmd));
 
     const esp_console_cmd_t set_gps_position_cap_cmd = {
         .command = "set_gps_position_cap",
@@ -20772,7 +20809,7 @@ static void register_commands(void)
         .func = &cmd_set_gps_position_cap,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cap_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_gps_position_cap_cmd));
 
     const esp_console_cmd_t wardrive_cmd = {
         .command = "start_wardrive",
@@ -20781,7 +20818,7 @@ static void register_commands(void)
         .func = &cmd_start_wardrive,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_cmd));
 
     const esp_console_cmd_t get_wardrive_config_cmd = {
         .command = "get_wardrive_config",
@@ -20790,7 +20827,7 @@ static void register_commands(void)
         .func = &cmd_get_wardrive_config,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&get_wardrive_config_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&get_wardrive_config_cmd));
 
     const esp_console_cmd_t set_wardrive_bands_cmd = {
         .command = "set_wardrive_bands",
@@ -20799,7 +20836,7 @@ static void register_commands(void)
         .func = &cmd_set_wardrive_bands,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_bands_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_wardrive_bands_cmd));
 
     const esp_console_cmd_t set_wardrive_channels_cmd = {
         .command = "set_wardrive_channels",
@@ -20808,7 +20845,7 @@ static void register_commands(void)
         .func = &cmd_set_wardrive_channels,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_channels_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_wardrive_channels_cmd));
 
     const esp_console_cmd_t set_wardrive_rssi_delta_cmd = {
         .command = "set_wardrive_rssi_delta",
@@ -20817,7 +20854,7 @@ static void register_commands(void)
         .func = &cmd_set_wardrive_rssi_delta,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_rssi_delta_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_wardrive_rssi_delta_cmd));
 
     const esp_console_cmd_t set_wardrive_memcap_cmd = {
         .command = "set_wardrive_memcap",
@@ -20826,7 +20863,7 @@ static void register_commands(void)
         .func = &cmd_set_wardrive_memcap,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_memcap_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_wardrive_memcap_cmd));
 
     const esp_console_cmd_t set_wardrive_cooldown_cmd = {
         .command = "set_wardrive_cooldown",
@@ -20835,7 +20872,7 @@ static void register_commands(void)
         .func = &cmd_set_wardrive_cooldown,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_cooldown_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_wardrive_cooldown_cmd));
 
     const esp_console_cmd_t wardrive_blacklist_cmd = {
         .command = "wardrive_blacklist",
@@ -20844,7 +20881,7 @@ static void register_commands(void)
         .func = &cmd_wardrive_blacklist,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_blacklist_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_blacklist_cmd));
 
     const esp_console_cmd_t start_antisurv_cmd = {
         .command = "start_antisurveillance",
@@ -20853,7 +20890,7 @@ static void register_commands(void)
         .func = &cmd_start_antisurveillance,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&start_antisurv_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&start_antisurv_cmd));
 
     const esp_console_cmd_t set_antisurv_sens_cmd = {
         .command = "set_antisurv_sensitivity",
@@ -20862,7 +20899,9 @@ static void register_commands(void)
         .func = &cmd_set_antisurv_sensitivity,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_antisurv_sens_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_antisurv_sens_cmd));
+
+    sw_register();
 
     const esp_console_cmd_t wardrive_promisc_cmd = {
         .command = "start_wardrive_promisc",
@@ -20871,7 +20910,7 @@ static void register_commands(void)
         .func = &cmd_start_wardrive_promisc,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_promisc_cmd));
 
     const esp_console_cmd_t wardrive_promisc_trace_cmd = {
         .command = "start_wardrive_promisc_trace",
@@ -20880,7 +20919,7 @@ static void register_commands(void)
         .func = &cmd_start_wardrive_promisc_trace,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_trace_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wardrive_promisc_trace_cmd));
 
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
@@ -20889,7 +20928,7 @@ static void register_commands(void)
         .func = &cmd_start_portal,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&portal_cmd));
 
     const esp_console_cmd_t darksword_cmd = {
         .command = "start_darksword",
@@ -20898,7 +20937,7 @@ static void register_commands(void)
         .func = &cmd_start_darksword,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&darksword_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&darksword_cmd));
 
     const esp_console_cmd_t rogueap_cmd = {
         .command = "start_rogueap",
@@ -20907,7 +20946,7 @@ static void register_commands(void)
         .func = &cmd_start_rogueap,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&rogueap_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&rogueap_cmd));
 
     const esp_console_cmd_t karma_cmd = {
         .command = "start_karma",
@@ -20916,7 +20955,7 @@ static void register_commands(void)
         .func = &cmd_start_karma,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&karma_cmd));
 
     const esp_console_cmd_t vendor_cmd = {
         .command = "vendor",
@@ -20925,7 +20964,7 @@ static void register_commands(void)
         .func = &cmd_vendor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&vendor_cmd));
 
     const esp_console_cmd_t display_cmd = {
         .command = "display",
@@ -20934,7 +20973,7 @@ static void register_commands(void)
         .func = &cmd_display,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&display_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&display_cmd));
 
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
@@ -20943,7 +20982,7 @@ static void register_commands(void)
         .func = &cmd_boot_button,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&boot_button_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&boot_button_cmd));
 
     const esp_console_cmd_t led_cmd = {
         .command = "led",
@@ -20952,7 +20991,7 @@ static void register_commands(void)
         .func = &cmd_led,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&led_cmd));
 
     const esp_console_cmd_t channel_time_cmd = {
         .command = "channel_time",
@@ -20961,7 +21000,7 @@ static void register_commands(void)
         .func = &cmd_channel_time,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&channel_time_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&channel_time_cmd));
 
     const esp_console_cmd_t download_cmd = {
         .command = "download",
@@ -20970,7 +21009,7 @@ static void register_commands(void)
         .func = &cmd_download,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&download_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&download_cmd));
 
     const esp_console_cmd_t pcap_cmd = {
         .command = "start_pcap",
@@ -20979,7 +21018,7 @@ static void register_commands(void)
         .func = &cmd_start_pcap,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&pcap_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&pcap_cmd));
 
     const esp_console_cmd_t zig_recon_cmd = {
         .command = "start_zig_recon",
@@ -20988,7 +21027,7 @@ static void register_commands(void)
         .func = &cmd_start_zig_recon,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&zig_recon_cmd));
 
     const esp_console_cmd_t zig_recon_status_cmd = {
         .command = "zig_recon_status",
@@ -20997,7 +21036,7 @@ static void register_commands(void)
         .func = &cmd_zig_recon_status,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_status_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&zig_recon_status_cmd));
 
     const esp_console_cmd_t zig_recon_list_cmd = {
         .command = "zig_recon_list",
@@ -21006,7 +21045,7 @@ static void register_commands(void)
         .func = &cmd_zig_recon_list,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_list_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&zig_recon_list_cmd));
 
     const esp_console_cmd_t zig_recon_nodes_cmd = {
         .command = "zig_recon_nodes",
@@ -21015,7 +21054,7 @@ static void register_commands(void)
         .func = &cmd_zig_recon_nodes,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_nodes_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&zig_recon_nodes_cmd));
 
     const esp_console_cmd_t zig_recon_clear_cmd = {
         .command = "zig_recon_clear",
@@ -21024,7 +21063,7 @@ static void register_commands(void)
         .func = &cmd_zig_recon_clear,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_clear_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&zig_recon_clear_cmd));
 
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
@@ -21033,7 +21072,7 @@ static void register_commands(void)
         .func = &cmd_stop,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&stop_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&stop_cmd));
 
     const esp_console_cmd_t init_nrf24_cmd = {
         .command = "init_nrf24",
@@ -21042,7 +21081,7 @@ static void register_commands(void)
         .func = &cmd_init_nrf24,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&init_nrf24_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&init_nrf24_cmd));
 
     const esp_console_cmd_t start_jammer24_cmd = {
         .command = "start_jammer24",
@@ -21051,7 +21090,7 @@ static void register_commands(void)
         .func = &cmd_start_jammer24,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&start_jammer24_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&start_jammer24_cmd));
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
@@ -21060,7 +21099,7 @@ static void register_commands(void)
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wifi_connect_cmd));
 
     const esp_console_cmd_t wifi_disconnect_cmd = {
         .command = "wifi_disconnect",
@@ -21069,7 +21108,7 @@ static void register_commands(void)
         .func = &cmd_wifi_disconnect,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_disconnect_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&wifi_disconnect_cmd));
 
     const esp_console_cmd_t ota_check_cmd = {
         .command = "ota_check",
@@ -21078,7 +21117,7 @@ static void register_commands(void)
         .func = &cmd_ota_check,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_check_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ota_check_cmd));
 
     const esp_console_cmd_t ota_list_cmd = {
         .command = "ota_list",
@@ -21087,7 +21126,7 @@ static void register_commands(void)
         .func = &cmd_ota_list,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_list_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ota_list_cmd));
 
     const esp_console_cmd_t ota_channel_cmd = {
         .command = "ota_channel",
@@ -21096,7 +21135,7 @@ static void register_commands(void)
         .func = &cmd_ota_channel,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_channel_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ota_channel_cmd));
 
     const esp_console_cmd_t ota_info_cmd = {
         .command = "ota_info",
@@ -21105,7 +21144,7 @@ static void register_commands(void)
         .func = &cmd_ota_info,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_info_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ota_info_cmd));
 
     const esp_console_cmd_t ota_boot_cmd = {
         .command = "ota_boot",
@@ -21114,7 +21153,7 @@ static void register_commands(void)
         .func = &cmd_ota_boot,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_boot_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ota_boot_cmd));
 
     const esp_console_cmd_t list_hosts_cmd = {
         .command = "list_hosts",
@@ -21123,7 +21162,7 @@ static void register_commands(void)
         .func = &cmd_list_hosts,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_hosts_cmd));
 
     const esp_console_cmd_t list_hosts_vendor_cmd = {
         .command = "list_hosts_vendor",
@@ -21132,7 +21171,7 @@ static void register_commands(void)
         .func = &cmd_list_hosts_vendor,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_vendor_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_hosts_vendor_cmd));
 
     const esp_console_cmd_t nmap_cmd = {
         .command = "start_nmap",
@@ -21141,7 +21180,7 @@ static void register_commands(void)
         .func = &cmd_start_nmap,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&nmap_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&nmap_cmd));
 
     const esp_console_cmd_t arp_ban_cmd = {
         .command = "arp_ban",
@@ -21150,7 +21189,7 @@ static void register_commands(void)
         .func = &cmd_arp_ban,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&arp_ban_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&arp_ban_cmd));
 
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
@@ -21159,7 +21198,7 @@ static void register_commands(void)
         .func = &cmd_reboot,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&reboot_cmd));
 
     const esp_console_cmd_t ping_cmd = {
         .command = "ping",
@@ -21168,7 +21207,7 @@ static void register_commands(void)
         .func = &cmd_ping,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&ping_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&ping_cmd));
 
     const esp_console_cmd_t version_cmd = {
         .command = "version",
@@ -21177,7 +21216,7 @@ static void register_commands(void)
         .func = &cmd_version,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&version_cmd));
 
     const esp_console_cmd_t list_sd_cmd = {
         .command = "list_sd",
@@ -21186,7 +21225,7 @@ static void register_commands(void)
         .func = &cmd_list_sd,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_sd_cmd));
 
     const esp_console_cmd_t sd_status_cmd = {
         .command = "sd_status",
@@ -21195,7 +21234,7 @@ static void register_commands(void)
         .func = &cmd_sd_status,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_status_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&sd_status_cmd));
 
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
@@ -21204,7 +21243,7 @@ static void register_commands(void)
         .func = &cmd_show_pass,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&show_pass_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&show_pass_cmd));
 
     const esp_console_cmd_t list_dir_cmd = {
         .command = "list_dir",
@@ -21213,7 +21252,7 @@ static void register_commands(void)
         .func = &cmd_list_dir,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_dir_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_dir_cmd));
 
     const esp_console_cmd_t list_ssid_cmd = {
         .command = "list_ssid",
@@ -21222,7 +21261,7 @@ static void register_commands(void)
         .func = &cmd_list_ssid,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssid_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_ssid_cmd));
 
     const esp_console_cmd_t list_ssids_cmd = {
         .command = "list_ssids",
@@ -21231,7 +21270,7 @@ static void register_commands(void)
         .func = &cmd_list_ssids,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssids_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&list_ssids_cmd));
 
     const esp_console_cmd_t add_ssid_cmd = {
         .command = "add_ssid",
@@ -21240,7 +21279,7 @@ static void register_commands(void)
         .func = &cmd_add_ssid,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&add_ssid_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&add_ssid_cmd));
 
     const esp_console_cmd_t remove_ssid_cmd = {
         .command = "remove_ssid",
@@ -21249,7 +21288,7 @@ static void register_commands(void)
         .func = &cmd_remove_ssid,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&remove_ssid_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&remove_ssid_cmd));
 
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
@@ -21258,7 +21297,7 @@ static void register_commands(void)
         .func = &cmd_file_delete,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&file_delete_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&file_delete_cmd));
 
     const esp_console_cmd_t select_html_cmd = {
         .command = "select_html",
@@ -21267,7 +21306,7 @@ static void register_commands(void)
         .func = &cmd_select_html,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&select_html_cmd));
 
     const esp_console_cmd_t set_html_begin_cmd = {
         .command = "set_html_begin",
@@ -21276,7 +21315,7 @@ static void register_commands(void)
         .func = &cmd_set_html_begin,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_begin_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_html_begin_cmd));
 
     const esp_console_cmd_t set_html_cmd = {
         .command = "set_html",
@@ -21285,7 +21324,7 @@ static void register_commands(void)
         .func = &cmd_set_html,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_html_cmd));
 
     const esp_console_cmd_t set_html_end_cmd = {
         .command = "set_html_end",
@@ -21294,7 +21333,7 @@ static void register_commands(void)
         .func = &cmd_set_html_end,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_end_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&set_html_end_cmd));
 
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
@@ -21304,7 +21343,7 @@ static void register_commands(void)
         .func = &cmd_scan_bt,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_bt_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&scan_bt_cmd));
 
     const esp_console_cmd_t scan_airtag_cmd = {
         .command = "scan_airtag",
@@ -21313,7 +21352,7 @@ static void register_commands(void)
         .func = &cmd_scan_airtag,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_airtag_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&scan_airtag_cmd));
 
 }
 
