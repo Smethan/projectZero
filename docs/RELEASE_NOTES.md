@@ -1,5 +1,18 @@
 # Smethan fork firmware
 
+## 1.7.3 — Wi-Fi serial capture for uConsole BLE
+
+Adds `start_wardrive_wifi_serial <session>` and the
+`wardrive_wifi_serial_v1` capability. This retains continuous 2.4/5 GHz Wi-Fi
+management observations, heartbeats and the host lease, but does not start BLE
+discovery. It uses Wi-Fi NULL mode and restores the previous mode on stop.
+WDG can now use the uConsole's Bluetooth for All Wardrive, avoiding the C5's
+documented unstable Wi-Fi sniffer/BLE coexistence combination. This is a
+mitigation, not a hardware-confirmed diagnosis of every heartbeat timeout.
+
+The existing combined command and passive HS Sniff remain available. Upgrade
+WDG as well to select the new Wi-Fi-only command and collect host BLE records.
+
 This release includes All Wardrive and passive HS Sniff over serial, without
 GPS or SD on the ESP32. Use current Smethan/WatchDogsGo main for the host UI.
 

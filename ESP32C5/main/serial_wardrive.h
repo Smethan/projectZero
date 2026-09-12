@@ -5,6 +5,7 @@
 #include "esp_console.h"
 bool sw_active(void);
 bool sw_hs_mode(void);
+bool sw_wifi_only_mode(void);
 bool sw_stop(void);
 void sw_ble(const uint8_t *addr, uint8_t type, int rssi, uint8_t event, const uint8_t *data, size_t len);
 void sw_register(void);

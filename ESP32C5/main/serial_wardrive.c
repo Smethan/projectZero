@@ -17,7 +17,9 @@
 #define CACHE 128
 static atomic_bool active, stopping, collecting;
 static bool passive_hs;
+static bool wifi_only;
 bool sw_hs_mode(void) { return passive_hs; }
+bool sw_wifi_only_mode(void) { return wifi_only || passive_hs; }
 #define HS_MAX_FRAME 2304
 typedef struct {
     int64_t at;
@@ -119,7 +121,7 @@ static void wifi_cb(void *buf,wifi_promiscuous_pkt_type_t type) {
     atomic_fetch_add(&wifi_count,1); offer(&o);
 }
 void sw_ble(const uint8_t *addr,uint8_t type,int rssi,uint8_t event,const uint8_t *data,size_t len) {
-    if (passive_hs) return;
+    if (sw_wifi_only_mode()) return;
     observation o={.kind=2,.addr_type=type,.rssi=rssi,.event=event,.len=len>62?62:len};
     for(int i=0;i<6;i++) o.addr[i]=addr[5-i]; /* NimBLE is little-endian */
     memcpy(o.data,data,o.len); atomic_fetch_add(&ble_count,1); offer(&o);
@@ -236,6 +238,7 @@ static int start(int argc,char **argv) {
     if(sw_active()) return 1;
     if(!sw_prepare()) return 1;
     passive_hs = !strcmp(argv[0], "start_hs_sniff_serial");
+    wifi_only = !strcmp(argv[0], "start_wardrive_wifi_serial");
     if (passive_hs) {
         hs_queue = xQueueCreate(8, sizeof(hs_observation));
         if (!hs_queue) return 1;
@@ -256,7 +259,7 @@ static int keepalive(int argc,char **argv) {
     atomic_store(&lease,now_ms()); return 0;
 }
 static int capabilities(int argc,char **argv) {
-    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"hs_sniff_serial_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"hs_sniff_serial_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 /* All main console commands share an ownership gate, including attack commands.
  * Registration retains the original handlers and changes no idle behavior. */
@@ -280,6 +283,7 @@ esp_err_t sw_register_command(const esp_console_cmd_t *cmd) {
 void sw_register(void) {
     const esp_console_cmd_t cmds[]={
         {.command="start_wardrive_serial",.help="WiFi + BLE over serial, no GPS/SD: <session>",.func=start},
+        {.command="start_wardrive_wifi_serial",.help="WiFi only over serial for host BLE, no GPS/SD: <session>",.func=start},
         {.command="start_hs_sniff_serial",.help="Passive EAPOL/PMKID and management PCAP over serial, no SD: <session>",.func=start},
         {.command="wardrive_keepalive",.help="Renew serial session lease: <session>",.func=keepalive},
         {.command="get_capabilities",.help="Machine-readable serial capabilities",.func=capabilities}};

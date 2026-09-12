@@ -64,5 +64,15 @@ int main(void){
     assert(strstr(output_capture,"stopped"));
     task_ok=0;assert(start(2,hs_args)==1 && hs_queue==NULL && !sw_active());task_ok=1;
     fresh();assert(!sw_hs_mode());atomic_store(&stopping,true);test_task(NULL);
+    char *wifi_args[]={"start_wardrive_wifi_serial","host-ble"};
+    assert(start(2,wifi_args)==0 && sw_wifi_only_mode() && !sw_hs_mode());
+    atomic_store(&collecting,true);output_capture[0]=0;
+    sw_ble(a,1,-60,0,ad,sizeof(ad));assert(!uxQueueMessagesWaiting(queue));
+    assert(atomic_load(&ble_count)==0);
+    beacon(8,45);assert(xQueueReceive(queue,&o,0));emit(&o);
+    assert(strstr(output_capture,"\"kind\":\"wifi\""));
+    test_task(NULL);assert(!sw_active() && strstr(output_capture,"stats"));
+    capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_wifi_serial_v1\":true"));
+    fresh();assert(!sw_wifi_only_mode());atomic_store(&stopping,true);test_task(NULL);
     puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, mode transitions");
 }

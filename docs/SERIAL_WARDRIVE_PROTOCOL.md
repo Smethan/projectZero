@@ -47,6 +47,12 @@ Example observation:
 
 A missing `started` or heartbeat is an error, not proof of successful dual capture. ESP-IDF describes C5 sniffer/BLE coexistence as supported with unstable performance: [ESP-IDF 6.0.1 coexistence](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html). Hardware validation remains necessary.
 
+Firmware 1.7.3 adds `wardrive_wifi_serial_v1: true` to capabilities and
+`start_wardrive_wifi_serial <session>`. It uses the same Wi-Fi records, channel
+hopping, two-second stats, 15-second host lease and stop protocol, with BLE
+discovery disabled. The host collects BLE separately. `ble_count` is zero for
+this session; it must not be interpreted as a count of host BLE observations.
+
 ## Passive handshake/PMKID serial extension
 
 `hs_sniff_serial_v1: true` advertises `start_hs_sniff_serial TOKEN`. This selects

@@ -129,7 +129,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.2"
+#define JANOS_VERSION "1.7.3"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -6512,14 +6512,14 @@ bool sw_radio_start(void) {
     esp_wifi_get_band_mode(&sw_saved_band);
     esp_wifi_get_promiscuous_filter(&sw_saved_filter);
     esp_wifi_get_mode(&sw_saved_mode);
-    if (sw_hs_mode()) {
+    if (sw_wifi_only_mode()) {
         /* NULL mode has no STA/AP traffic: no probes, association or deauth.
          * The serial ownership gate keeps other radio commands out. */
         if (nimble_initialized) bt_stop_scan();
         if (esp_wifi_set_mode(WIFI_MODE_NULL) != ESP_OK) return false;
     }
     if (esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO) != ESP_OK) return false;
-    if (sw_hs_mode()) return true;
+    if (sw_wifi_only_mode()) return true;
     if (bt_nimble_init() != ESP_OK) return false;
     return bt_start_scan_coex() == 0;
 }
@@ -6535,7 +6535,7 @@ void sw_radio_stop(void) {
     if (nimble_initialized) bt_stop_scan();
     esp_wifi_set_promiscuous_filter(&sw_saved_filter);
     esp_wifi_set_band_mode(sw_saved_band);
-    if (sw_hs_mode()) esp_wifi_set_mode(sw_saved_mode);
+    if (sw_wifi_only_mode()) esp_wifi_set_mode(sw_saved_mode);
     sw_saved_radio = false;
 }
 
