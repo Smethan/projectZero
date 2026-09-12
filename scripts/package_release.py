@@ -42,6 +42,9 @@ def main():
     assert set(flash) == set(offsets.values()), flash
     description = json.loads((build/'project_description.json').read_text())
     assert description['project_version'] == VERSION, description['project_version']
+    ota_project = re.search(r'^#define OTA_PROJECT_NAME "([^"]+)"',
+                           (ROOT/'ESP32C5/main/main.c').read_text(), re.M).group(1)
+    assert description['project_name'] == ota_project, 'OTA must accept the built project name'
     manifest = dict(format=1, repository='Smethan/projectZero', board=args.board,
                     chip='esp32c5', version=VERSION,
                     source_commit=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),

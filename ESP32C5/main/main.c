@@ -129,7 +129,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.1"
+#define JANOS_VERSION "1.7.2"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -147,7 +147,7 @@
 #define OTA_NVS_NAMESPACE "ota"
 #define OTA_NVS_KEY_CHANNEL "channel"
 #define OTA_DEV_BRANCH "development"
-#define OTA_PROJECT_NAME "projectZero"
+#define OTA_PROJECT_NAME "projectZerobyLOCOSP"
 
 // WPA-SEC cloud upload
 #define WPASEC_NVS_NAMESPACE "wpasec"

@@ -10,6 +10,8 @@ SHA256SUMS covers the release downloads. The standalone application binaries
 are intended for the matching board's onboard OTA updater.
 
 Firmware now reports the same version in its console and IDF image metadata.
+Version 1.7.2 also aligns the onboard OTA project-name check with the actual
+LOCOSP-derived application, so subsequent fork updates are accepted.
 Stable/tagged onboard OTA follows Smethan/projectZero and selects the matching
 board application. The old mutable development-binary channel is disabled.
 
