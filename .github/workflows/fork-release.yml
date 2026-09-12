@@ -1,0 +1,61 @@
+name: Fork firmware release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Standard public-repository runner only. Never run this on private forks.
+    if: github.repository == 'Smethan/projectZero' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      IDF_IMAGE: espressif/idf:v6.0.1@sha256:efc19fae2f52fc6873630c668da26aa834139a063b5fb73a46ebc0dbd217b587
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test transport and validate version
+        run: |
+          bash tests/serial_wardrive/run.sh
+          python3 scripts/package_release.py --check-version
+      - name: Build both board variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for board in wroom xiao; do
+            build_source="$RUNNER_TEMP/firmware-$board"
+            cp -a ESP32C5 "$build_source"
+            if [ "$board" = xiao ]; then
+              cat "$build_source/sdkconfig.xiao" >> "$build_source/sdkconfig"
+            fi
+            docker run --rm -v "$build_source:/project" -w /project "$IDF_IMAGE" \
+              idf.py --preview build size 2>&1 | tee "dist/build-$board.log"
+            python3 scripts/package_release.py --board "$board" --source "$build_source" --output dist
+          done
+          cd dist
+          sha256sum *.zip *.bin *.log > SHA256SUMS
+      - name: Publish complete tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/release-draft" 2>/dev/null; then
+            test "$(cat "$RUNNER_TEMP/release-draft")" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Smethan projectZero $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest

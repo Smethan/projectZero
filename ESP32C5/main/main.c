@@ -129,11 +129,15 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.0"
+#define JANOS_VERSION "1.7.1"
 
-#define OTA_GITHUB_OWNER "LOCOSP"
+#define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
-#define OTA_ASSET_NAME "projectZero.bin"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#define OTA_ASSET_NAME "projectZerobyLOCOSP-xiao.bin"
+#else
+#define OTA_ASSET_NAME "projectZerobyLOCOSP.bin"
+#endif
 #define OTA_HTTP_MAX_BODY (256 * 1024)
 #define OTA_TASK_STACK_SIZE 12288
 #define OTA_TASK_PRIORITY 5
@@ -2766,13 +2770,10 @@ static esp_err_t ota_fetch_release_by_tag(const char *tag,
 }
 
 static esp_err_t ota_build_branch_url(char *url_out, size_t url_len) {
-    int res = snprintf(url_out, url_len,
-                       "https://raw.githubusercontent.com/%s/%s/%s/ESP32C5/binaries-esp32c5/%s",
-                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO, OTA_DEV_BRANCH, OTA_ASSET_NAME);
-    if (res < 0 || res >= (int)url_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    return ESP_OK;
+    /* Fork builds are published as versioned release assets, never mutable
+     * binaries committed to a development branch. */
+    MY_LOG_INFO(TAG, "OTA: development channel unavailable; select stable or a release tag");
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 static bool ota_is_expected_project(const esp_app_desc_t *desc) {
@@ -24165,4 +24166,3 @@ static bool is_bssid_whitelisted(const uint8_t *bssid) {
     
     return false;
 }
-

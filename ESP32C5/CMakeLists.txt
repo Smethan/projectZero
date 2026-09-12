@@ -3,7 +3,11 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
-set(JANOS_VERSION "1.6.9")
+file(STRINGS "${CMAKE_SOURCE_DIR}/main/main.c" JANOS_VERSION_LINE REGEX "^#define JANOS_VERSION ")
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" JANOS_VERSION "${JANOS_VERSION_LINE}")
+if(NOT JANOS_VERSION)
+  message(FATAL_ERROR "Missing numeric JANOS_VERSION in main/main.c")
+endif()
 set(PROJECT_VER "${JANOS_VERSION}")
 
 # Ensure IDF FatFs has exFAT enabled for all developers building this repo.
