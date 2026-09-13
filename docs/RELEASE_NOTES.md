@@ -2,6 +2,12 @@
 
 ## 1.7.8 — Faster native USB OTA
 
+Measured on the uConsole: **53.33 seconds** for a complete published-release
+USB update, versus **445.65 seconds** through the old receiver (about **8.4x
+faster**). Deliberate serial close/lost-ACK recovery finished in **60.23 seconds**.
+Both booted a verified valid slot with no pending transfer. See
+[hardware validation](https://github.com/Smethan/projectZero/blob/main/docs/USB_OTA_VALIDATION_2026-09-13.md) for method and limits.
+
 - XIAO native USB advertises 4 KiB base64 blocks to WDG 0.9.24+, replacing
   256-byte paced hex chunks. Each block still has an image identity, exact
   offset, CRC32 and acknowledgement. Full-image SHA256, ESP image validation,
