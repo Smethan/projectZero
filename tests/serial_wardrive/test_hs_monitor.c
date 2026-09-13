@@ -3,6 +3,13 @@ static pcap_frame_observer_t observer;
 void pcap_serializer_set_observer(pcap_frame_observer_t cb) { observer=cb; }
 int main(void) {
     test_clock=1000;
+    char long_line[900];memset(long_line,'x',sizeof(long_line)-1);long_line[899]=0;
+    /* Real console ring rejects a single request over 256 bytes. */
+    assert(usb_serial_jtag_write_bytes(long_line,899,100)==0);
+    assert(serial_output(long_line,899,100));assert(strlen(output_capture)==899);
+    output_capture[0]=0;
+    transport_limit=0;assert(!serial_output(long_line,899,100));
+    transport_limit=1024;
     assert(hsm_start(true));assert(observer);
     uint8_t frame[336]={0};frame[0]=8;frame[1]=2;
     uint8_t llc[]={0xaa,0xaa,3,0,0,0,0x88,0x8e};memcpy(frame+24,llc,8);

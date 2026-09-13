@@ -1,5 +1,6 @@
 /* Compile the real transport/callback code against in-memory radio/RTOS shims. */
 #include "../../ESP32C5/main/serial_wardrive.c"
+bool uota_busy(void){return false;}
 static bool radio_ok=true, prepare_ok=true;
 static int stopped_radios, hops;
 bool sw_prepare(void){return prepare_ok;}
@@ -36,7 +37,7 @@ int main(void){
     for(int i=0;i<100;i++){a[0]=i;sw_ble(a,1,-60,0,ad,sizeof(ad));}
     assert(uxQueueMessagesWaiting(queue)==64);assert(atomic_load(&drops)>0);
     assert(xQueueReceive(queue,&o,0));test_clock+=2001;unsigned old=atomic_load(&drops);emit(&o);assert(atomic_load(&drops)==old+1);
-    transport_limit=1;old=atomic_load(&drops);status("stats","");assert(atomic_load(&drops)==old+1);
+    transport_limit=0;old=atomic_load(&drops);status("stats","");assert(atomic_load(&drops)==old+1);
     fresh();test_task(NULL);assert(!sw_active());assert(hops>0 && stopped_radios>0);
     assert(strstr(output_capture,"started") && strstr(output_capture,"stats") && strstr(output_capture,"stopped"));
     fresh();radio_ok=false;test_task(NULL);assert(!strstr(output_capture,"started"));assert(strstr(output_capture,"error") && strstr(output_capture,"stopped"));

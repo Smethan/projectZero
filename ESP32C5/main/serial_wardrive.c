@@ -1,6 +1,8 @@
 /* Host-owned GPS/SD-free coexistence capture. No allocations or I/O in callbacks. */
 #include "serial_wardrive.h"
 #include "hs_capture.h"
+#include "serial_output.h"
+#include "usb_ota.h"
 #include "capture_pool.h"
 #include "capture_memory.h"
 #include <stdio.h>
@@ -63,21 +65,10 @@ static void mac(char *out,const uint8_t *p) {
 static void output(const char *body) {
     char line[1024];
     int n=snprintf(line,sizeof(line),"\nWDG:%s\n",body);
-    if(n<=0 || n >= sizeof(line)) { atomic_fetch_add(&drops,1); return; }
-    flockfile(stdout);
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-    int sent=usb_serial_jtag_write_bytes(line,n,pdMS_TO_TICKS(100));
-#else
-    int sent=0;
-    int64_t deadline=now_ms()+100;
-    while(sent<n && now_ms()<deadline) {
-        int w=uart_tx_chars(CONFIG_ESP_CONSOLE_UART_NUM,line+sent,n-sent);
-        if(w>0) sent+=w; else vTaskDelay(1);
-    }
-#endif
-    funlockfile(stdout);
-    if(sent<n) atomic_fetch_add(&drops,1);
+    if(n<=0 || n>=sizeof(line) || !serial_output(line,n,100))
+        atomic_fetch_add(&drops,1);
 }
+
 static void status(const char *kind,const char *extra) {
     char b[512];
     snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"uptime_ms\":%lld,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u%s}",kind,session,++seq,(long long)now_ms(),atomic_load(&wifi_count),atomic_load(&ble_count),atomic_load(&drops),extra);
@@ -278,6 +269,9 @@ static int capabilities(int argc,char **argv) {
 static struct { const char *name; esp_console_cmd_func_t func; } commands[256];
 static unsigned command_count;
 static int dispatch(int argc,char **argv) {
+    if(uota_busy() && strncmp(argv[0],"uota_",5) && strcmp(argv[0],"version") && strcmp(argv[0],"ota_info") && strcmp(argv[0],"get_capabilities")) {
+        printf("USB OTA is active; finish or abort it first.\n");return 1;
+    }
     if(argc<1) return 1;
     if(sw_active() && strcmp(argv[0],"stop") && strcmp(argv[0],"get_capabilities") && strcmp(argv[0],"wardrive_keepalive")) {
         printf("Serial wardrive busy; stop first.\n"); return 1;

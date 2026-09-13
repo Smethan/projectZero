@@ -1,5 +1,6 @@
 #include "serial_wardrive.h"
 #include "hs_monitor.h"
+#include "usb_ota.h"
 #include "capture_memory.h"
 #include "esp_wifi_default.h"
 // main.c
@@ -132,7 +133,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.5"
+#define JANOS_VERSION "1.7.6"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -2199,6 +2200,11 @@ static double gps_distance_meters(double lat1, double lon1, double lat2, double 
 static bool wardrive_trace_init_file(const char *path);
 static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt);
 static void wardrive_trace_finalize_file(const char *path);
+static bool usb_ota_prepare(void) {
+    if (ota_check_in_progress) return false;
+    return stop_operations(true) == 0 && !sw_active() && !handshake_attack_active;
+}
+
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -20940,6 +20946,7 @@ static void register_commands(void)
     ESP_ERROR_CHECK(sw_register_command(&set_antisurv_sens_cmd));
 
     sw_register();
+    uota_register(usb_ota_prepare, safe_restart);
 
     const esp_console_cmd_t wardrive_promisc_cmd = {
         .command = "start_wardrive_promisc",

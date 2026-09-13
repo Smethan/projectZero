@@ -9,6 +9,8 @@ import argparse
 from pathlib import Path
 
 LIMITS = {
+    ("usb_ota.c", "finish_cmd"): 2048,
+    ("usb_ota.c", "chunk_cmd"): 768,
     ("serial_wardrive.c", "hs_wifi_cb"): 256,
     ("serial_wardrive.c", "worker"): 512,
     ("hs_monitor.c", "observe"): 256,

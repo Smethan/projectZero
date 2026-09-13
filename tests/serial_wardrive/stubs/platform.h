@@ -50,7 +50,7 @@ static int esp_wifi_set_promiscuous_rx_cb(void (*f)(void*,wifi_promiscuous_pkt_t
 static int esp_wifi_set_promiscuous(bool on){return 0;}
 static char output_capture[65536];
 static int transport_limit=1024;
-static int usb_serial_jtag_write_bytes(const char *buf,int n,int ticks){int count=n<transport_limit?n:transport_limit;strncat(output_capture,buf,count);return count;}
+static int usb_serial_jtag_write_bytes(const char *buf,int n,int ticks){int count=n>256?0:(n<transport_limit?n:transport_limit);strncat(output_capture,buf,count);return count;}
 
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_INTERNAL 2

@@ -1,6 +1,7 @@
 /* Bounded, nonblocking observer of existing HS Capture PCAP appends. */
 #include "hs_monitor.h"
 #include "hs_capture.h"
+#include "serial_output.h"
 #include "capture_pool.h"
 #include "capture_memory.h"
 #include "pcap_serializer.h"
@@ -27,21 +28,10 @@ static int64_t now_ms(void) { return esp_timer_get_time()/1000; }
 static void output(const char *body) {
     char line[1024];
     int n=snprintf(line,sizeof(line),"\nHSC:%s\n",body);
-    if(n<=0 || n>=sizeof(line) || ftrylockfile(stdout)!=0) {
-        atomic_fetch_add(&dropped,1); return;
-    }
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-    int sent=usb_serial_jtag_write_bytes(line,n,pdMS_TO_TICKS(10));
-#else
-    int sent=0; int64_t end=now_ms()+10;
-    while(sent<n && now_ms()<end) {
-        int w=uart_tx_chars(CONFIG_ESP_CONSOLE_UART_NUM,line+sent,n-sent);
-        if(w>0) sent+=w; else vTaskDelay(1);
-    }
-#endif
-    funlockfile(stdout);
-    if(sent<n) atomic_fetch_add(&dropped,1);
+    if(n<=0 || n>=sizeof(line) || !serial_output(line,n,100))
+        atomic_fetch_add(&dropped,1);
 }
+
 static void status(const char *kind) {
     char body[400];
     snprintf(body,sizeof(body),"{\"v\":1,\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"storage\":\"%s\",\"wifi_count\":%u,\"ble_count\":0,\"drops\":%u}",

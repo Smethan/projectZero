@@ -1,4 +1,4 @@
-idf_component_register(SRCS "oled_display.c" "main.c" "serial_wardrive.c" "hs_monitor.c" "attack_handshake.c"
+idf_component_register(SRCS "oled_display.c" "main.c" "serial_wardrive.c" "hs_monitor.c" "usb_ota.c" "attack_handshake.c"
                        INCLUDE_DIRS .
                        REQUIRES esp_timer esp_wifi esp_event esp_psram nvs_flash
                                 console driver fatfs mbedtls esp-tls esp_http_server

@@ -1,5 +1,25 @@
 # Smethan fork firmware
 
+## 1.7.6 — Capture progress transport repair and resumable USB OTA
+
+- Split serial protocol output into 64-byte writes. ESP-IDF's console USB TX
+  ring is 256 bytes and rejects a single request larger than the ring. Short
+  status messages succeeded while larger HSC/HS Sniff packet lines failed,
+  producing gaps/drops and empty PMKID/M1-M4 displays. Full lines remain locked
+  against interleaving, with bounded waiting on a disconnected host.
+- Add application-mode USB OTA commands (`uota_status`, `uota_begin`,
+  `uota_chunk`, `uota_finish`, `uota_abort`). The inactive app slot receives
+  CRC-checked 256-byte chunks; duplicate retries are compared with flash and
+  acknowledged without rewriting. Save 4 KiB checkpoints in NVS for reboot
+  recovery, erase only the unfinished tail on resume, and verify full SHA256,
+  app project and ESP-IDF image validity before changing the boot selection.
+- Installing this release once by Wi-Fi OTA enables subsequent USB OTA updates.
+  USB OTA does not change bootloader, partition table, board profile or SD files.
+  An unfinished transfer blocks conflicting commands until finished/aborted.
+- Offline tests model the real USB ring limit, duplicate/lost acknowledgments,
+  checkpoint recovery, checksum errors, flash/NVS failures and boot validation.
+
+
 ## 1.7.5 — Capture memory and startup recovery
 
 Addresses the memory hazards found while investigating HS Sniff reboots on
