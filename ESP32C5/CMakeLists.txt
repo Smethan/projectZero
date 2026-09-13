@@ -21,6 +21,8 @@ if(PROJECTZERO_PATCH_IDF_LINENOISE_UTF8)
   include(${CMAKE_SOURCE_DIR}/tools/patch_idf_linenoise_utf8.cmake)
 endif()
 
+include(${CMAKE_SOURCE_DIR}/tools/patch_idf_linenoise_machine.cmake)
+
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 

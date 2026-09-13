@@ -8,6 +8,7 @@
 #include "esp_app_desc.h"
 #include "nvs.h"
 #include "psa/crypto.h"
+#include "linenoise/linenoise.h"
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
@@ -123,7 +124,7 @@ static int begin_cmd(int argc,char **argv) {
         err=esp_ota_begin(target,size,&handle);
     }
     if(err!=ESP_OK)return fail("begin");
-    active=true;response("ready",NULL);return 0;
+    active=true;linenoiseSetMachineMode(true);response("ready",NULL);return 0;
 }
 static int chunk_cmd(int argc,char **argv) {
     uint32_t at,expected_crc;
@@ -148,7 +149,7 @@ static int chunk_cmd(int argc,char **argv) {
     offset+=size;
     if(offset%SECTOR==0) {
         meta.checkpoint=offset;
-        if(!persist()){esp_ota_abort(handle);active=false;return fail("checkpoint");}
+        if(!persist()){esp_ota_abort(handle);active=false;linenoiseSetMachineMode(false);return fail("checkpoint");}
     }
     response("ack",NULL);return 0;
 }
@@ -170,7 +171,7 @@ static int finish_cmd(int argc,char **argv) {
     if(strcmp(hex,meta.hash))return fail("sha256");
     esp_app_desc_t desc;
     if(esp_ota_get_partition_description(target,&desc)!=ESP_OK||strcmp(desc.project_name,"projectZerobyLOCOSP"))return fail("project");
-    err=esp_ota_end(handle);active=false;
+    err=esp_ota_end(handle);active=false;linenoiseSetMachineMode(false);
     if(err!=ESP_OK)return fail("image_validation");
     if(esp_ota_set_boot_partition(target)!=ESP_OK)return fail("boot_selection");
     response("applied",NULL);clear();vTaskDelay(pdMS_TO_TICKS(500));
@@ -182,7 +183,7 @@ static int abort_cmd(int argc,char **argv) {
     load();
     if(meta.magic==META_MAGIC&&strcmp(argv[1],meta.hash))return fail("image_mismatch");
     if(active)esp_ota_abort(handle);
-    active=false;clear();response("aborted",NULL);return 0;
+    active=false;linenoiseSetMachineMode(false);clear();response("aborted",NULL);return 0;
 }
 void uota_register(bool (*prepare)(void),void (*restart)(void)) {
     prepare_cb=prepare;restart_cb=restart;

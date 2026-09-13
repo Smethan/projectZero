@@ -1,5 +1,15 @@
 # Smethan fork firmware
 
+## 1.7.7 — Prevent USB OTA command truncation
+
+- USB OTA temporarily disables console input echo and per-character flushes.
+  The standard console otherwise blocks its reader long enough to overrun the
+  256-byte receive ring, truncating firmware chunks before CRC validation.
+- Normal console behavior returns on abort, final validation, or reboot.
+  Chunk CRC, durable checkpoints, whole-image SHA256, inactive-slot-only writes,
+  and boot validation are unchanged.
+- Install this version using Wi-Fi OTA before using WDG's USB OTA option.
+
 ## 1.7.6 — Capture progress transport repair and resumable USB OTA
 
 - Split serial protocol output into 64-byte writes. ESP-IDF's console USB TX

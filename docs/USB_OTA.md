@@ -1,6 +1,6 @@
-# Application-mode USB OTA (1.7.6+)
+# Application-mode USB OTA (1.7.7+)
 
-Install firmware 1.7.6 once using the existing Wi-Fi updater. WDG's USB OTA
+Install firmware 1.7.7 once using the existing Wi-Fi updater. WDG's USB OTA
 method then downloads a verified release on the host and writes only the inactive
 application partition. No ROM bootloader entry, esptool, SD card, partition-table
 write, bootloader write or full-chip erase is involved.
@@ -42,3 +42,8 @@ firmware updates, as with the pre-existing USB/OTA tools.
 Native tests link OpenSSL for an independent SHA256 implementation (`libssl-dev`
 on Debian/Ubuntu). Tests cover block retries, checkpoint recovery, erase boundaries,
 SHA mismatch, flash/NVS failure, pending boot validation and explicit abort.
+
+The build applies a checked patch to the pinned ESP-IDF console: USB OTA uses
+its normal command parser with input echo disabled until finish/abort. This
+prevents per-character USB flushes from overrunning the RX ring. Ordinary
+terminal behavior is restored afterward; no SDK patch is needed on the host.
