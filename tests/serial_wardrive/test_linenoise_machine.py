@@ -32,14 +32,14 @@ static void flushWrite(void) { ++flushes; }
 tests = r'''
 int main(void) {
     sink = tmpfile(); assert(sink);
-    char line[700], output[1024] = {0};
-    memset(line, 'a', 640); line[640] = '\n'; line[641] = 0;
+    char line[6000], output[8192] = {0};
+    memset(line, 'a', 5580); line[5580] = '\n'; line[5581] = 0;
     input = line;
     linenoiseSetMachineMode(true);
     linenoiseSetMachineMode(true); /* reconnect must not replace saved mode */
     assert(dumbmode == 1);
-    assert(linenoiseDumb(output, sizeof(output), ">") == 640);
-    assert(!memcmp(output, line, 640));
+    assert(linenoiseDumb(output, sizeof(output), ">") == 5580);
+    assert(!memcmp(output, line, 5580));
     assert(flushes == 0 && ftell(sink) == 0);
     linenoiseSetMachineMode(false); assert(dumbmode == 0);
     input = "abc\bD\n"; input_position = 0;

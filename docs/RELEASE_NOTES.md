@@ -1,5 +1,23 @@
 # Smethan fork firmware
 
+## 1.7.8 — Faster native USB OTA
+
+- XIAO native USB advertises 4 KiB base64 blocks to WDG 0.9.24+, replacing
+  256-byte paced hex chunks. Each block still has an image identity, exact
+  offset, CRC32 and acknowledgement. Full-image SHA256, ESP image validation,
+  inactive-slot writes and durable 4 KiB resume checkpoints remain required.
+- A guarded patch to the pinned SDK expands native USB RX buffering to 8 KiB;
+  the console accepts 8 KiB lines. The receiver remains quiet during OTA.
+  Block storage is static, avoiding a large REPL stack allocation.
+- Final verification yields every 64 KiB instead of every 1 KiB, preserving
+  scheduling opportunities while removing thousands of deliberate delays.
+- Older WDG versions retain the 256-byte protocol. WROOM keeps that paced path.
+  Installing 1.7.8 from 1.7.7 still uses the old speed once.
+- Tests cover all final block lengths, strict base64 rejection, CRC, duplicate
+  ACK recovery, legacy-to-fast resume, simulated reboot/sector recovery,
+  NVS/write/hash failures, SDK input behavior and stack limits.
+- No handshake capture or hotspot changes are included.
+
 ## 1.7.7 — Prevent USB OTA command truncation
 
 - USB OTA temporarily disables console input echo and per-character flushes.

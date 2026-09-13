@@ -11,3 +11,4 @@ done
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -Wno-deprecated-declarations \
     -I stubs -I ../../ESP32C5/main test_usb_ota.c -lcrypto -o "$test_dir/test-usb"
 "$test_dir/test-usb"
+python3 test_usb_buffer_patch.py

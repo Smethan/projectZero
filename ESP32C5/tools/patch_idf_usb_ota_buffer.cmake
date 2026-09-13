@@ -1,0 +1,18 @@
+# The native USB REPL must absorb one complete negotiated OTA block command.
+# Guard the exact pinned SDK hook; never advertise fast transfer on a guessed patch.
+set(_repl "$ENV{IDF_PATH}/components/console/esp_console_repl_chip.c")
+file(READ "${_repl}" _src)
+set(_hook "usb_serial_jtag_driver_config_t usb_serial_jtag_config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();")
+set(_patch "${_hook}\n    usb_serial_jtag_config.rx_buffer_size = 8192; /* projectZero USB OTA block */")
+if(NOT _src MATCHES "projectZero USB OTA block")
+  string(FIND "${_src}" "${_hook}" _found)
+  if(_found LESS 0)
+    message(FATAL_ERROR "Unsupported IDF USB REPL: fast OTA buffer patch refused")
+  endif()
+  string(REPLACE "${_hook}" "${_patch}" _src "${_src}")
+  file(WRITE "${_repl}" "${_src}")
+endif()
+string(FIND "${_src}" "${_patch}" _verified)
+if(_verified LESS 0)
+  message(FATAL_ERROR "USB OTA buffer marker exists without the required 8192-byte RX capacity")
+endif()

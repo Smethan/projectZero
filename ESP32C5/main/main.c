@@ -133,7 +133,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.7"
+#define JANOS_VERSION "1.7.8"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -21573,7 +21573,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"Type 'help' to list all commands.");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 1024;  // must fit set_html chunks (~266 chars each)
+    repl_config.max_cmdline_length = 8192;  // native USB OTA: 4KiB base64 plus identity/CRC
 
     esp_console_register_help_command();
     register_commands();

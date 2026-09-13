@@ -14,11 +14,16 @@
 #include <inttypes.h>
 #define SECTOR 4096u
 #define CHUNK 256u
+#define BLOCK 4096u
+/* Console commands are serialized; keep block storage off the REPL stack. */
+static uint8_t block_data[BLOCK];
 #define META_MAGIC 0x554f5431u
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #define BOARD "xiao"
+#define FAST_FIELDS ",\"block_size\":4096,\"encoding\":\"base64\",\"line_size\":8192"
 #else
 #define BOARD "wroom"
+#define FAST_FIELDS ""
 #endif
 
 typedef struct {
@@ -56,7 +61,7 @@ static uint32_t crc32(const uint8_t *p,unsigned n) {
 }
 static void response(const char *kind,const char *error) {
     char line[400];
-    int n=snprintf(line,sizeof(line),"\nUOTA:{\"v\":1,\"kind\":\"%s\",\"board\":\"%s\",\"sha256\":\"%s\",\"size\":%"PRIu32",\"offset\":%"PRIu32",\"active\":%s,\"slot\":\"%s\",\"error\":\"%s\"}\n",
+    int n=snprintf(line,sizeof(line),"\nUOTA:{\"v\":1,\"kind\":\"%s\",\"board\":\"%s\",\"sha256\":\"%s\",\"size\":%"PRIu32",\"offset\":%"PRIu32",\"active\":%s,\"slot\":\"%s\",\"error\":\"%s\"" FAST_FIELDS "}\n",
         kind,BOARD,meta.magic==META_MAGIC?meta.hash:"",meta.size,offset,
         active?"true":"false",target?target->label:"",error?error:"");
     if(n>0&&n<sizeof(line))serial_output(line,n,1000);
@@ -126,22 +131,14 @@ static int begin_cmd(int argc,char **argv) {
     if(err!=ESP_OK)return fail("begin");
     active=true;linenoiseSetMachineMode(true);response("ready",NULL);return 0;
 }
-static int chunk_cmd(int argc,char **argv) {
-    uint32_t at,expected_crc;
-    if(argc!=5||!active||strcmp(argv[1],meta.hash)||!number(argv[2],&at)||!number(argv[3],&expected_crc))return fail("chunk_arguments");
-    unsigned chars=strlen(argv[4]);
-    if(!chars||chars>CHUNK*2||chars%2)return fail("chunk_size");
-    unsigned size=chars/2;
-    if(at%CHUNK||at>meta.size||size!=((meta.size-at)<CHUNK?meta.size-at:CHUNK))return fail("chunk_bounds");
-    uint8_t data[CHUNK],previous[CHUNK];
-    for(unsigned i=0;i<size;i++) {
-        int a=nibble(argv[4][i*2]),b=nibble(argv[4][i*2+1]);
-        if(a<0||b<0)return fail("chunk_hex");
-        data[i]=(a<<4)|b;
-    }
-    if(crc32(data,size)!=expected_crc)return fail("chunk_crc");
+static int write_block(uint32_t at, const uint8_t *data, unsigned size) {
+    uint8_t previous[CHUNK];
     if(at<offset) {
-        if(at+size>offset||esp_partition_read(target,at,previous,size)!=ESP_OK||memcmp(data,previous,size))return fail("duplicate_mismatch");
+        if(at+size>offset)return fail("duplicate_mismatch");
+        for(unsigned i=0;i<size;i+=CHUNK) {
+            unsigned n=size-i<CHUNK?size-i:CHUNK;
+            if(esp_partition_read(target,at+i,previous,n)!=ESP_OK||memcmp(data+i,previous,n))return fail("duplicate_mismatch");
+        }
         response("ack",NULL);return 0;
     }
     if(at!=offset)return fail("offset");
@@ -153,6 +150,59 @@ static int chunk_cmd(int argc,char **argv) {
     }
     response("ack",NULL);return 0;
 }
+static int chunk_cmd(int argc,char **argv) {
+    uint32_t at,expected_crc;
+    if(argc!=5||!active||strcmp(argv[1],meta.hash)||!number(argv[2],&at)||!number(argv[3],&expected_crc))return fail("chunk_arguments");
+    unsigned chars=strlen(argv[4]);
+    if(!chars||chars>CHUNK*2||chars%2)return fail("chunk_size");
+    unsigned size=chars/2;
+    if(at%CHUNK||at>meta.size||size!=((meta.size-at)<CHUNK?meta.size-at:CHUNK))return fail("chunk_bounds");
+    uint8_t data[CHUNK];
+    for(unsigned i=0;i<size;i++) {
+        int a=nibble(argv[4][i*2]),b=nibble(argv[4][i*2+1]);
+        if(a<0||b<0)return fail("chunk_hex");
+        data[i]=(a<<4)|b;
+    }
+    if(crc32(data,size)!=expected_crc)return fail("chunk_crc");
+    return write_block(at,data,size);
+}
+/* Strict base64: no whitespace, invalid alphabet, internal padding or noncanonical tail. */
+static int b64_digit(char c) {
+    if(c>='A'&&c<='Z')return c-'A';
+    if(c>='a'&&c<='z')return c-'a'+26;
+    if(c>='0'&&c<='9')return c-'0'+52;
+    return c=='+'?62:c=='/'?63:-1;
+}
+static unsigned decode_block(const char *text) {
+    size_t n=strlen(text);unsigned used=0;
+    if(!n||n%4||n>5464)return 0;
+    for(size_t i=0;i<n;i+=4) {
+        int a=b64_digit(text[i]),b=b64_digit(text[i+1]);
+        bool pad2=text[i+2]=='=',pad3=text[i+3]=='=';
+        int c=pad2?0:b64_digit(text[i+2]),d=pad3?0:b64_digit(text[i+3]);
+        if(a<0||b<0||c<0||d<0||(pad2&&!pad3)||((pad2||pad3)&&i+4!=n)||
+           (pad2&&(b&15))||(pad3&&!pad2&&(c&3)))return 0;
+        unsigned count=pad2?1:pad3?2:3;
+        if(used+count>BLOCK)return 0;
+        block_data[used++]=(a<<2)|(b>>4);
+        if(count>1)block_data[used++]=(b<<4)|(c>>2);
+        if(count>2)block_data[used++]=(c<<6)|d;
+    }
+    return used;
+}
+static int block_cmd(int argc,char **argv) {
+    uint32_t at,expected_crc;
+    if(argc!=5||!active||strcmp(argv[1],meta.hash)||!number(argv[2],&at)||!number(argv[3],&expected_crc))return fail("chunk_arguments");
+    unsigned size=decode_block(argv[4]);
+    if(!size)return fail("chunk_base64");
+    /* Finish the current sector after a legacy 256-byte resume, then use 4 KiB. */
+    unsigned wanted=BLOCK-at%BLOCK;
+    if(at>meta.size)return fail("chunk_bounds");
+    if(wanted>meta.size-at)wanted=meta.size-at;
+    if(at%CHUNK||size!=wanted)return fail("chunk_bounds");
+    if(crc32(block_data,size)!=expected_crc)return fail("chunk_crc");
+    return write_block(at,block_data,size);
+}
 static int finish_cmd(int argc,char **argv) {
     if(argc!=2||!active||strcmp(argv[1],meta.hash)||offset!=meta.size)return fail("incomplete");
     uint8_t data[1024],digest[32];char hex[65];
@@ -162,7 +212,7 @@ static int finish_cmd(int argc,char **argv) {
         unsigned size=meta.size-at<sizeof(data)?meta.size-at:sizeof(data);
         err=esp_partition_read(target,at,data,size);
         if(!err)err=psa_hash_update(&sha,data,size);
-        vTaskDelay(1);
+        if((at+size)%65536==0)vTaskDelay(1);
     }
     if(!err)err=psa_hash_finish(&sha,digest,sizeof(digest),&digest_size);
     psa_hash_abort(&sha);
@@ -191,6 +241,7 @@ void uota_register(bool (*prepare)(void),void (*restart)(void)) {
         {.command="uota_status",.help="USB OTA status/resume offset",.func=status_cmd},
         {.command="uota_begin",.help="USB OTA begin/resume: size sha256",.func=begin_cmd},
         {.command="uota_chunk",.help="USB OTA chunk: sha256 offset crc32 hex",.func=chunk_cmd},
+        {.command="uota_block",.help="USB OTA 4KiB block: sha256 offset crc32 base64",.func=block_cmd},
         {.command="uota_finish",.help="Verify USB OTA and reboot: sha256",.func=finish_cmd},
         {.command="uota_abort",.help="Discard pending USB OTA: sha256",.func=abort_cmd},
     };

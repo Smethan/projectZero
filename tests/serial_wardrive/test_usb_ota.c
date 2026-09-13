@@ -1,4 +1,5 @@
 #include "../../ESP32C5/main/usb_ota.c"
+#include <openssl/evp.h>
 esp_err_t sw_register_command(const esp_console_cmd_t *c){return 0;}
 static bool prepared(void){return true;}
 static bool rebooted;
@@ -20,7 +21,51 @@ static int chunk(unsigned at) {
     char *args[]={"uota_chunk",hash,position,crc,hex};return chunk_cmd(5,args);
 }
 static int finish(void){char *args[]={"uota_finish",hash};return finish_cmd(2,args);}
+static int block(unsigned at, unsigned size) {
+    char position[20],crc[20],encoded[5465];snprintf(position,sizeof(position),"%u",at);
+    snprintf(crc,sizeof(crc),"%u",crc32(image+at,size));
+    EVP_EncodeBlock((unsigned char *)encoded,image+at,size);
+    char *args[]={"uota_block",hash,position,crc,encoded};return block_cmd(5,args);
+}
+static void fast_tests(void) {
+    fresh();assert(!begin());assert(strstr(output_capture,"\"block_size\":4096"));
+    assert(!block(0,4096)&&offset==4096&&meta.checkpoint==4096&&write_calls==1);
+    unsigned writes=write_calls;
+    assert(!block(0,4096)&&write_calls==writes); /* duplicate full-block ACK */
+    flash_bytes[3000]^=1;assert(block(0,4096));flash_bytes[3000]^=1;
+    assert(block(4096,256)&&offset==4096); /* short nonfinal block */
+    active=false;memset(&meta,0,sizeof(meta));offset=0;
+    load();assert(offset==4096);assert(!begin());
+    assert(erase_at==4096&&erase_size==4096);
+    assert(!block(4096,4096)&&!finish()&&rebooted&&boot_index==1);
+    fresh();assert(!begin());assert(!chunk(0));assert(!block(256,3840));
+    assert(offset==4096&&meta.checkpoint==4096); /* legacy->fast live resume */
+    fresh();assert(!begin());nvs_fail=true;
+    assert(block(0,4096)&&!active&&boot_index==0);nvs_fail=false;
+    load();assert(!offset);assert(!begin()&&!block(0,4096));
+    assert(!memcmp(flash_bytes,image,4096));
+    const char *bad[]={"", "AA", "!!!!", "A===", "AA=A", "AB==", "AAB=", "AA==AAAA", "AA A"};
+    for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++)assert(!decode_block(bad[i]));
+    char encoded[5500];
+    for(unsigned n=1;n<=4096;n++) {
+        EVP_EncodeBlock((unsigned char *)encoded,image,n);
+        assert(decode_block(encoded)==n&&!memcmp(block_data,image,n));
+    }
+    EVP_EncodeBlock((unsigned char *)encoded,image,4097);assert(!decode_block(encoded));
+    /* Every partial final sector size, including all base64 padding variants. */
+    for(unsigned tail=1;tail<=4096;tail++) {
+        fresh();char size[20];snprintf(size,sizeof(size),"%u",4096+tail);
+        char *args[]={"uota_begin",size,hash};assert(!begin_cmd(3,args));
+        assert(!block(0,4096)&&!block(4096,tail)&&offset==4096+tail);
+    }
+    fresh();assert(!begin());
+    EVP_EncodeBlock((unsigned char *)encoded,image,4096);
+    char *args[]={"uota_block",hash,"0","0",encoded};
+    assert(block_cmd(5,args)&&offset==0&&write_calls==0); /* CRC rejection */
+    puts("PASS: 4KiB base64, every final tail, strict encoding, duplicates, legacy resume, reboot and NVS failures");
+}
 int main(void) {
+    fast_tests();
     fresh();assert(crc32((uint8_t*)"123456789",9)==0xcbf43926);
     assert(!begin()&&active&&machine_mode);assert(!chunk(0));unsigned writes=write_calls;
     assert(!chunk(0)&&write_calls==writes&&offset==256); /* lost ACK retry */
