@@ -11,6 +11,10 @@
 
 #include <stdint.h>
 
+/* Optional nonblocking observer of frames successfully appended to the PCAP. */
+typedef void (*pcap_frame_observer_t)(const uint8_t *, unsigned);
+void pcap_serializer_set_observer(pcap_frame_observer_t observer);
+
 /**
  * @brief PCAP global header
  * 
@@ -80,4 +84,3 @@ unsigned pcap_serializer_get_size();
 uint8_t *pcap_serializer_get_buffer();
 
 #endif
-

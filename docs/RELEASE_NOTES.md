@@ -1,5 +1,22 @@
 # Smethan fork firmware
 
+## 1.7.4 — HS Capture progress stream
+
+Both existing HS Capture variants now send a bounded `HSC:` progress stream
+containing copies of handshake/context frames successfully appended to their
+PCAP. WDG 0.9.18 uses these for live per-AP/client PMKID and M1–M4 displays.
+The observer does not change capture targeting, injection, packet selection,
+SD saving or the no-SD final PCAP/HCCAPX dump. Progress can drop independently
+of the capture; its counters expose that limitation. It is stopped before the
+base64 file transfer. Channel/RSSI are not available from this observer.
+
+The stream uses v1 session/sequence and 240-byte hex chunks, like passive HS
+capture, with `HSC:` instead of `WDG:`. Frame records omit channel/RSSI. Status
+records include `storage: sd|serial`, `wifi_count` (queued progress frames),
+`ble_count: 0` and `drops`. A four-frame queue and nonblocking stdout locking
+ensure a slow/unavailable host does not block the radio callback. Existing
+firmware without this stream can still report coarse M1–M4 sightings to WDG.
+
 ## 1.7.3 — Wi-Fi serial capture for uConsole BLE
 
 Adds `start_wardrive_wifi_serial <session>` and the

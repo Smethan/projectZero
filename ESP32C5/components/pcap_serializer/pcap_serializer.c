@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdatomic.h>
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 #include "esp_log.h"
 #include "esp_err.h"
@@ -36,6 +37,10 @@ static const char *TAG = "pcap_serializer";
 
 static unsigned pcap_size = 0;
 static uint8_t *pcap_buffer = NULL;
+static _Atomic(pcap_frame_observer_t) frame_observer;
+void pcap_serializer_set_observer(pcap_frame_observer_t observer) {
+    atomic_store(&frame_observer, observer);
+}
 
 uint8_t *pcap_serializer_init(){
     // Make sure memory from previous attack is freed
@@ -84,6 +89,8 @@ void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size, unsigned
     memcpy(&reallocated_pcap_buffer[pcap_size + sizeof(pcap_record_header_t)], buffer, size);
     pcap_buffer = reallocated_pcap_buffer;
     pcap_size += sizeof(pcap_record_header_t) + size;
+    pcap_frame_observer_t observer = atomic_load(&frame_observer);
+    if (observer) observer(buffer, size);
 }
 
 void pcap_serializer_deinit(){

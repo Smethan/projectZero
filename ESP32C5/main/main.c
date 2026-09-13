@@ -1,4 +1,5 @@
 #include "serial_wardrive.h"
+#include "hs_monitor.h"
 // main.c
 #include <stdio.h>
 #include <string.h>
@@ -129,7 +130,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.3"
+#define JANOS_VERSION "1.7.4"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -7425,6 +7426,7 @@ static void handshake_cleanup(void) {
 
     // Disable promiscuous mode (sniffer mode uses this)
     esp_wifi_set_promiscuous(false);
+    hsm_stop(); /* Finish progress before the legacy base64 file dump. */
 
     // Mark task as finished BEFORE serial dump — cmd_stop() waits for
     // task_handle == NULL and will force-kill the task after 1s timeout.
@@ -7875,6 +7877,7 @@ static void handshake_attack_task(void *pvParameters) {
     (void)pvParameters;
     
     MY_LOG_INFO(TAG, "Handshake attack task started.");
+    if (!hsm_start(handshake_serial_mode)) MY_LOG_INFO(TAG, "HS progress unavailable; capture continues");
     MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks" : "Sniffer + D-UCB");
     
     // Set LED to cyan for handshake attack
@@ -11597,6 +11600,7 @@ static int cmd_stop(int argc, char **argv) {
         // Stop handshake attack if running (old non-task mode)
         attack_handshake_stop();
     }
+    hsm_stop(); /* Also release telemetry after a forced task stop. */
 
     // Stop channel view monitor if running
     channel_view_stop();
