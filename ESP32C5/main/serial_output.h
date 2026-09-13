@@ -12,12 +12,20 @@
 /* The IDF console installs a 256-byte USB TX ring. write_bytes queues the
  * WHOLE request or fails; a larger JSON line can never fit. Keep each write
  * small, lock for the complete line, and bound waiting even with no USB host. */
-static bool serial_output(const char *data, unsigned length, unsigned timeout_ms) {
+static bool serial_output_begin(unsigned timeout_ms) {
     int64_t end=esp_timer_get_time()/1000+timeout_ms;
     while(ftrylockfile(stdout)!=0) {
         if(esp_timer_get_time()/1000>=end) return false;
         vTaskDelay(1);
     }
+    return true;
+}
+
+/* Write while the caller owns stdout through serial_output_begin(). This lets
+ * multi-record protocols keep logs and telemetry out of a complete artifact. */
+static bool serial_output_locked(const char *data, unsigned length,
+                                 unsigned timeout_ms) {
+    int64_t end=esp_timer_get_time()/1000+timeout_ms;
     unsigned sent=0;
     while(sent<length) {
         int64_t left=end-esp_timer_get_time()/1000;
@@ -32,6 +40,16 @@ static bool serial_output(const char *data, unsigned length, unsigned timeout_ms
         if(n>0) sent+=(unsigned)n;
         else vTaskDelay(1);
     }
-    funlockfile(stdout);
     return sent==length;
+}
+
+static void serial_output_end(void) {
+    funlockfile(stdout);
+}
+
+static bool serial_output(const char *data, unsigned length, unsigned timeout_ms) {
+    if (!serial_output_begin(timeout_ms)) return false;
+    bool ok=serial_output_locked(data,length,timeout_ms);
+    serial_output_end();
+    return ok;
 }

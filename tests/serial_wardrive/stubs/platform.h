@@ -44,7 +44,7 @@ static void vTaskDelete(void *task){}
 #define WIFI_PROMIS_FILTER_MASK_DATA 2
 typedef int wifi_promiscuous_pkt_type_t;
 typedef struct {int filter_mask;} wifi_promiscuous_filter_t;
-typedef struct {struct {int sig_len;uint8_t channel;int8_t rssi;}rx_ctrl;uint8_t payload[512];}wifi_promiscuous_pkt_t;
+typedef struct {struct {int sig_len;uint8_t channel;int8_t rssi;uint32_t timestamp;}rx_ctrl;uint8_t payload[512];}wifi_promiscuous_pkt_t;
 static int esp_wifi_set_promiscuous_filter(const wifi_promiscuous_filter_t *f){return 0;}
 static int esp_wifi_set_promiscuous_rx_cb(void (*f)(void*,wifi_promiscuous_pkt_type_t)){return 0;}
 static int esp_wifi_set_promiscuous(bool on){return 0;}

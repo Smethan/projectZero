@@ -17,6 +17,23 @@ LIMITS = {
     ("serial_wardrive.c", "worker"): 512,
     ("hs_monitor.c", "observe"): 256,
     ("hs_monitor.c", "worker"): 512,
+    ("main.c", "hs_sniffer_promiscuous_cb"): 256,
+    ("main.c", "hs_process_queued_frame"): 256,
+    ("main.c", "hs_capture_drain"): 256,
+    ("main.c", "hs_capture_close"): 128,
+    ("main.c", "hs_build_ap_artifact"): 128,
+    ("main.c", "hs_save_ap_to_sd"): 512,
+    ("main.c", "hs_serial_printf_locked"): 384,
+    ("main.c", "dump_base64_serial_locked"): 256,
+    ("main.c", "hs_dump_ap_serial"): 256,
+    ("main.c", "handshake_cleanup"): 128,
+    ("main.c", "hs_scan_complete"): 768,
+    ("main.c", "cmd_handshake_scope"): 256,
+    ("hs_exchange.c", "hsx_ingest"): 256,
+    ("hs_exchange.c", "hsx_set_ap_ssid"): 128,
+    ("hs_exchange.c", "hsx_build_pcap"): 128,
+    ("hs_exchange.c", "parse_eapol"): 128,
+    ("hs_exchange.c", "build_hccapx_candidate"): 256,
 }
 
 

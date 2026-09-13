@@ -90,3 +90,105 @@ age limit applies. Stop disables reception, drains for up to 1.5 seconds plus
 one in-progress frame, counts remaining drops, frees the queue and emits stopped.
 WDG writes PCAP and identifies visible PMKIDs on the uConsole; receiving EAPOL
 does not by itself establish handshake completeness.
+
+## Active HS target-selection extension
+
+Firmware 1.7.9 advertises `hs_capture_targets_v1: true`. This extension adds an
+optional scan-and-select scope to both existing active capture destinations. It
+does not require GPS. `sd` still requires a mounted ESP32 SD card; `serial`
+keeps the existing base64 PCAP/HCCAPX transfer for host-side storage.
+
+### Network snapshot
+
+`hs_scan TOKEN` starts an asynchronous nearby-network scan. `TOKEN` must match
+`[A-Za-z0-9_-]{1,32}`. The ESP32 must be idle, with no scan cancellation still
+draining. Machine records use a separate `HST:` prefix and JSON version 1:
+
+| Kind | Fields |
+| --- | --- |
+| `scan_started` | `scan`, `count`, `error` |
+| `ap` | `scan`, `seq`, `bssid`, `ssid_hex`, `channel`, `rssi`, `auth` |
+| `scan_done` | `scan`, `count`, `error` |
+| `scan_error` | `scan`, `count`, `error` |
+
+`ssid_hex` is zero to 32 binary-safe bytes; `auth` is the ESP-IDF numeric Wi-Fi
+authentication value. AP sequence numbers start at 1 and must be contiguous.
+The terminal `scan_done.count` must equal the number of AP rows. A host accepts
+the snapshot only after the matching token has one `scan_started`, every row in
+order and `scan_done`.
+
+The firmware retrieves the driver's AP list once per scan event and emits at
+most 64 APs. It suppresses the ordinary CSV copy for this scan. Each serial
+write is bounded to 250 ms and the whole result has a three-second output
+budget. Failure, cancellation, a partial serial result or a lost terminal record
+revokes readiness. `stop` waits for the asynchronous scan-done event before it
+acknowledges cancellation; while that event drains, another scan is rejected.
+This prevents a delayed event from completing a newer token.
+
+### Capture scope
+
+```
+start_handshake_scope <sd|serial> all
+start_handshake_scope <sd|serial> TOKEN BSSID[,BSSID...]
+```
+
+`all` starts the original all-nearby sniffer/D-UCB/deauthentication behavior and
+does not need a scan. The selected form accepts 1 to 16 unique unicast BSSIDs
+from the matching completed snapshot. The snapshot expires after five minutes.
+Before installing the capture callback, firmware resolves every BSSID and
+channel and rejects the whole request if any BSSID is missing, open/WEP, on an
+unsupported channel, duplicated or malformed. The resulting BSSID/channel set
+is immutable for the run. Promiscuous reception, D-UCB hopping and active
+deauthentication are then limited to that set.
+
+WDG also refuses BSSIDs on its host whitelist. Direct protocol clients must
+apply their own policy before issuing an active capture command.
+
+Startup errors are single `HST:` records with `kind:"capture_error"`, `storage`
+(`sd` or `serial`) and one of `invalid_targets`, `busy`, `sd_required`,
+`scan_expired`, `target_unavailable`, `target_channel` or `start_failed`.
+Validation is fail closed: an invalid selected request never falls back to
+all-nearby capture.
+
+### Serial artifact framing
+
+The `serial` destination emits one bounded artifact per AP after the callback is
+disabled and its queues are drained. Each artifact is ordered as follows:
+
+```text
+CAPTURE_KIND: VALID|PMKID|PARTIAL
+--- PCAP BEGIN ---
+<base64 PCAP lines>
+--- PCAP END ---
+PCAP_SIZE: <bytes>
+--- HCCAPX BEGIN ---       # VALID only
+<base64 HCCAPX lines>      # VALID only
+--- HCCAPX END ---         # VALID only
+SSID: <ssid>  AP: <BSSID>
+```
+
+`CAPTURE_KIND` always precedes the binary blocks. The final `SSID`/`AP` line is
+the sole commit record; firmware omits it if any preceding serial write fails.
+Firmware owns the stdout lock across the whole sequence so unrelated logs cannot
+interleave. A host must discard an uncommitted partial sequence and reset its
+block state at the next `CAPTURE_KIND` or `PCAP BEGIN`. `PMKID` and `PARTIAL`
+carry PCAP only. `VALID` carries a same-exchange PCAP plus HCCAPX. The active
+artifact PCAP is bounded by `HSX_PCAP_MAX` at 2,136 bytes: its 24-byte global
+header plus no more than four 512-byte frames and their 16-byte record headers.
+
+The Wi-Fi callback only validates routing and copies eligible context/EAPOL
+frames into an eight-frame bounded pool; it does not parse exchanges, allocate,
+write files or use the serial console. The capture task owns those operations
+and drains the pool before output or reset. Per-exchange state lives in PSRAM,
+tracks at most 32 AP/station/replay entries and stores frames up to 512 bytes.
+When full, it may replace the oldest incomplete entry but does not evict a
+completed entry for new traffic.
+
+`HSC:` PMKID and M1-M4 progress remains observation telemetry. Its counts do
+not certify a matching exchange. Firmware 1.7.9 isolates saved EAPOL artifacts
+by AP, station and normalized replay exchange before labeling them complete or
+valid; a row of progress sightings is still not that validation result.
+
+The scan/scope lifecycle, bounds, frame filtering, serial failures and exchange
+matching have native synthetic coverage. Both ESP32-C5 release variants build,
+but this release has not been physically RF-validated for targeted capture.

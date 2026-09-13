@@ -14,6 +14,9 @@ the uConsole host application.
 ### What this fork adds
 - **All Wardrive** — host-owned Wi-Fi/BLE scanning over serial without ESP GPS/SD.
 - **Passive HS Sniff** — EAPOL/PMKID packets streamed to WDG without deauth or SD.
+- **Optional active HS targets** — `hs_scan` plus `start_handshake_scope` limits
+  either SD or serial capture to as many as 16 explicit BSSIDs while retaining
+  the original all-nearby mode.
 - **Fork updates** — versioned XIAO/standard release packages and matching onboard OTA.
 - **Handshake capture without SD card** — PCAP/HCCAPX streamed as base64 over serial, saved on the host machine
 - **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
@@ -66,6 +69,10 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `show_pass` - prints the contents of `/sdcard/lab/portals.txt` for quick review of captured submissions.
 - `start_karma <probe_index>` - re-broadcasts one of the sniffed probe SSIDs so the portal can masquerade as whatever nearby phones expect.
 - `start_handshake` - exclusive LAB feature that spins up a dedicated WPA handshake capture task (shown as **Handshaker** inside the Flipper UI). More details: https://github.com/C5Lab/projectZero/wiki/Handshaker
+- `hs_scan <token>` / `start_handshake_scope <sd|serial> ...` - optional
+  scan-bound BSSID selection for the same active/deauthentication capture. Use
+  `all`, or 1-16 BSSIDs from a fresh scan token; see the
+  [serial protocol](docs/SERIAL_WARDRIVE_PROTOCOL.md#active-hs-target-selection-extension).
 - `save_handshake` - manual flush of a completed 4-way handshake to the SD card when you want to preserve it before stopping attacks.
 
 ### Disruption & Containment
@@ -128,36 +135,61 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 
 > **Important:** The upstream [C5Lab web flasher](https://c5lab.github.io/projectZero/) only supports mainline firmware and will **not** work with this fork. Use one of the methods below.
 
-### Method 1: flash_board.py (recommended)
+Download the board-specific ZIP from the
+[latest Smethan/projectZero release](https://github.com/Smethan/projectZero/releases/latest).
+In these filenames, `<version>` is the numeric release version without the leading
+`v` from its tag:
 
-1. Download **`esp32c5-firmware.zip`** from the [latest release](https://github.com/LOCOSP/projectZero/releases/latest) and unzip it.
-2. Install dependencies:
+- **ESP32-C5-WROOM-1:** `projectZerobyLOCOSP-<version>.zip`, containing the
+  `projectZerobyLOCOSP.bin` application.
+- **XIAO ESP32-C5:** `projectZerobyLOCOSP-xiao-<version>.zip`, containing the
+  `projectZerobyLOCOSP-xiao.bin` application.
+
+Each ZIP also contains `bootloader.bin`, `partition-table.bin`,
+`ota_data_initial.bin`, and a `manifest.json` with the board, offsets, sizes, and
+file hashes. The release's `SHA256SUMS` covers both ZIPs.
+
+### Method 1: esptool (recommended manual method)
+
+1. Unzip the correct board-specific release archive.
+2. Install or update esptool:
    ```bash
-   pip install --upgrade esptool pyserial
+   python -m pip install --upgrade esptool
    ```
 3. Put the ESP32-C5 into download mode — hold the **BOOT** button while plugging in USB (or while pressing **RESET**), then release.
-4. Flash:
+4. From the unzipped archive, flash all four binaries. Replace the example port
+   with the board's serial port.
+
+   ESP32-C5-WROOM-1:
    ```bash
-   python flash_board.py --port /dev/ttyUSB0          # Linux
-   python flash_board.py --port COM10                 # Windows
-   python flash_board.py --port /dev/ttyUSB0 --erase  # full erase before flash
+   python -m esptool --chip esp32c5 --port /dev/ttyUSB0 --baud 460800 write-flash --flash-mode dio --flash-freq 80m 0x2000 bootloader.bin 0x8000 partition-table.bin 0xf000 ota_data_initial.bin 0x20000 projectZerobyLOCOSP.bin
    ```
+
+   XIAO ESP32-C5:
+   ```bash
+   python -m esptool --chip esp32c5 --port /dev/ttyACM0 --baud 460800 write-flash --flash-mode dio --flash-freq 80m 0x2000 bootloader.bin 0x8000 partition-table.bin 0xf000 ota_data_initial.bin 0x20000 projectZerobyLOCOSP-xiao.bin
+   ```
+
+   On Windows, use the board's COM port, such as `COM10`, in place of the
+   `/dev/ttyUSB0` or `/dev/ttyACM0` example.
 5. The board reboots automatically after flashing.
 
 ### Method 2: Browser-based flasher (esptool-js)
 
 No installation needed — works in Chrome/Edge with WebSerial support.
 
-1. Download and unzip **`esp32c5-firmware.zip`** from the [latest release](https://github.com/LOCOSP/projectZero/releases/latest).
+1. Download and unzip the correct WROOM or XIAO archive from the
+   [latest Smethan/projectZero release](https://github.com/Smethan/projectZero/releases/latest).
 2. Open [Espressif Web Flasher](https://espressif.github.io/esptool-js/) in your browser.
 3. Put the ESP32-C5 into download mode (hold **BOOT** + plug USB).
 4. Click **Connect**, select the serial port, and set baud to **460800**.
 5. Add the firmware files with these flash addresses:
    | File | Address |
    |------|---------|
-   | `bootloader.bin` | `0x0` |
+   | `bootloader.bin` | `0x2000` |
    | `partition-table.bin` | `0x8000` |
-   | `projectZero.bin` | `0x10000` |
+   | `ota_data_initial.bin` | `0xf000` |
+   | `projectZerobyLOCOSP.bin` (WROOM) or `projectZerobyLOCOSP-xiao.bin` (XIAO) | `0x20000` |
 6. Click **Program** and wait for it to finish.
 7. After flashing, copy `oui_wifi.bin` to the SD card at `/lab/oui_wifi.bin` (optional, for vendor name lookups).
 
@@ -168,7 +200,8 @@ If the ESP32-C5 is connected through a Flipper Zero:
 1. On the Flipper, open **GPIO → USB-UART Bridge** so it presents a serial adapter to the host PC.
 2. While holding the **BOOT** button on the LAB C5 board, plug the board into the Flipper; release BOOT after it clicks in.
 3. Connect the Flipper to your PC over USB.
-4. Run `flash_board.py` as shown in Method 1 — it will detect the bridge automatically (close qFlipper first).
+4. Run the matching `esptool` command from Method 1 with the bridge's serial
+   port (close qFlipper first).
 
 ### Flashing Troubleshooting
 
@@ -178,7 +211,9 @@ If the ESP32-C5 is connected through a Flipper Zero:
 
 ## Credits
 
-This fork is maintained by [LOCOSP](https://github.com/LOCOSP). The original projectZero is built by the [C5Lab](https://github.com/C5Lab) team.
+This WDG-focused fork is maintained by [Smethan](https://github.com/Smethan) and
+builds on [LOCOSP/projectZero](https://github.com/LOCOSP/projectZero), which in
+turn derives from the original [C5Lab/projectZero](https://github.com/C5Lab/projectZero).
 
 ## Community and Docs
 

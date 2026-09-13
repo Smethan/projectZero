@@ -233,6 +233,10 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_evil_twin` — clone first selected AP + deauth others, captive portal harvests password. Optional `select_html`.
 - `sae_overflow` — WPA3 SAE client‑overflow on exactly one selected AP.
 - `start_handshake` — capture WPA handshakes (targeted with selection, else scan‑and‑attack loop). Saves PCAP/HCCAPX.
+- `start_handshake_serial` — run the same active sniffer/D-UCB/deauthentication capture and transfer PCAP/HCCAPX over serial. No SD card or GPS is required.
+- `hs_scan <token>` — create the five-minute network snapshot used by optional BSSID-scoped active capture. The token is 1-32 letters, digits, `_` or `-`.
+- `start_handshake_scope <sd|serial> all` — start either existing capture destination with its original all-nearby scope.
+- `start_handshake_scope <sd|serial> <token> <BSSID[,BSSID...]>` — capture 1-16 BSSIDs from the matching completed `hs_scan` snapshot.
 - `save_handshake` — manually save a captured complete 4‑way handshake.
 - `start_blackout` — scan all networks every 3 min and deauth everything.
 - `start_beacon_spam "SSID1" "SSID2" ...` — broadcast fake beacons (max 32 SSIDs, 1‑32 chars each).
@@ -243,6 +247,35 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_darksword` — advanced attack/exfil module. Run `help start_darksword` for current options. Stop with `stop`.
 
 All attacks stop with `stop`.
+
+### Optional HS target scope
+
+`hs_scan` streams machine-readable `HST:` JSON records: `scan_started`, one
+contiguously numbered `ap` record per result, then `scan_done`; failures use
+`scan_error`. AP records include `bssid`, binary-safe `ssid_hex`, `channel`,
+`rssi`, and numeric ESP-IDF `auth`. Hosts must require the same token, complete
+sequence, and terminal count before using a snapshot.
+
+The selected `start_handshake_scope` form rejects the entire request if the
+snapshot is incomplete or older than five minutes, or if any target is missing,
+malformed, duplicated, open/WEP, or on an unsupported channel. It does not fall
+back to all nearby networks. The resolved BSSID/channel list remains immutable
+until `stop`, and reception, channel hopping and deauthentication are limited to
+that list. `capture_error` records report `storage` plus `invalid_targets`,
+`busy`, `sd_required`, `scan_expired`, `target_unavailable`, `target_channel`,
+or `start_failed`.
+
+`stop` waits for an asynchronous scan cancellation event before acknowledging
+it. New scans remain blocked while that event drains, so an old event cannot
+complete a newer token. WDG applies its own whitelist before sending a selected
+command; direct console clients must apply their own allow/exclude policy.
+
+The `HSC:` PMKID/M1-M4 counters are packet sightings. They are not proof of a
+matched exchange. Firmware 1.7.9 labels an EAPOL artifact complete/valid only
+when the captured pair has the same AP, station and normalized replay exchange.
+For serial storage, each stopped-run artifact starts with `CAPTURE_KIND:
+VALID|PMKID|PARTIAL`, followed by its PCAP, an HCCAPX block only for `VALID`,
+and a final `SSID: ... AP: ...` commit line. A serial failure omits that commit.
 
 ## WiFi connection (STA)
 

@@ -1,5 +1,46 @@
 # Smethan fork firmware
 
+## 1.7.9 — Optional active HS targets and capture isolation
+
+- Advertise `hs_capture_targets_v1` and add `hs_scan <token>` plus
+  `start_handshake_scope <sd|serial> all|<token> <BSSID,...>`. Both existing
+  active destinations retain all-nearby operation. A selected run accepts at
+  most 16 BSSIDs from one completed five-minute scan, then limits promiscuous
+  reception, D-UCB channel hopping and active deauthentication to that immutable
+  BSSID/channel set. Neither destination requires GPS; `sd` still requires a
+  mounted ESP32 SD card.
+- Fail closed on malformed, duplicate, missing, open/WEP, stale-token or
+  unsupported-channel targets. `HST:` JSON carries binary-safe SSIDs, contiguous
+  AP sequence numbers and explicit scan/capture errors; an invalid selected
+  request never becomes an all-nearby attack.
+- Give each asynchronous scan event one owner. The scan handler retrieves and
+  frees the ESP-IDF AP list exactly once, suppresses duplicate legacy CSV output,
+  bounds serial output, and publishes a snapshot only after all rows are sent.
+  `stop` waits for a cancelled scan's completion event, and new scans remain
+  blocked until that event drains, preventing stale events from completing a
+  newer token.
+- Isolate EAPOL state by AP, station and normalized replay exchange. Only a
+  matching M1+M2 or M2+M3 pair produces a complete HCCAPX/result; PMKID-bearing
+  association context and partial PCAP evidence can still be preserved without
+  being labeled a complete exchange. The live `HSC:` PMKID/M1-M4 counters remain
+  packet sightings rather than validation. The Wi-Fi callback only bounded-copies
+  eligible frames; a task owns parsing, storage and the 32-entry PSRAM exchange
+  table, with a 512-byte stored-frame limit.
+- Repair the SD HCCAPX reset order so the captured message-pair state is read
+  before any serializer reset. Storage/result messages now describe files that
+  were actually emitted, keep one exchange/AP per artifact, and retain usable
+  PCAP data when no matching HCCAPX exists. Serial artifacts announce
+  `CAPTURE_KIND: VALID|PMKID|PARTIAL` before any block and emit their sole
+  SSID/AP commit line only after every required block succeeds. One stdout lock
+  covers the full artifact so normal logs cannot split its framing.
+
+Native tests cover strict target parsing, 802.11 BSSID direction mapping,
+scan-token lifecycle and cancellation races, serial loss/deadlines, storage
+startup failures, exchange matching and artifact construction. Both ESP32-C5
+release variants build with stack guards. These are synthetic/build checks;
+targeted capture and RF completeness were not physically validated for this
+release.
+
 ## 1.7.8 — Faster native USB OTA
 
 Measured on the uConsole: **53.33 seconds** for a complete published-release
