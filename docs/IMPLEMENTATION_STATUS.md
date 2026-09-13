@@ -1,6 +1,34 @@
 # Implementation and verification — 2026-09-12
 
-Implemented in the user's LOCOSP-derived forks on `feature/all-wardrive`. No upstream PR, merge or push. No device connection or flashing.
+Current maintenance is on the user's fork `main`; the original feature-branch
+checkpoints below are historical. No upstream PR, merge or push.
+
+## 1.7.5 capture memory repair
+
+Investigated a reported HS Sniff reboot on 1.7.4 without a device panic log.
+The release reduces memory pressure and handles startup failures; it is not a
+hardware-confirmed diagnosis of that individual crash.
+
+- Capture frame pools are allocated only during sessions, prefer PSRAM, and
+  fall back to checked internal allocation. Callback/worker queue entries are
+  pointers; full packets are not local stack variables.
+- XIAO static HP SRAM: 226339 -> 217451 bytes (8888 reclaimed). HS Sniff worker
+  allocation: 10240 -> 6144 bytes. These are build/allocation sizes, not measured
+  runtime free-heap values.
+- ESP32-C5 compiler local-stack measurements: passive callback 2352 -> 32,
+  passive worker 2368 -> 144, progress observer 2336 -> 16, progress worker
+  2352 -> 48 bytes. The complete call chains also use stack. Release CI checks
+  conservative local-frame limits to prevent reintroducing packet arrays.
+- Native tests cover pool ownership/full-size packet integrity, exhaustion,
+  missing PSRAM, allocation/task/radio failures, late callbacks and cleanup.
+  The production Wi-Fi initialization function is fault-injected at all 11
+  fallible stages and successfully retried without duplicate user handlers.
+  These tests also pass AddressSanitizer/UndefinedBehaviorSanitizer.
+- Serial preparation preserves a healthy Wi-Fi driver after stopping other
+  operations. Explicit stop still resets Wi-Fi. Wi-Fi initialization happens
+  before capture allocation and returns errors instead of calling abort.
+- Existing WDG protocol/PMKID/M1-M4 displays and All Wardrive scheduling remain
+  compatible. No device flashing was performed for this repair.
 
 ## Passive HS Sniff update — 2026-09-12
 

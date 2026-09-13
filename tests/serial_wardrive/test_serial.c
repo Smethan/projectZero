@@ -1,8 +1,8 @@
 /* Compile the real transport/callback code against in-memory radio/RTOS shims. */
 #include "../../ESP32C5/main/serial_wardrive.c"
-static bool radio_ok=true;
+static bool radio_ok=true, prepare_ok=true;
 static int stopped_radios, hops;
-bool sw_prepare(void){return true;}
+bool sw_prepare(void){return prepare_ok;}
 bool sw_radio_start(void){return radio_ok;}
 void sw_radio_stop(void){stopped_radios++;}
 void sw_radio_hop(unsigned i){hops++;}
@@ -53,16 +53,31 @@ int main(void){
     assert(hs_capture_kind(hs.payload,336)==2);
     assert(hs_capture_kind(hs.payload,335)==0); /* truncated declared EAPOL */
     hs.payload[1]|=0x40;assert(!hs_capture_kind(hs.payload,336));hs.payload[1]=2;
-    hs_wifi_cb(&hs,WIFI_PKT_DATA);hs_observation raw;assert(xQueueReceive(hs_queue,&raw,0));
-    assert(raw.len==336);hs_emit(&raw);
+    hs_wifi_cb(&hs,WIFI_PKT_DATA);hs_observation *raw;assert(xQueueReceive(hs_pool.ready,&raw,0));
+    assert(raw->len==336);hs_emit(raw);capture_pool_release(&hs_pool,raw);
     assert(strstr(output_capture,"\"kind\":\"hs_packet\"") && strstr(output_capture,"\"offset\":240"));
     assert(!strstr(output_capture,"\"kind\":\"ble\""));
     hs.payload[30]=0x08;assert(!hs_capture_kind(hs.payload,336));hs.payload[30]=0x88;
     for(int i=0;i<10;i++) hs_wifi_cb(&hs,WIFI_PKT_DATA);
-    assert(uxQueueMessagesWaiting(hs_queue)==8 && atomic_load(&drops)>=2);
-    atomic_store(&stopping,true);test_task(NULL);assert(!sw_active() && hs_queue==NULL);
+    assert(uxQueueMessagesWaiting(hs_pool.ready)==8 && atomic_load(&drops)>=2);
+    atomic_store(&stopping,true);test_task(NULL);assert(!sw_active() && hs_pool.ready==NULL);
     assert(strstr(output_capture,"stopped"));
-    task_ok=0;assert(start(2,hs_args)==1 && hs_queue==NULL && !sw_active());task_ok=1;
+    task_ok=0;assert(start(2,hs_args)==1 && hs_pool.ready==NULL && !sw_active());task_ok=1;
+    assert(!heap_live);
+    prepare_ok=false;output_capture[0]=0;
+    assert(start(2,hs_args)==1 && !sw_active() && !heap_live);
+    assert(strstr(output_capture,"radio_prepare_failed"));prepare_ok=true;
+    output_capture[0]=0;fail_psram=fail_internal=true;
+    assert(start(2,hs_args)==1 && !sw_active() && !heap_live);
+    assert(strstr(output_capture,"capture_allocation_failed"));
+    fail_internal=false;assert(start(2,hs_args)==0); /* no PSRAM board */
+    assert(last_heap_caps==(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    atomic_store(&stopping,true);test_task(NULL);assert(!heap_live);
+    hs_wifi_cb(&hs,WIFI_PKT_DATA); /* callback arriving after cleanup */
+    fail_psram=false;
+    assert(start(2,hs_args)==0);radio_ok=false;output_capture[0]=0;
+    test_task(NULL);assert(!sw_active() && !heap_live && !hs_pool.ready);
+    assert(strstr(output_capture,"radio_start_failed") && strstr(output_capture,"stopped"));
     fresh();assert(!sw_hs_mode());atomic_store(&stopping,true);test_task(NULL);
     char *wifi_args[]={"start_wardrive_wifi_serial","host-ble"};
     assert(start(2,wifi_args)==0 && sw_wifi_only_mode() && !sw_hs_mode());

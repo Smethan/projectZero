@@ -55,6 +55,19 @@ this session; it must not be interpreted as a count of host BLE observations.
 
 ## Passive handshake/PMKID serial extension
 
+Firmware 1.7.5 uses a session-owned eight-buffer pool for passive capture and a
+separate four-buffer pool for HS Capture progress. Pools prefer PSRAM and fall
+back to checked internal allocations. Queue entries are pointers, and buffers
+remain owned by their producer/consumer until returned; this removes full-frame
+copies from task stacks. These pools are released on stop or failed startup.
+The ordinary Wi-Fi/BLE observation queue remains static.
+
+Passive startup reports `kind: error` with `radio_prepare_failed`,
+`capture_allocation_failed`, `task_allocation_failed`, or `radio_start_failed`
+as appropriate. The existing host error/stop handling remains compatible.
+`capture_memory` console logs at startup/failure report heap headroom; they are
+not additional protocol records and do not renew the host lease.
+
 `hs_sniff_serial_v1: true` advertises `start_hs_sniff_serial TOKEN`. This selects
 a separate passive Wi-Fi capture mode using the same owner, session, keepalive,
 status and stop protocol. It uses WIFI_MODE_NULL, no BLE scanning or Wi-Fi

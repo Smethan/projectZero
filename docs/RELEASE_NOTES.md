@@ -1,5 +1,40 @@
 # Smethan fork firmware
 
+## 1.7.5 — Capture memory and startup recovery
+
+Addresses the memory hazards found while investigating HS Sniff reboots on
+1.7.4. The reported device panic was unavailable, so a successful field test
+is still needed to confirm resolution of that specific crash.
+
+- HS Sniff and HS Capture progress now use bounded pools of packet buffers,
+  allocated only while running. PSRAM is preferred when available, with a
+  checked internal-RAM fallback. Callback and worker stacks hold pointers
+  instead of full 2304-byte packets. No allocation or logging occurs in the
+  packet callbacks. Pool exhaustion drops progress records rather than waiting.
+- Removes the permanent 9280-byte HS Capture progress queue. Including the new
+  pool metadata, the XIAO build reclaims 8888 bytes of static internal RAM.
+  The HS Sniff worker stack is reduced from 10240 to 6144 bytes after removing
+  the large local frame. The PCAP and serial record formats are unchanged.
+- Serial capture preparation stops conflicting operations without performing
+  another full Wi-Fi teardown after WDG's explicit stop. Wi-Fi is initialized
+  before allocating the capture pool/task. Explicit stop retains its radio
+  reset behavior.
+- Wi-Fi initialization returns allocation/API errors and cleans up partial
+  startup instead of aborting. Capture allocation failures produce a session
+  error. Startup diagnostics report free internal RAM, its largest contiguous
+  block, and free PSRAM; these are occasional logs, not recurring packet logs.
+- Adds allocation/ownership/retry regression tests and compiler stack-frame
+  limits for both capture callbacks and workers in the release workflow.
+
+All Wardrive keeps its current continuous Wi-Fi channel hopping and reduced
+BLE scan duty cycle. Ten-second output batches alone would not remove radio
+contention and would require more buffering/delay (current records expire at
+two seconds). Alternating Wi-Fi/BLE windows would be a separate scheduling
+change with capture gaps. The existing host-BLE option remains available.
+
+Use the **XIAO ESP32-C5** package for the XIAO board. Existing WDG 0.9.20 is
+compatible; this release does not require a WDG update or an SD card for HS Sniff.
+
 ## 1.7.4 — HS Capture progress stream
 
 Both existing HS Capture variants now send a bounded `HSC:` progress stream

@@ -1,5 +1,7 @@
 #include "serial_wardrive.h"
 #include "hs_monitor.h"
+#include "capture_memory.h"
+#include "esp_wifi_default.h"
 // main.c
 #include <stdio.h>
 #include <string.h>
@@ -130,7 +132,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.4"
+#define JANOS_VERSION "1.7.5"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1927,6 +1929,7 @@ static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
+static int stop_operations(bool reset_wifi);
 static int cmd_init_nrf24(int argc, char **argv);
 static int cmd_start_jammer24(int argc, char **argv);
 static int cmd_start_zig_recon(int argc, char **argv);
@@ -3449,60 +3452,71 @@ static void ota_log_boot_info(void) {
 // --- Wi-Fi initialization (STA only - uses less memory) ---
 // AP mode will be enabled dynamically when needed (Evil Twin, Portal)
 static esp_err_t wifi_init_ap_sta(void) {
-    // Initialize netif only once (shared between WiFi and BLE modes)
+    esp_err_t ret = ESP_OK;
+    bool driver_ready = false, new_sta = false;
+    capture_memory_log("wifi_init_begin");
+    /* These operations allocate memory. Return failures to the caller instead
+     * of converting an ordinary low-memory condition into a panic/reboot. */
+#define WIFI_TRY(operation) do { \
+    ret = (operation); \
+    if (ret != ESP_OK) { \
+        ESP_LOGE(TAG, "%s failed: %s", #operation, esp_err_to_name(ret)); \
+        goto failed; \
+    } \
+} while (0)
     if (!netif_initialized) {
-        ESP_ERROR_CHECK(esp_netif_init());
+        WIFI_TRY(esp_netif_init());
         netif_initialized = true;
     }
-    
-    // Create event loop only once (shared between WiFi and BLE modes)
     if (!event_loop_initialized) {
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        WIFI_TRY(esp_event_loop_create_default());
         event_loop_initialized = true;
     }
-
-    // Only create STA interface once (reused on WiFi re-init)
     if (sta_netif_handle == NULL) {
-        sta_netif_handle = esp_netif_create_default_wifi_sta();
+        /* The default convenience constructor asserts on allocation failure.
+         * Use its underlying public APIs with explicit cleanup instead. */
+        esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_WIFI_STA();
+        sta_netif_handle = esp_netif_new(&netif_cfg);
+        if (!sta_netif_handle) { ret = ESP_ERR_NO_MEM; goto failed; }
+        new_sta = true;
+        WIFI_TRY(esp_netif_attach_wifi_station(sta_netif_handle));
+        WIFI_TRY(esp_wifi_set_default_wifi_sta_handlers());
     }
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    // Register event handler only once (survives WiFi reinit after mode switch)
+    WIFI_TRY(esp_wifi_init(&cfg));
+    driver_ready = true;
     if (!wifi_event_handler_registered) {
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                            ESP_EVENT_ANY_ID,
-                                                            &wifi_event_handler,
-                                                            NULL,
-                                                            NULL));
+        WIFI_TRY(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                      &wifi_event_handler, NULL, NULL));
         wifi_event_handler_registered = true;
     }
     if (!ip_event_handler_registered) {
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                            IP_EVENT_STA_GOT_IP,
-                                                            &ip_event_handler,
-                                                            NULL,
-                                                            NULL));
+        WIFI_TRY(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                      &ip_event_handler, NULL, NULL));
         ip_event_handler_registered = true;
     }
-
     wifi_config_t wifi_config = { 0 };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
+    WIFI_TRY(esp_wifi_set_mode(WIFI_MODE_STA));
+    WIFI_TRY(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    WIFI_TRY(esp_wifi_start());
+#undef WIFI_TRY
     uint8_t mac[6];
-    esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
-
-    if (ret == ESP_OK) {
-         MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    } else {
-        ESP_LOGE("MAC", "Failed to get MAC address");
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+        MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-
+    capture_memory_log("wifi_init_ready");
     return ESP_OK;
+
+failed:
+    if (driver_ready) { esp_wifi_stop(); esp_wifi_deinit(); }
+    if (new_sta) {
+        esp_netif_destroy_default_wifi(sta_netif_handle);
+        sta_netif_handle = NULL;
+    }
+    capture_memory_log("wifi_init_failed");
+    ESP_LOGE(TAG, "WiFi initialization failed: %s; retry after freeing resources", esp_err_to_name(ret));
+    return ret;
 }
 
 static esp_err_t wifi_apply_extended_country(void)
@@ -6499,7 +6513,12 @@ cleanup:
     vTaskDelete(NULL);
 }
 
-bool sw_prepare(void) { return cmd_stop(0, NULL) == 0; }
+/* WDG already stops before starting; also support direct serial commands.
+ * Quiesce operations without tearing down a healthy Wi-Fi driver a second time. */
+bool sw_prepare(void) {
+    /* Initialize the radio before allocating capture buffers/task stacks. */
+    return stop_operations(false) == 0 && ensure_wifi_mode();
+}
 static wifi_band_mode_t sw_saved_band;
 static wifi_promiscuous_filter_t sw_saved_filter;
 static bool sw_saved_radio;
@@ -6509,10 +6528,10 @@ bool sw_radio_start(void) {
     if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
         handshake_attack_active || antisurv_active) return false;
     if (!ensure_wifi_mode()) return false;
+    if (esp_wifi_get_band_mode(&sw_saved_band) != ESP_OK ||
+        esp_wifi_get_promiscuous_filter(&sw_saved_filter) != ESP_OK ||
+        esp_wifi_get_mode(&sw_saved_mode) != ESP_OK) return false;
     sw_saved_radio = true;
-    esp_wifi_get_band_mode(&sw_saved_band);
-    esp_wifi_get_promiscuous_filter(&sw_saved_filter);
-    esp_wifi_get_mode(&sw_saved_mode);
     if (sw_wifi_only_mode()) {
         /* NULL mode has no STA/AP traffic: no probes, association or deauth.
          * The serial ownership gate keeps other radio commands out. */
@@ -11481,8 +11500,12 @@ static int cmd_start_beacon_spam_ssids(int argc, char **argv) {
 }
 
 static int cmd_stop(int argc, char **argv) {
-    if (!sw_stop()) { printf("Serial stop timed out; retry stop.\n"); return 1; }
     (void)argc; (void)argv;
+    return stop_operations(true);
+}
+
+static int stop_operations(bool reset_wifi) {
+    if (!sw_stop()) { printf("Serial stop timed out; retry stop.\n"); return 1; }
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
 
@@ -11996,24 +12019,24 @@ static int cmd_stop(int argc, char **argv) {
             esp_wifi_disconnect();
         }
         
-        // Reset WiFi to clean state
-        MY_LOG_INFO(TAG, "Resetting WiFi...");
-        esp_wifi_stop();
-        esp_wifi_deinit();
-        
-        // Destroy AP netif if exists
-        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-        if (ap_netif) {
-            esp_netif_destroy(ap_netif);
-        }
-        ap_netif_handle = NULL;
-        
-        wifi_initialized = false;
-        current_radio_mode = RADIO_MODE_NONE;
-        
-        // Reinitialize WiFi fresh (STA mode)
-        if (!ensure_wifi_mode()) {
-            MY_LOG_INFO(TAG, "Warning: Failed to reinitialize WiFi after stop");
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (reset_wifi) {
+            // Reset WiFi to clean state for an explicit stop command.
+            MY_LOG_INFO(TAG, "Resetting WiFi...");
+            esp_wifi_stop();
+            esp_wifi_deinit();
+
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) esp_netif_destroy(ap_netif);
+            ap_netif_handle = NULL;
+            wifi_initialized = false;
+            current_radio_mode = RADIO_MODE_NONE;
+
+            if (!ensure_wifi_mode()) {
+                MY_LOG_INFO(TAG, "Warning: Failed to reinitialize WiFi after stop");
+                return 1;
+            }
         }
     }
     

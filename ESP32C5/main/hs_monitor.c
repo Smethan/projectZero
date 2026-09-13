@@ -1,6 +1,8 @@
 /* Bounded, nonblocking observer of existing HS Capture PCAP appends. */
 #include "hs_monitor.h"
 #include "hs_capture.h"
+#include "capture_pool.h"
+#include "capture_memory.h"
 #include "pcap_serializer.h"
 #include <stdatomic.h>
 #include <stdio.h>
@@ -14,9 +16,7 @@
 #include "sdkconfig.h"
 
 typedef struct { int64_t at; unsigned size; uint8_t data[2304]; } frame_t;
-static StaticQueue_t storage;
-static uint8_t queue_bytes[4 * sizeof(frame_t)];
-static QueueHandle_t queue;
+static capture_pool_t pool;
 static atomic_bool enabled, stopping, running;
 static atomic_uint producers, dropped, frames;
 static unsigned seq, packet;
@@ -53,9 +53,11 @@ static void observe(const uint8_t *data,unsigned size) {
     if(!atomic_load(&enabled)) goto done;
     if(!hs_capture_kind(data,size)) goto done;
     if(size>2304) { atomic_fetch_add(&dropped,1); goto done; }
-    frame_t frame={.at=now_ms(),.size=size};
-    memcpy(frame.data,data,size);
-    if(xQueueSend(queue,&frame,0)!=pdTRUE) atomic_fetch_add(&dropped,1);
+    frame_t *frame=capture_pool_acquire(&pool);
+    if(!frame) { atomic_fetch_add(&dropped,1); goto done; }
+    frame->at=now_ms(); frame->size=size;
+    memcpy(frame->data,data,size);
+    if(!capture_pool_publish(&pool,frame)) atomic_fetch_add(&dropped,1);
     else atomic_fetch_add(&frames,1);
 done:
     atomic_fetch_sub(&producers,1);
@@ -80,29 +82,41 @@ static void worker(void *unused) {
     int64_t stats=now_ms(),end=0;
     while(true) {
         if(atomic_load(&stopping) && !end) end=now_ms()+200;
-        if(end && (now_ms()>=end || !uxQueueMessagesWaiting(queue))) break;
-        frame_t frame;
-        if(xQueueReceive(queue,&frame,pdMS_TO_TICKS(10))==pdTRUE) emit(&frame);
+        if(end && (now_ms()>=end || !uxQueueMessagesWaiting(pool.ready))) break;
+        frame_t *frame;
+        if(xQueueReceive(pool.ready,&frame,pdMS_TO_TICKS(10))==pdTRUE) {
+            emit(frame); capture_pool_release(&pool,frame);
+        }
         if(now_ms()-stats>=2000) { status("stats");stats=now_ms(); }
     }
-    atomic_fetch_add(&dropped,uxQueueMessagesWaiting(queue));
+    pcap_serializer_set_observer(NULL);
+    atomic_store(&enabled,false);
+    while(atomic_load(&producers)) vTaskDelay(1);
+    atomic_fetch_add(&dropped,uxQueueMessagesWaiting(pool.ready));
+    capture_pool_close(&pool);
     status("stopped");
     atomic_store(&running,false);
     vTaskDelete(NULL);
 }
 bool hsm_start(bool serial_storage) {
     if(atomic_load(&running) || atomic_load(&producers)) return false;
-    if(!queue) queue=xQueueCreateStatic(4,sizeof(frame_t),queue_bytes,&storage);
-    xQueueReset(queue);
+    capture_memory_log("hs_progress_begin");
+    if(!capture_pool_open(&pool,4,sizeof(frame_t))) {
+        capture_memory_log("hs_progress_allocation_failed"); return false;
+    }
     serial_mode=serial_storage;seq=packet=0;
     snprintf(session,sizeof(session),"%llx",(unsigned long long)esp_timer_get_time());
     atomic_store(&dropped,0);atomic_store(&frames,0);
     atomic_store(&stopping,false);atomic_store(&running,true);
-    if(xTaskCreate(worker,"hs_progress",6144,NULL,3,NULL)!=pdPASS) {
-        atomic_store(&running,false);return false;
-    }
     atomic_store(&enabled,true);
     pcap_serializer_set_observer(observe);
+    if(xTaskCreate(worker,"hs_progress",6144,NULL,3,NULL)!=pdPASS) {
+        pcap_serializer_set_observer(NULL);
+        atomic_store(&enabled,false);
+        while(atomic_load(&producers)) vTaskDelay(1);
+        capture_pool_close(&pool);
+        atomic_store(&running,false);return false;
+    }
     return true;
 }
 void hsm_stop(void) {

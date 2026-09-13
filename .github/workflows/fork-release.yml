@@ -38,7 +38,8 @@ jobs:
               cat "$build_source/sdkconfig.xiao" >> "$build_source/sdkconfig"
             fi
             docker run --rm -v "$build_source:/project" -w /project "$IDF_IMAGE" \
-              idf.py --preview build size 2>&1 | tee "dist/build-$board.log"
+              idf.py --preview -DCMAKE_C_FLAGS=-fstack-usage build size 2>&1 | tee "dist/build-$board.log"
+            python3 scripts/check_capture_stack.py "$build_source/build" | tee "dist/capture-stack-$board.log"
             python3 scripts/package_release.py --board "$board" --source "$build_source" --output dist
           done
           cd dist
