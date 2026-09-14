@@ -5,6 +5,8 @@
 #include "usb_ota.h"
 #include "capture_pool.h"
 #include "capture_memory.h"
+#include "esp_heap_caps.h"
+#include "linenoise/linenoise.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -22,6 +24,7 @@
 static atomic_bool active, stopping, collecting;
 static bool passive_hs;
 static bool wifi_only;
+static bool batch_mode;
 bool sw_hs_mode(void) { return passive_hs; }
 bool sw_wifi_only_mode(void) { return wifi_only || passive_hs; }
 #define HS_MAX_FRAME 2304
@@ -40,7 +43,9 @@ static StaticQueue_t queue_storage;
 static uint8_t queue_bytes[QLEN * 128];
 static QueueHandle_t queue;
 static char session[33];
-static unsigned seq;
+static atomic_uint seq;
+static atomic_uint batch_number;
+static atomic_int batch_phase; /* 0 idle, 1 collecting, 2 reporting */
 typedef struct {
     int64_t at;
     uint8_t kind, addr[6], rx[6], bssid[6], addr_type, event, len, data[62];
@@ -49,9 +54,13 @@ typedef struct {
 } observation;
 _Static_assert(sizeof(observation) <= 128, "queue backing size");
 static struct { uint32_t hash; int64_t at; } seen[CACHE];
+typedef struct { uint32_t hash; bool used; observation value; } batch_slot;
+static batch_slot *batch_slots;
+static unsigned batch_capacity;
 static portMUX_TYPE cache_lock = portMUX_INITIALIZER_UNLOCKED;
 bool sw_active(void) { return atomic_load(&active); }
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+static unsigned next_seq(void) { return atomic_fetch_add(&seq,1)+1; }
 static void hex(char *out, const uint8_t *in, size_t len) {
     static const char h[]="0123456789abcdef";
     for (size_t i=0;i<len;i++) { out[2*i]=h[in[i]>>4]; out[2*i+1]=h[in[i]&15]; }
@@ -69,10 +78,28 @@ static void output(const char *body) {
         atomic_fetch_add(&drops,1);
 }
 
+/* Batch control frames are sparse and define lifecycle state.  Give them a
+ * larger deadline and retry the exact same frame/sequence number. */
+static bool control_output(const char *body) {
+    char line[1024];
+    int n=snprintf(line,sizeof(line),"\nWDG:%s\n",body);
+    if(n<=0 || n>=sizeof(line)) { atomic_fetch_add(&drops,1); return false; }
+    for(unsigned attempt=0;attempt<3;attempt++)
+        if(serial_output(line,n,250)) return true;
+    atomic_fetch_add(&drops,1);
+    return false;
+}
+
 static void status(const char *kind,const char *extra) {
     char b[512];
-    snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"uptime_ms\":%lld,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u%s}",kind,session,++seq,(long long)now_ms(),atomic_load(&wifi_count),atomic_load(&ble_count),atomic_load(&drops),extra);
+    snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"uptime_ms\":%lld,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u%s}",kind,session,next_seq(),(long long)now_ms(),atomic_load(&wifi_count),atomic_load(&ble_count),atomic_load(&drops),extra);
     output(b);
+}
+static void batch_status(const char *kind,const char *state,const char *extra) {
+    char b[640];
+    unsigned record_seq=next_seq();
+    snprintf(b,sizeof(b),"{\"v\":2,\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"uptime_ms\":%lld,\"state\":\"%s\",\"batch\":%u,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u%s}",kind,session,record_seq,(long long)now_ms(),state,atomic_load(&batch_number),atomic_load(&wifi_count),atomic_load(&ble_count),atomic_load(&drops),extra);
+    control_output(b);
 }
 static void offer(observation *o) {
     atomic_fetch_add(&producers,1);
@@ -119,24 +146,78 @@ void sw_ble(const uint8_t *addr,uint8_t type,int rssi,uint8_t event,const uint8_
     for(int i=0;i<6;i++) o.addr[i]=addr[5-i]; /* NimBLE is little-endian */
     memcpy(o.data,data,o.len); atomic_fetch_add(&ble_count,1); offer(&o);
 }
-static void emit(const observation *o) {
+static void emit_version(const observation *o,unsigned version,unsigned batch) {
     int64_t age=now_ms()-o->at;
-    if(age>2000) { atomic_fetch_add(&drops,1); return; }
+    if(age>(version==2?20000:2000)) { atomic_fetch_add(&drops,1); return; }
     char a[18],r[18],bssid[18],bssid_json[22],data[125],b[900];
     mac(a,o->addr); mac(r,o->rx); mac(bssid,o->bssid); hex(data,o->data,o->len);
     if(o->event==4) strcpy(bssid_json,"null");
     else snprintf(bssid_json,sizeof(bssid_json),"\"%s\"",bssid);
     if(o->kind==2) {
-        snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"ble\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"addr_type\":%u,\"event\":%u,\"rssi\":%d,\"data_hex\":\"%s\",\"truncated\":false}",session,++seq,(long long)o->at,(long long)age,a,o->addr_type,o->event,o->rssi,data);
+        if(version==2)
+            snprintf(b,sizeof(b),"{\"v\":2,\"kind\":\"ble\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"addr_type\":%u,\"event\":%u,\"rssi\":%d,\"data_hex\":\"%s\",\"truncated\":false}",session,next_seq(),batch,(long long)o->at,(long long)age,a,o->addr_type,o->event,o->rssi,data);
+        else
+            snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"ble\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"addr_type\":%u,\"event\":%u,\"rssi\":%d,\"data_hex\":\"%s\",\"truncated\":false}",session,next_seq(),(long long)o->at,(long long)age,a,o->addr_type,o->event,o->rssi,data);
         output(b);
     } else {
-        snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"wifi_mgmt\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"receiver\":\"%s\",\"bssid\":%s,\"frame_type\":0,\"subtype\":%u,\"ssid_present\":%s,\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d}",session,++seq,(long long)o->at,(long long)age,a,r,bssid_json,o->event,o->ssid_present?"true":"false",data,o->channel,o->rssi);
+        if(version==2)
+            snprintf(b,sizeof(b),"{\"v\":2,\"kind\":\"wifi_mgmt\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"receiver\":\"%s\",\"bssid\":%s,\"frame_type\":0,\"subtype\":%u,\"ssid_present\":%s,\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d}",session,next_seq(),batch,(long long)o->at,(long long)age,a,r,bssid_json,o->event,o->ssid_present?"true":"false",data,o->channel,o->rssi);
+        else
+            snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"wifi_mgmt\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"receiver\":\"%s\",\"bssid\":%s,\"frame_type\":0,\"subtype\":%u,\"ssid_present\":%s,\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d}",session,next_seq(),(long long)o->at,(long long)age,a,r,bssid_json,o->event,o->ssid_present?"true":"false",data,o->channel,o->rssi);
         output(b);
         if(o->event==8 || o->event==5) {
-            snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"wifi\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d,\"auth\":\"%s\"}",session,++seq,(long long)o->at,(long long)(now_ms()-o->at),bssid,data,o->channel,o->rssi,o->privacy?"PRIVACY":"OPEN");
+            if(version==2)
+                snprintf(b,sizeof(b),"{\"v\":2,\"kind\":\"wifi\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d,\"auth\":\"%s\"}",session,next_seq(),batch,(long long)o->at,(long long)(now_ms()-o->at),bssid,data,o->channel,o->rssi,o->privacy?"PRIVACY":"OPEN");
+            else
+                snprintf(b,sizeof(b),"{\"v\":1,\"kind\":\"wifi\",\"session\":\"%s\",\"seq\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d,\"auth\":\"%s\"}",session,next_seq(),(long long)o->at,(long long)(now_ms()-o->at),bssid,data,o->channel,o->rssi,o->privacy?"PRIVACY":"OPEN");
             output(b);
         }
     }
+}
+static void emit(const observation *o) { emit_version(o,1,0); }
+
+static uint32_t observation_hash(const observation *o) {
+    uint32_t hash=2166136261u;
+    const uint8_t *parts[]={&o->kind,o->addr,o->rx,o->bssid,&o->addr_type,
+                            &o->event,&o->len,o->data,&o->channel,
+                            &o->ssid_present,&o->privacy};
+    const size_t sizes[]={1,6,6,6,1,1,1,o->len,1,1,1};
+    for(unsigned part=0;part<sizeof(parts)/sizeof(parts[0]);part++)
+        for(size_t i=0;i<sizes[part];i++) hash=(hash^parts[part][i])*16777619u;
+    return hash ? hash : 1;
+}
+static bool observation_equal(const observation *a,const observation *b) {
+    return a->kind==b->kind && !memcmp(a->addr,b->addr,6) &&
+        !memcmp(a->rx,b->rx,6) && !memcmp(a->bssid,b->bssid,6) &&
+        a->addr_type==b->addr_type && a->event==b->event && a->len==b->len &&
+        !memcmp(a->data,b->data,a->len) && a->channel==b->channel &&
+        a->ssid_present==b->ssid_present && a->privacy==b->privacy;
+}
+static bool batch_open(void) {
+    batch_capacity=256;
+    batch_slots=heap_caps_malloc(sizeof(*batch_slots)*batch_capacity,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(!batch_slots) {
+        batch_capacity=128;
+        batch_slots=heap_caps_malloc(sizeof(*batch_slots)*batch_capacity,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    }
+    if(batch_slots) memset(batch_slots,0,sizeof(*batch_slots)*batch_capacity);
+    return batch_slots!=NULL;
+}
+static void batch_close(void) {
+    heap_caps_free(batch_slots); batch_slots=NULL; batch_capacity=0;
+}
+static void batch_add(const observation *o) {
+    uint32_t hash=observation_hash(o);
+    for(unsigned probe=0;probe<batch_capacity;probe++) {
+        batch_slot *slot=&batch_slots[(hash+probe)%batch_capacity];
+        if(!slot->used) { slot->used=true;slot->hash=hash;slot->value=*o;return; }
+        if(slot->hash==hash && observation_equal(&slot->value,o)) {
+            if(o->rssi>slot->value.rssi) slot->value.rssi=o->rssi;
+            slot->value.at=o->at;
+            return;
+        }
+    }
+    atomic_fetch_add(&drops,1);
 }
 static void hs_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!buf ||
@@ -181,8 +262,57 @@ static void hs_emit(const hs_observation *o) {
         char data[481], body[900];
         hex(data, o->data+offset, size);
         snprintf(body, sizeof(body), "{\"v\":1,\"kind\":\"hs_packet\",\"session\":\"%s\",\"seq\":%u,\"packet\":%u,\"offset\":%u,\"total\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"channel\":%u,\"rssi\":%d,\"data_hex\":\"%s\"}",
-                 session, ++seq, id, offset, o->len, (long long)o->at, (long long)age, o->channel, o->rssi, data);
+                 session, next_seq(), id, offset, o->len, (long long)o->at, (long long)age, o->channel, o->rssi, data);
         output(body);
+    }
+}
+static void batch_worker_loop(void) {
+    linenoiseSetMachineMode(true);
+    atomic_store(&batch_phase,1);
+    batch_status("started","running",",\"window_ms\":10000");
+    int64_t heartbeat=now_ms(); unsigned hop_index=0; int64_t hop=0;
+    while(!atomic_load(&stopping) && now_ms()-atomic_load(&lease)<15000) {
+        unsigned current=atomic_fetch_add(&batch_number,1)+1;
+        memset(batch_slots,0,sizeof(*batch_slots)*batch_capacity);
+        memset(seen,0,sizeof(seen)); xQueueReset(queue);
+        atomic_store(&batch_phase,1); atomic_store(&collecting,true);
+        batch_status("batch_start","running",",\"window_ms\":10000");
+        int64_t deadline=now_ms()+10000;
+        while(!atomic_load(&stopping) && now_ms()<deadline && now_ms()-atomic_load(&lease)<15000) {
+            if(now_ms()-hop>=160) { sw_radio_hop(hop_index++);hop=now_ms(); }
+            observation o;
+            if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) batch_add(&o);
+            if(now_ms()-heartbeat>=2000) {
+                batch_status("heartbeat","running",""); heartbeat=now_ms();
+            }
+        }
+        atomic_store(&collecting,false);
+        while(atomic_load(&producers) && !atomic_load(&stopping)) vTaskDelay(1);
+        observation pending;
+        while(xQueueReceive(queue,&pending,0)==pdTRUE) batch_add(&pending);
+        if(atomic_load(&stopping) || now_ms()-atomic_load(&lease)>=15000) break;
+        atomic_store(&batch_phase,2);
+        unsigned wifi=0,ble=0;
+        for(unsigned i=0;i<batch_capacity;i++) if(batch_slots[i].used) {
+            if(batch_slots[i].value.kind==2) ble++; else wifi++;
+        }
+        char extra[128];
+        snprintf(extra,sizeof(extra),",\"batch_wifi\":%u,\"batch_ble\":%u,\"capacity\":%u",wifi,ble,batch_capacity);
+        batch_status("batch_results","reporting",extra);
+        int64_t report_deadline=now_ms()+5000;
+        unsigned sent_wifi=0,sent_ble=0;
+        for(unsigned i=0;i<batch_capacity && !atomic_load(&stopping);i++) {
+            if(!batch_slots[i].used) continue;
+            if(now_ms()>=report_deadline) { atomic_fetch_add(&drops,1);continue; }
+            emit_version(&batch_slots[i].value,2,current);
+            if(batch_slots[i].value.kind==2) sent_ble++; else sent_wifi++;
+            if(now_ms()-heartbeat>=2000) {
+                batch_status("heartbeat","reporting",""); heartbeat=now_ms();
+            }
+        }
+        if(atomic_load(&stopping)) break;
+        snprintf(extra,sizeof(extra),",\"batch_wifi\":%u,\"batch_ble\":%u",sent_wifi,sent_ble);
+        batch_status("batch_done","running",extra);
     }
 }
 static void worker(void *unused) {
@@ -191,22 +321,28 @@ static void worker(void *unused) {
     if(ready) ready=esp_wifi_set_promiscuous_filter(&filter)==ESP_OK && esp_wifi_set_promiscuous_rx_cb(passive_hs ? hs_wifi_cb : wifi_cb)==ESP_OK && esp_wifi_set_promiscuous(true)==ESP_OK;
     if(ready && !atomic_load(&stopping)) {
         capture_memory_log("serial_capture_ready");
-        atomic_store(&collecting,true); status("started","");
-        int64_t stats=now_ms(),hop=0; unsigned index=0;
-        while(!atomic_load(&stopping) && now_ms()-atomic_load(&lease)<15000) {
-            if(now_ms()-hop>=160) { sw_radio_hop(index++); hop=now_ms(); }
-            if (passive_hs) {
-                hs_observation *o;
-                if(xQueueReceive(hs_pool.ready,&o,pdMS_TO_TICKS(10))==pdTRUE) {
-                    hs_emit(o); capture_pool_release(&hs_pool, o);
+        if(batch_mode) batch_worker_loop();
+        else {
+            atomic_store(&collecting,true); status("started","");
+            int64_t stats=now_ms(),hop=0; unsigned index=0;
+            while(!atomic_load(&stopping) && now_ms()-atomic_load(&lease)<15000) {
+                if(now_ms()-hop>=160) { sw_radio_hop(index++); hop=now_ms(); }
+                if (passive_hs) {
+                    hs_observation *o;
+                    if(xQueueReceive(hs_pool.ready,&o,pdMS_TO_TICKS(10))==pdTRUE) {
+                        hs_emit(o); capture_pool_release(&hs_pool, o);
+                    }
+                } else {
+                    observation o;
+                    if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) emit(&o);
                 }
-            } else {
-                observation o;
-                if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) emit(&o);
+                if(now_ms()-stats>=2000) { status("stats",""); stats=now_ms(); }
             }
-            if(now_ms()-stats>=2000) { status("stats",""); stats=now_ms(); }
         }
-    } else if(!ready) status("error",",\"message\":\"radio_start_failed\"");
+    } else if(!ready) {
+        if(batch_mode) batch_status("error","error",",\"message\":\"radio_start_failed\"");
+        else status("error",",\"message\":\"radio_start_failed\"");
+    }
     atomic_store(&collecting,false);
     sw_radio_stop();
     /* Radio callbacks never wait, so outstanding copies finish promptly. */
@@ -223,7 +359,12 @@ static void worker(void *unused) {
         unsigned discarded=uxQueueMessagesWaiting(queue);
         atomic_fetch_add(&drops,discarded); xQueueReset(queue);
     }
-    status("stopped","");
+    if(batch_mode) {
+        atomic_store(&batch_phase,0);
+        batch_status("stopped","stopped","");
+        linenoiseSetMachineMode(false);
+        batch_close();
+    } else status("stopped","");
     atomic_store(&active,false);
     vTaskDelete(NULL);
 }
@@ -238,22 +379,34 @@ static int start(int argc,char **argv) {
     for(char *p=argv[1];*p;p++) if(!isalnum((unsigned char)*p) && *p!='-' && *p!='_') return 1;
     if(sw_active()) return 1;
     passive_hs = !strcmp(argv[0], "start_hs_sniff_serial");
-    wifi_only = !strcmp(argv[0], "start_wardrive_wifi_serial");
+    batch_mode = strstr(argv[0],"_batch_serial")!=NULL;
+    wifi_only = !strcmp(argv[0], "start_wardrive_wifi_serial") || !strcmp(argv[0], "start_wardrive_wifi_batch_serial");
     if(!queue) queue=xQueueCreateStatic(QLEN,sizeof(observation),queue_bytes,&queue_storage);
     xQueueReset(queue); memset(seen,0,sizeof(seen));
-    strcpy(session,argv[1]); seq=0; packet_id=0;
+    strcpy(session,argv[1]); atomic_store(&seq,0); atomic_store(&batch_number,0); atomic_store(&batch_phase,0); packet_id=0;
     atomic_store(&drops,0); atomic_store(&wifi_count,0); atomic_store(&ble_count,0);
-    if(!sw_prepare()) { status("error",",\"message\":\"radio_prepare_failed\""); return 1; }
+    if(!sw_prepare()) {
+        if(batch_mode) batch_status("error","error",",\"message\":\"radio_prepare_failed\"");
+        else status("error",",\"message\":\"radio_prepare_failed\"");
+        return 1;
+    }
     capture_memory_log("serial_capture_begin");
     if (passive_hs && !capture_pool_open(&hs_pool, 8, sizeof(hs_observation))) {
         capture_memory_log("serial_capture_allocation_failed");
         status("error",",\"message\":\"capture_allocation_failed\""); return 1;
     }
+    if(batch_mode && !batch_open()) {
+        capture_memory_log("serial_batch_allocation_failed");
+        batch_status("error","error",",\"message\":\"batch_allocation_failed\""); return 1;
+    }
     atomic_store(&lease,now_ms()); atomic_store(&stopping,false); atomic_store(&active,true);
     if(xTaskCreate(worker,"serial_wardrive",6144,NULL,4,NULL)!=pdPASS) {
         capture_pool_close(&hs_pool);
+        batch_close();
         capture_memory_log("serial_task_allocation_failed");
-        status("error",",\"message\":\"task_allocation_failed\""); atomic_store(&active,false); return 1;
+        if(batch_mode) batch_status("error","error",",\"message\":\"task_allocation_failed\"");
+        else status("error",",\"message\":\"task_allocation_failed\"");
+        atomic_store(&active,false); return 1;
     }
     return 0;
 }
@@ -261,8 +414,14 @@ static int keepalive(int argc,char **argv) {
     if(argc!=2 || !sw_active() || strcmp(argv[1],session)) return 1;
     atomic_store(&lease,now_ms()); return 0;
 }
+static int wardrive_status(int argc,char **argv) {
+    if(argc!=2 || !session[0] || strcmp(argv[1],session)) return 1;
+    const char *state=!batch_mode?"legacy":!sw_active()?"stopped":atomic_load(&batch_phase)==2?"reporting":"running";
+    batch_status("status",state,"");
+    return 0;
+}
 static int capabilities(int argc,char **argv) {
-    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 /* All main console commands share an ownership gate, including attack commands.
  * Registration retains the original handlers and changes no idle behavior. */
@@ -273,7 +432,7 @@ static int dispatch(int argc,char **argv) {
         printf("USB OTA is active; finish or abort it first.\n");return 1;
     }
     if(argc<1) return 1;
-    if(sw_active() && strcmp(argv[0],"stop") && strcmp(argv[0],"get_capabilities") && strcmp(argv[0],"wardrive_keepalive")) {
+    if(sw_active() && strcmp(argv[0],"stop") && strcmp(argv[0],"get_capabilities") && strcmp(argv[0],"wardrive_keepalive") && strcmp(argv[0],"wardrive_status")) {
         printf("Serial wardrive busy; stop first.\n"); return 1;
     }
     for(unsigned i=0;i<command_count;i++) if(!strcmp(argv[0],commands[i].name)) return commands[i].func(argc,argv);
@@ -290,8 +449,11 @@ void sw_register(void) {
     const esp_console_cmd_t cmds[]={
         {.command="start_wardrive_serial",.help="WiFi + BLE over serial, no GPS/SD: <session>",.func=start},
         {.command="start_wardrive_wifi_serial",.help="WiFi only over serial for host BLE, no GPS/SD: <session>",.func=start},
+        {.command="start_wardrive_batch_serial",.help="10s batched WiFi + BLE over serial: <session>",.func=start},
+        {.command="start_wardrive_wifi_batch_serial",.help="10s batched WiFi only for host BLE: <session>",.func=start},
         {.command="start_hs_sniff_serial",.help="Passive EAPOL/PMKID and management PCAP over serial, no SD: <session>",.func=start},
         {.command="wardrive_keepalive",.help="Renew serial session lease: <session>",.func=keepalive},
+        {.command="wardrive_status",.help="Repeat current batched wardrive state: <session>",.func=wardrive_status},
         {.command="get_capabilities",.help="Machine-readable serial capabilities",.func=capabilities}};
     for(unsigned i=0;i<sizeof(cmds)/sizeof(cmds[0]);i++) ESP_ERROR_CHECK(sw_register_command(&cmds[i]));
 }

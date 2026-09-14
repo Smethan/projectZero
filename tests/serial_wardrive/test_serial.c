@@ -90,5 +90,50 @@ int main(void){
     test_task(NULL);assert(!sw_active() && strstr(output_capture,"stats"));
     capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_wifi_serial_v1\":true"));
     fresh();assert(!sw_wifi_only_mode());atomic_store(&stopping,true);test_task(NULL);
-    puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, mode transitions");
+    /* v2 batches retain the strongest RSSI and latest capture time for an
+       identical observation, and preserve the batch id on the wire. */
+    char *batch_args[]={"start_wardrive_batch_serial","batch-fixture"};
+    output_capture[0]=0;test_clock=1000;
+    assert(start(2,batch_args)==0 && batch_mode && batch_capacity>=128);
+    observation one={.kind=2,.addr_type=1,.rssi=-70,.event=0,.len=2,.data={1,2}};
+    one.addr[0]=0x42;one.at=1000;batch_add(&one);
+    one.rssi=-40;one.at=1200;batch_add(&one);
+    unsigned occupied=0;batch_slot *saved=NULL;
+    for(unsigned i=0;i<batch_capacity;i++)if(batch_slots[i].used){occupied++;saved=&batch_slots[i];}
+    assert(occupied==1 && saved->value.rssi==-40 && saved->value.at==1200);
+    emit_version(&saved->value,2,7);
+    assert(strstr(output_capture,"\"v\":2") && strstr(output_capture,"\"batch\":7"));
+    unsigned before_full=atomic_load(&drops);
+    for(unsigned i=0;i<batch_capacity+20;i++) {
+        observation many={.kind=2,.rssi=-50,.len=2,.data={3,4}};
+        many.addr[0]=i&255;many.addr[1]=i>>8;batch_add(&many);
+    }
+    assert(atomic_load(&drops)>before_full); /* bounded table drops overflow */
+    atomic_store(&stopping,true);test_task(NULL);
+    assert(!sw_active() && !machine_mode && !heap_live && strstr(output_capture,"\"kind\":\"stopped\""));
+    output_capture[0]=0;char *status_args[]={"wardrive_status","batch-fixture"};
+    assert(wardrive_status(2,status_args)==0 && strstr(output_capture,"\"state\":\"stopped\""));
+
+    fail_psram=true;output_capture[0]=0;test_clock=1000;
+    assert(start(2,batch_args)==0 && batch_capacity==128);
+    assert(last_heap_caps==(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    atomic_store(&stopping,true);test_task(NULL);assert(!heap_live);fail_psram=false;
+
+    char *wifi_batch_args[]={"start_wardrive_wifi_batch_serial","wifi-batch"};
+    output_capture[0]=0;test_clock=1000;
+    assert(start(2,wifi_batch_args)==0 && sw_wifi_only_mode());
+    atomic_store(&collecting,true);sw_ble(a,1,-60,0,ad,sizeof(ad));
+    assert(atomic_load(&ble_count)==0);
+    atomic_store(&stopping,true);test_task(NULL);assert(!heap_live);
+
+    /* A quiet batch still publishes heartbeats and explicit phase boundaries;
+       lease expiry cleans up the radio, table and console mode. */
+    output_capture[0]=0;test_clock=1000;
+    assert(start(2,batch_args)==0);test_task(NULL);
+    assert(strstr(output_capture,"\"kind\":\"started\"") && strstr(output_capture,"\"kind\":\"heartbeat\""));
+    assert(strstr(output_capture,"\"kind\":\"batch_start\"") && strstr(output_capture,"\"kind\":\"batch_results\""));
+    assert(strstr(output_capture,"\"kind\":\"batch_done\"") && strstr(output_capture,"\"state\":\"stopped\""));
+    assert(!machine_mode && !heap_live);
+    capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_batch_serial_v2\":true"));
+    puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, v2 batching and mode transitions");
 }

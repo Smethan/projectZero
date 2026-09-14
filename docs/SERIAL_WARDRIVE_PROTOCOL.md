@@ -1,6 +1,60 @@
-# Serial wardrive protocol v1
+# Serial wardrive protocol v1 and v2
 
 Commands are newline-terminated console commands. Capture is BLE discovery (not Bluetooth Classic) and Wi-Fi management reception. No GPS command or SD card is needed. GPS, timestamps, files and classification belong to the host.
+
+## Batched transport v2 (firmware 1.7.10)
+
+Firmware advertises `wardrive_batch_serial_v2: true`,
+`wardrive_wifi_batch_serial_v2: true`, `batch_window_ms: 10000`,
+`heartbeat_ms: 2000`, and `max_age_ms: 20000`. WDG prefers v2 for all three All
+Wardrive choices and falls back to the v1 commands below for older firmware.
+
+- `start_wardrive_batch_serial TOKEN` starts ESP32 Wi-Fi management capture and
+  ESP32 BLE discovery.
+- `start_wardrive_wifi_batch_serial TOKEN` starts ESP32 Wi-Fi capture only; WDG
+  runs BlueZ BLE discovery on the uConsole.
+- `wardrive_status TOKEN` repeats the current session state. It is accepted
+  while capture is active and after a completed stop so a host can recover a
+  lost lifecycle frame.
+
+The worker collects for ten seconds while continuously hopping Wi-Fi channels.
+It drains the callback queue into a 256-entry PSRAM table or a 128-entry
+internal-RAM fallback. Identical evidence is merged, retaining the strongest
+RSSI and latest capture time. At the end of a window it disables callback
+collection, drains in-flight entries, reports for at most five seconds and
+begins the next window. Radios remain initialized. This deliberate reporting
+gap prevents the output burst from contending with callback collection.
+
+Every v2 record carries `v:2`, `session`, a strictly increasing `seq`, and
+`batch`. Lifecycle records also carry `state`, `uptime_ms`, `wifi_count`,
+`ble_count`, and `drops`:
+
+| Kind | Meaning and additional fields |
+| --- | --- |
+| `started` | Session owner and radios are ready; `batch` is zero. |
+| `heartbeat` | Two-second control heartbeat; `state` is `running` or `reporting`. |
+| `batch_start` | Collection began; `window_ms:10000`. |
+| `batch_results` | Reporting begins; `batch_wifi`, `batch_ble`, and table `capacity`. |
+| `wifi`, `wifi_mgmt`, `ble` | Same evidence fields as v1 plus the nonzero batch number; `age_ms` is at most 20000. |
+| `batch_done` | Reporting ended; `batch_wifi` and `batch_ble` are the observations selected for output. |
+| `status` | Reply to `wardrive_status`; state is `running`, `reporting`, or `stopped`. |
+| `stopped` / `error` | Final state or a bounded startup/allocation error. |
+
+Control frames receive a 250 ms serial deadline and are retried up to three
+times without changing their sequence number. Observation frames retain the
+100 ms best-effort deadline. The host may therefore see an identical control
+record more than once and must ignore duplicate sequences. `stop` checks occur
+between observation records, so a large result set does not make cleanup wait
+for the whole batch. Console machine mode suppresses prompt/echo traffic until
+the structured stop has been attempted and normal console behavior is restored.
+
+The combined ESP mode retains Wi-Fi promiscuous reception plus BLE scanning.
+Espressif's ESP32-C5 coexistence table marks that combination as supported with
+unstable performance. Batching reduces serial and host-processing pressure; it
+does not change that RF coexistence classification. The Wi-Fi-only v2 command
+used by All Wardrive (host BLE) avoids ESP-side BLE coexistence.
+
+## Streaming transport v1
 
 ## Commands and ownership
 
@@ -84,7 +138,7 @@ No HS records are sent by All Wardrive, and no BLE/inventory records are sent
 by HS Sniff. `wifi_count` counts queued raw frames in this mode; `ble_count` is 0.
 
 The eight-frame queue is allocated for the session and released on cleanup.
-The worker uses a 10 KB stack. Repeat beacons/probe responses with identical
+The worker uses a 6 KB stack. Repeat beacons/probe responses with identical
 BSSID/tagged fields are limited to one per ten seconds. The ordinary two-second
 age limit applies. Stop disables reception, drains for up to 1.5 seconds plus
 one in-progress frame, counts remaining drops, frees the queue and emits stopped.

@@ -1,5 +1,35 @@
 # Smethan fork firmware
 
+## 1.7.10 — Batched All Wardrive transport
+
+- Add `start_wardrive_batch_serial` and
+  `start_wardrive_wifi_batch_serial`. They collect Wi-Fi management and BLE
+  observations for ten seconds, deduplicate them in a worker-owned table, pause
+  collection while reporting that table, then start the next window without
+  tearing down the radios. The Wi-Fi-only command is the backend for WDG's host
+  BLE mode. Existing v1 streaming commands and HS modes are unchanged.
+- Prefer a 256-entry PSRAM table and fall back to a checked 128-entry internal
+  allocation. Callbacks retain their nonblocking static queue and perform no
+  serial I/O or allocation. Equal observations keep the strongest RSSI and the
+  most recent capture time; full tables and expired/unsent records increment
+  the existing drop counter.
+- Add protocol-v2 `started`, two-second `heartbeat`, `batch_start`,
+  `batch_results`, observation, `batch_done`, `status`, `stopped`, and `error`
+  records. Control records use a 250 ms deadline and repeat the same sequence
+  number up to three times. `wardrive_status <session>` recovers a missed start,
+  phase, or stop acknowledgment. The 15-second host lease remains in force.
+- Keep the console in machine mode for the batch session so prompts and command
+  echo cannot compete with framed output. Stop aborts reporting between records,
+  emits a retried structured stop, restores console mode and then lets the
+  existing global cleanup completion provide an independent fallback.
+
+Native transport tests cover batch deduplication, phase/heartbeat framing,
+allocation cleanup, lease expiry and v1 compatibility. Both ESP32-C5 variants
+build under the pinned ESP-IDF 6.0.1 image and pass stack guards. The combined
+ESP Wi-Fi-sniffer/BLE mode still uses a coexistence combination Espressif marks
+as unstable; the separate host-BLE mode avoids that combination. RF behavior
+and timeout recovery still require a field soak on the XIAO/uConsole hardware.
+
 ## 1.7.9 — Optional active HS targets and capture isolation
 
 - Advertise `hs_capture_targets_v1` and add `hs_scan <token>` plus
