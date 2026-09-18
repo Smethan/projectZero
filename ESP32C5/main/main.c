@@ -7992,7 +7992,7 @@ static void handshake_attack_task_sniffer(void) {
     // 1. Initialize D-UCB
     ducb_init();
     
-    if (handshake_scope.count) {
+    if (handshake_scope.count && !handshake_scope.exclude) {
         int count=0;
         for(int i=0;i<ducb_channel_count;i++)
             if(hst_channel(&handshake_scope,ducb_channels[i].channel))ducb_channels[count++]=ducb_channels[i];
@@ -8437,7 +8437,10 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
     handshake_serial_mode = serial_storage;
 
     MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - %s", serial_storage ? "Serial PCAP Mode" : "SD Mode");
-    MY_LOG_INFO(TAG, "Scope: %s (%u selected)", handshake_scope.count ? "selected BSSIDs" : "all visible networks",handshake_scope.count);
+    MY_LOG_INFO(TAG, "Scope: %s (%u listed)",
+                !handshake_scope.count ? "all visible networks" :
+                handshake_scope.exclude ? "all except whitelisted BSSIDs" : "selected BSSIDs",
+                handshake_scope.count);
     MY_LOG_INFO(TAG, "Files: %s",serial_storage ? "serial PCAP/HCCAPX (no SD)" : "ESP32 SD /lab/handshakes/");
     MY_LOG_INFO(TAG, "Will run until 'stop' command");
     MY_LOG_INFO(TAG, "Python app will parse and save .pcap/.hccapx files automatically");
@@ -8477,13 +8480,15 @@ static int cmd_handshake_scope(int argc,char **argv) {
     if(argc<3||(strcmp(argv[1],"sd")&&strcmp(argv[1],"serial")))return 1;
     bool serial_storage=!strcmp(argv[1],"serial");
     hs_target_set targets={0};
-    bool all=!strcmp(argv[2],"all");
+    bool all=!strcmp(argv[2],"all"),all_except=!strcmp(argv[2],"all-except");
     if((all&&argc!=3)||(!all&&argc!=4))return hs_scope_error(argv[1],"invalid_targets");
     if(handshake_attack_active||handshake_attack_task_handle||g_scan_in_progress||
        g_scan_cancel_pending||hs_scan_pending||atomic_load(&hs_scan_output_active)||
        atomic_load(&handshake_cleanup_active))return hs_scope_error(argv[1],"busy");
     if(!serial_storage&&!sd_card_mounted)return hs_scope_error(argv[1],"sd_required");
-    if(!all) {
+    if(all_except) {
+        if(!hst_parse_exclusions(&targets,argv[3]))return hs_scope_error(argv[1],"invalid_targets");
+    } else if(!all) {
         if(!hs_scan_ready||!g_scan_done||strcmp(argv[2],hs_scan_snapshot.token)||
            esp_timer_get_time()-hs_scan_completed_us>300000000LL)return hs_scope_error(argv[1],"scan_expired");
         if(!hst_parse(&targets,argv[3]))return hs_scope_error(argv[1],"invalid_targets");
@@ -21048,7 +21053,7 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(sw_register_command(&handshake_serial_cmd));
     const esp_console_cmd_t hs_scan_cmd={.command="hs_scan",.help="Scan networks for optional HS selection: token",.func=cmd_hs_scan};
-    const esp_console_cmd_t hs_scope_cmd={.command="start_handshake_scope",.help="Active HS capture: sd|serial all OR scan-token BSSID[,BSSID...]",.func=cmd_handshake_scope};
+    const esp_console_cmd_t hs_scope_cmd={.command="start_handshake_scope",.help="Active HS capture: sd|serial all|all-except BSSIDs OR scan-token BSSIDs",.func=cmd_handshake_scope};
     ESP_ERROR_CHECK(sw_register_command(&hs_scan_cmd));
     ESP_ERROR_CHECK(sw_register_command(&hs_scope_cmd));
 

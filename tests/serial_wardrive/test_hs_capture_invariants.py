@@ -42,6 +42,7 @@ build_artifact = function("static hs_artifact_kind_t hs_build_ap_artifact(")
 complete_exchange = function("static hsx_entry_t *hs_complete_exchange(")
 psram_init = function("static bool init_psram_buffers(void)")
 scan_complete = function("static void hs_scan_complete(bool success)")
+attack_task = function("static void handshake_attack_task_sniffer(void)")
 
 # The driver callback only validates/routes packets and copies them into bounded
 # queues.  Parsing, serializer growth, exchange state, AP state, storage, and
@@ -81,6 +82,13 @@ assert callback.count("hs_queue_frame(pkt, len,") == 3
 assert "copy->len = (uint16_t)len" in queue_frame
 assert "memcpy(copy->data, pkt->payload, len)" in queue_frame
 assert "hsx_ingest(" in process and "hs_capture_append_for_progress(" in process
+
+# The immutable scope is enforced again immediately before active injection.
+# This protects all-except capture even if unrelated AP/client state somehow
+# survives long enough to reach the task-owned deauthentication loop.
+scope_filter = attack_task.index("hst_contains(&handshake_scope, ap->bssid)")
+deauth_send = attack_task.index("hs_send_targeted_deauth(", scope_filter)
+assert scope_filter < deauth_send
 
 # Stop accepting before unregistering/disabling the callback.  Wait for every
 # producer, drain its published copies, then destroy queues/pool.  Cleanup may

@@ -4,8 +4,15 @@
 #include <stddef.h>
 #include <string.h>
 #define HS_TARGET_LIMIT 16
-/* Immutable while the capture callback is installed. Empty means explicit ALL. */
-typedef struct { unsigned count; uint8_t mac[HS_TARGET_LIMIT][6], channel[HS_TARGET_LIMIT]; } hs_target_set;
+#define HS_EXCLUSION_LIMIT 32
+#define HS_SCOPE_LIMIT HS_EXCLUSION_LIMIT
+/* Immutable while the callback is installed. Empty means explicit ALL;
+ * exclude reverses membership so listed BSSIDs are never captured/deauthed. */
+typedef struct {
+    unsigned count;
+    bool exclude;
+    uint8_t mac[HS_SCOPE_LIMIT][6], channel[HS_SCOPE_LIMIT];
+} hs_target_set;
 static int hst_hex(char c) {
     if(c>='0'&&c<='9')return c-'0';
     if(c>='a'&&c<='f')return c-'a'+10;
@@ -14,14 +21,15 @@ static int hst_hex(char c) {
 }
 static bool hst_contains(const hs_target_set *set,const uint8_t *mac) {
     if(!set->count)return true;
-    for(unsigned i=0;i<set->count;i++)if(!memcmp(set->mac[i],mac,6))return true;
-    return false;
+    bool listed=false;
+    for(unsigned i=0;i<set->count;i++)if(!memcmp(set->mac[i],mac,6)){listed=true;break;}
+    return set->exclude?!listed:listed;
 }
-static bool hst_parse(hs_target_set *set,const char *list) {
+static bool hst_parse_limit(hs_target_set *set,const char *list,unsigned limit) {
     memset(set,0,sizeof(*set));
     if(!list||!*list)return false;
     while(*list) {
-        if(set->count==HS_TARGET_LIMIT||strlen(list)<17)return false;
+        if(set->count==limit||strlen(list)<17)return false;
         uint8_t *mac=set->mac[set->count];
         for(unsigned i=0;i<6;i++) {
             int a=hst_hex(list[i*3]),b=hst_hex(list[i*3+1]);
@@ -37,8 +45,16 @@ static bool hst_parse(hs_target_set *set,const char *list) {
     }
     return false;
 }
+static bool hst_parse(hs_target_set *set,const char *list) {
+    return hst_parse_limit(set,list,HS_TARGET_LIMIT);
+}
+static bool hst_parse_exclusions(hs_target_set *set,const char *list) {
+    if(!hst_parse_limit(set,list,HS_EXCLUSION_LIMIT))return false;
+    set->exclude=true;
+    return true;
+}
 static bool hst_channel(const hs_target_set *set,unsigned channel) {
-    if(!set->count)return true;
+    if(!set->count||set->exclude)return true;
     for(unsigned i=0;i<set->count;i++)if(set->channel[i]==channel)return true;
     return false;
 }

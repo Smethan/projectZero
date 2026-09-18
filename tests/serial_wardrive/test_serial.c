@@ -89,6 +89,7 @@ int main(void){
     assert(strstr(output_capture,"\"kind\":\"wifi\""));
     test_task(NULL);assert(!sw_active() && strstr(output_capture,"stats"));
     capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_wifi_serial_v1\":true"));
+    assert(strstr(output_capture,"\"hs_capture_exclusions_v1\":true"));
     fresh();assert(!sw_wifi_only_mode());atomic_store(&stopping,true);test_task(NULL);
     /* v2 batches retain the strongest RSSI and latest capture time for an
        identical observation, and preserve the batch id on the wire. */

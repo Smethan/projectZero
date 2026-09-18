@@ -421,7 +421,7 @@ static int wardrive_status(int argc,char **argv) {
     return 0;
 }
 static int capabilities(int argc,char **argv) {
-    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 /* All main console commands share an ownership gate, including attack commands.
  * Registration retains the original handlers and changes no idle behavior. */

@@ -68,6 +68,18 @@ static void test_mac_lists(void) {
     snprintf(seventeen, sizeof(seventeen), "%s,02:00:00:00:00:10", sixteen);
     assert(hst_parse(&set, sixteen) && set.count == HS_TARGET_LIMIT);
     assert(!hst_parse(&set, seventeen));
+
+    char exclusions[(HS_EXCLUSION_LIMIT + 1) * 18] = {0};
+    for (unsigned i = 0; i < HS_EXCLUSION_LIMIT; i++) {
+        char item[19];
+        snprintf(item, sizeof(item), "%s02:00:00:00:01:%02x", i ? "," : "", i);
+        strncat(exclusions, item, sizeof(exclusions) - strlen(exclusions) - 1);
+    }
+    assert(hst_parse_exclusions(&set, exclusions));
+    assert(set.exclude && set.count == HS_EXCLUSION_LIMIT);
+    strncat(exclusions, ",02:00:00:00:02:00",
+            sizeof(exclusions) - strlen(exclusions) - 1);
+    assert(!hst_parse_exclusions(&set, exclusions));
 }
 
 static void test_channels(void) {
@@ -81,6 +93,11 @@ static void test_channels(void) {
     assert(hst_channel(&set, 149));
     assert(!hst_channel(&set, 6));
     assert(!hst_channel(&set, 0));
+
+    assert(hst_parse_exclusions(&set, "02:11:22:33:44:55"));
+    assert(hst_channel(&set, 1) && hst_channel(&set, 149));
+    assert(!hst_contains(&set, ap_a));
+    assert(hst_contains(&set, ap_b));
 }
 
 static void test_frames(void) {
@@ -160,6 +177,15 @@ static void test_frames(void) {
     assert(!hst_frame_allowed(&set, frame, sizeof(frame)));
     frame[0] = 0x0c; /* extension/reserved */
     assert(!hst_frame_allowed(&set, frame, sizeof(frame)));
+
+    hs_target_set excluded = {0};
+    assert(hst_parse_exclusions(&excluded, "02:11:22:33:44:55"));
+    memset(frame, 0, sizeof(frame));
+    frame[0] = 0x80;
+    set_addr(frame, 10, ap_a); set_addr(frame, 16, ap_a);
+    assert(!hst_frame_allowed(&excluded, frame, sizeof(frame)));
+    set_addr(frame, 10, ap_b); set_addr(frame, 16, ap_b);
+    assert(hst_frame_allowed(&excluded, frame, sizeof(frame)));
 }
 
 int main(void) {

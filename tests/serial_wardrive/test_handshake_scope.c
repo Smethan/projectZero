@@ -128,10 +128,18 @@ int main(void) {
     const char *all_sd[] = {"start_handshake_scope", "sd", "all"};
     const char *selected[] = {"start_handshake_scope", "serial", "scan-token",
                               "02:11:22:33:44:66,02:11:22:33:44:55"};
+    const char *all_except[] = {"start_handshake_scope", "serial", "all-except",
+                                "02:11:22:33:44:55,02:11:22:33:44:66"};
 
     reset_state();
     assert(invoke(3, all_serial) == 0 && start_calls == 1 && started_serial);
     assert(started_targets.count == 0);
+
+    reset_state();
+    assert(invoke(4, all_except) == 0 && start_calls == 1 && started_serial);
+    assert(started_targets.exclude && started_targets.count == 2);
+    assert(!memcmp(started_targets.mac[0], hs_scan_snapshot.records[0].bssid, 6));
+    assert(!memcmp(started_targets.mac[1], hs_scan_snapshot.records[1].bssid, 6));
 
     reset_state();
     assert(invoke(3, all_sd) == 0 && start_calls == 1 && !started_serial);
@@ -157,6 +165,11 @@ int main(void) {
     reset_state();
     const char *all_extra[] = {"start_handshake_scope", "serial", "all", "extra"};
     assert_error("invalid_targets", 4, all_extra);
+
+    reset_state();
+    const char *bad_exclusion[] = {"start_handshake_scope", "serial", "all-except",
+                                   "02:11:22:33:44:zz"};
+    assert_error("invalid_targets", 4, bad_exclusion);
 
     reset_state();
     const char *missing_list[] = {"start_handshake_scope", "serial", "scan-token"};
