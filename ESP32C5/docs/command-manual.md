@@ -236,6 +236,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_handshake_serial` — run the same active sniffer/D-UCB/deauthentication capture and transfer PCAP/HCCAPX over serial. No SD card or GPS is required.
 - `hs_scan <token>` — create the five-minute network snapshot used by optional BSSID-scoped active capture. The token is 1-32 letters, digits, `_` or `-`.
 - `start_handshake_scope <sd|serial> all` — start either existing capture destination with its original all-nearby scope.
+- `start_handshake_scope <sd|serial> all-except <BSSID[,BSSID...]>` — capture all nearby WPA networks except 1-32 protected BSSIDs; excluded APs are never deauthenticated.
 - `start_handshake_scope <sd|serial> <token> <BSSID[,BSSID...]>` — capture 1-16 BSSIDs from the matching completed `hs_scan` snapshot.
 - `save_handshake` — manually save a captured complete 4‑way handshake.
 - `start_blackout` — scan all networks every 3 min and deauth everything.
@@ -265,10 +266,17 @@ that list. `capture_error` records report `storage` plus `invalid_targets`,
 `busy`, `sd_required`, `scan_expired`, `target_unavailable`, `target_channel`,
 or `start_failed`.
 
+The `all-except` form does not require a scan token. It rejects malformed,
+duplicate, multicast, zero, empty, or more than 32 BSSIDs before startup. The
+deny set remains immutable until `stop`; excluded frames are discarded before
+capture processing, and the deny set is checked again before each active
+deauthentication request.
+
 `stop` waits for an asynchronous scan cancellation event before acknowledging
 it. New scans remain blocked while that event drains, so an old event cannot
-complete a newer token. WDG applies its own whitelist before sending a selected
-command; direct console clients must apply their own allow/exclude policy.
+complete a newer token. WDG applies its own whitelist before a selected command
+and sends its Wi-Fi whitelist through `all-except` for all-nearby mode; direct
+console clients must apply their own allow/exclude policy.
 
 The `HSC:` PMKID/M1-M4 counters are packet sightings. They are not proof of a
 matched exchange. Firmware 1.7.9 labels an EAPOL artifact complete/valid only

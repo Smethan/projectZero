@@ -140,7 +140,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.10"
+#define JANOS_VERSION "1.7.11"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"

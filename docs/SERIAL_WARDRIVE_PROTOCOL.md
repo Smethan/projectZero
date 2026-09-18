@@ -183,11 +183,15 @@ This prevents a delayed event from completing a newer token.
 
 ```
 start_handshake_scope <sd|serial> all
+start_handshake_scope <sd|serial> all-except BSSID[,BSSID...]
 start_handshake_scope <sd|serial> TOKEN BSSID[,BSSID...]
 ```
 
 `all` starts the original all-nearby sniffer/D-UCB/deauthentication behavior and
-does not need a scan. The selected form accepts 1 to 16 unique unicast BSSIDs
+does not need a scan. Firmware 1.7.11 advertises
+`hs_capture_exclusions_v1: true`; `all-except` accepts 1 to 32 unique unicast
+BSSIDs without a scan and excludes them from both capture reception and active
+deauthentication. The selected form accepts 1 to 16 unique unicast BSSIDs
 from the matching completed snapshot. The snapshot expires after five minutes.
 Before installing the capture callback, firmware resolves every BSSID and
 channel and rejects the whole request if any BSSID is missing, open/WEP, on an
@@ -195,8 +199,11 @@ unsupported channel, duplicated or malformed. The resulting BSSID/channel set
 is immutable for the run. Promiscuous reception, D-UCB hopping and active
 deauthentication are then limited to that set.
 
-WDG also refuses BSSIDs on its host whitelist. Direct protocol clients must
-apply their own policy before issuing an active capture command.
+WDG refuses selected BSSIDs on its host whitelist and uses `all-except` for
+all-nearby capture whenever its Wi-Fi whitelist is nonempty. It fails closed if
+the firmware lacks exclusion support or the list cannot be represented. Direct
+protocol clients must apply their own policy before issuing an active capture
+command.
 
 Startup errors are single `HST:` records with `kind:"capture_error"`, `storage`
 (`sd` or `serial`) and one of `invalid_targets`, `busy`, `sd_required`,

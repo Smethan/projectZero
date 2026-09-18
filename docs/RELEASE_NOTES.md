@@ -1,5 +1,23 @@
 # Smethan fork firmware
 
+## 1.7.11 — Whitelist exclusions for active HS capture
+
+- Advertise `hs_capture_exclusions_v1` and add
+  `start_handshake_scope <sd|serial> all-except <BSSID,...>` for both active
+  capture destinations. The form accepts 1-32 unique unicast BSSIDs without a
+  network-scan token.
+- Store the exclusion set as immutable capture-session state. Excluded AP
+  frames are rejected in the promiscuous receive path, all channels remain
+  eligible for the remaining all-nearby capture, and the same exclusion is
+  checked again immediately before each targeted deauthentication request.
+- Keep `all` and scan-token selected capture compatible with firmware 1.7.9
+  clients. Malformed, duplicate, multicast, zero, empty, or oversized exclusion
+  lists fail closed with `invalid_targets` before radio mode changes.
+
+Native tests cover boundary-sized exclusion lists, frame filtering, channel
+behavior, command validation, cleanup, and the final pre-deauthentication scope
+check. RF behavior still requires field validation on the XIAO/uConsole setup.
+
 ## 1.7.10 — Batched All Wardrive transport
 
 - Add `start_wardrive_batch_serial` and

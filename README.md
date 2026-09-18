@@ -16,7 +16,8 @@ the uConsole host application.
 - **Passive HS Sniff** — EAPOL/PMKID packets streamed to WDG without deauth or SD.
 - **Optional active HS targets** — `hs_scan` plus `start_handshake_scope` limits
   either SD or serial capture to as many as 16 explicit BSSIDs while retaining
-  the original all-nearby mode.
+  the original all-nearby mode, and `all-except` protects up to 32 host
+  whitelisted BSSIDs from capture and deauthentication.
 - **Fork updates** — versioned XIAO/standard release packages and matching onboard OTA.
 - **Handshake capture without SD card** — PCAP/HCCAPX streamed as base64 over serial, saved on the host machine
 - **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
@@ -71,7 +72,8 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `start_handshake` - exclusive LAB feature that spins up a dedicated WPA handshake capture task (shown as **Handshaker** inside the Flipper UI). More details: https://github.com/C5Lab/projectZero/wiki/Handshaker
 - `hs_scan <token>` / `start_handshake_scope <sd|serial> ...` - optional
   scan-bound BSSID selection for the same active/deauthentication capture. Use
-  `all`, or 1-16 BSSIDs from a fresh scan token; see the
+  `all`, `all-except` with 1-32 protected BSSIDs, or 1-16 BSSIDs from a fresh
+  scan token; see the
   [serial protocol](docs/SERIAL_WARDRIVE_PROTOCOL.md#active-hs-target-selection-extension).
 - `save_handshake` - manual flush of a completed 4-way handshake to the SD card when you want to preserve it before stopping attacks.
 
