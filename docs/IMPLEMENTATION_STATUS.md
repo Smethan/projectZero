@@ -40,7 +40,7 @@ The existing HS Capture item alone now warns that it requires an ESP32 SD card.
 
 The new firmware capability `hs_sniff_serial_v1` streams passive raw frames
 over serial without ESP32 SD/GPS or deauth. It runs separately from All Wardrive.
-WDG saves raw PCAP plus JSONL classifications; message counts are observations,
+WDG saves radiotap PCAPNG plus JSONL classifications; message counts are observations,
 not validation of a complete exchange. Firmware uses an eight-frame dynamic
 queue (about 18.5 KB) and a 10 KB worker stack only while this mode is active.
 

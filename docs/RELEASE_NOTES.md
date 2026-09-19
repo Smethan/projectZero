@@ -1,5 +1,36 @@
 # Smethan fork firmware
 
+## 1.7.12 — PCAPNG capture context and WPA-Sec packaging
+
+- Emit new active handshake artifacts as PCAPNG only. Serial storage announces
+  `CAPTURE_FORMAT: PCAPNG`, transfers one bounded PCAPNG block, and retains
+  HCCAPX only for a validated exchange. SD storage writes `.pcapng`; no new
+  handshake path writes a duplicate classic `.pcap`.
+- Use radiotap IEEE 802.11 link type 127 with explicit microsecond timestamps,
+  FCS-stripped frames and per-packet channel/RSSI. Retain beacon,
+  authentication, association and every observed M1-M4 packet for one
+  AP/station/replay exchange. PMKID and partial association evidence use the
+  same format without being mislabeled as a validated EAPOL pair.
+- Delay an SD commit for up to two seconds after the first M1+M2 or M2+M3 pair,
+  while continuing to retain M3/M4; commit immediately once all four messages
+  arrive. Serial storage already waits for capture shutdown and includes every
+  retained exchange message at that point.
+- Convert the older selected-network handshake serializer and the general
+  `start_pcap radio|net` command to PCAPNG-only files. Radio captures include
+  radiotap channel/RSSI, while net captures use the Ethernet interface type.
+  The on-device WPA-Sec uploader now sends `.pcapng` captures.
+- Advertise `hs_capture_pcapng_v1`. WDG 0.9.38 validates block framing and
+  declared length, rebases boot-relative timestamps to wall time, saves only
+  PCAPNG for new captures and prefers it for WPA-Sec upload.
+
+Native tests cover PCAPNG section/interface/packet blocks, radiotap metadata,
+FCS stripping, serial transaction failure, context retention and existing
+capture ownership rules. Wireshark tools and hcxtools 7.1.2 accept the generated
+files and recover their interface, channel, RSSI and 802.11 frame types. These
+are synthetic/build checks; a file can only contain authentication,
+association, probe and EAPOL traffic that the radio actually heard, and RF
+completeness still needs field validation.
+
 ## 1.7.11 — Whitelist exclusions for active HS capture
 
 - Advertise `hs_capture_exclusions_v1` and add

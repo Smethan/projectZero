@@ -19,7 +19,7 @@ the uConsole host application.
   the original all-nearby mode, and `all-except` protects up to 32 host
   whitelisted BSSIDs from capture and deauthentication.
 - **Fork updates** — versioned XIAO/standard release packages and matching onboard OTA.
-- **Handshake capture without SD card** — PCAP/HCCAPX streamed as base64 over serial, saved on the host machine
+- **Handshake capture without SD card** — radiotap PCAPNG/HCCAPX streamed as base64 over serial and saved on the host machine
 - **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
 - **SSID with spaces** in `start_portal` command
 - All upstream features remain intact
@@ -223,6 +223,7 @@ turn derives from the original [C5Lab/projectZero](https://github.com/C5Lab/proj
 - LAB Discord: https://discord.gg/57wmJzzR8C
 
 ## Fork Changes
+- 2026-09-19 JanOS 1.7.12 - PCAPNG-only handshake and packet captures with radiotap channel/RSSI metadata
 - 2026-03-09 JanOS 1.5.5 - Handshake capture via serial (no SD card required), PCAP/HCCAPX streamed as base64 to host
 - 2026-03-09 JanOS 1.5.5 - Custom captive portal upload via serial (`set_html` chunked protocol, 1 MB PSRAM buffer)
 - 2026-03-09 JanOS 1.5.5 - Fix `start_portal` SSID with spaces, PSRAM buffer for `set_html` to prevent DRAM heap corruption

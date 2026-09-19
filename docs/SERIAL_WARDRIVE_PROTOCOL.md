@@ -142,7 +142,7 @@ The worker uses a 6 KB stack. Repeat beacons/probe responses with identical
 BSSID/tagged fields are limited to one per ten seconds. The ordinary two-second
 age limit applies. Stop disables reception, drains for up to 1.5 seconds plus
 one in-progress frame, counts remaining drops, frees the queue and emits stopped.
-WDG writes PCAP and identifies visible PMKIDs on the uConsole; receiving EAPOL
+WDG writes PCAPNG and identifies visible PMKIDs on the uConsole; receiving EAPOL
 does not by itself establish handshake completeness.
 
 ## Active HS target-selection extension
@@ -150,7 +150,7 @@ does not by itself establish handshake completeness.
 Firmware 1.7.9 advertises `hs_capture_targets_v1: true`. This extension adds an
 optional scan-and-select scope to both existing active capture destinations. It
 does not require GPS. `sd` still requires a mounted ESP32 SD card; `serial`
-keeps the existing base64 PCAP/HCCAPX transfer for host-side storage.
+uses the PCAPNG/HCCAPX transfer below for host-side storage.
 
 ### Network snapshot
 
@@ -218,10 +218,11 @@ disabled and its queues are drained. Each artifact is ordered as follows:
 
 ```text
 CAPTURE_KIND: VALID|PMKID|PARTIAL
---- PCAP BEGIN ---
-<base64 PCAP lines>
---- PCAP END ---
-PCAP_SIZE: <bytes>
+CAPTURE_FORMAT: PCAPNG
+--- PCAPNG BEGIN ---
+<base64 PCAPNG lines>
+--- PCAPNG END ---
+PCAPNG_SIZE: <bytes>
 --- HCCAPX BEGIN ---       # VALID only
 <base64 HCCAPX lines>      # VALID only
 --- HCCAPX END ---         # VALID only
@@ -232,10 +233,13 @@ SSID: <ssid>  AP: <BSSID>
 the sole commit record; firmware omits it if any preceding serial write fails.
 Firmware owns the stdout lock across the whole sequence so unrelated logs cannot
 interleave. A host must discard an uncommitted partial sequence and reset its
-block state at the next `CAPTURE_KIND` or `PCAP BEGIN`. `PMKID` and `PARTIAL`
-carry PCAP only. `VALID` carries a same-exchange PCAP plus HCCAPX. The active
-artifact PCAP is bounded by `HSX_PCAP_MAX` at 2,136 bytes: its 24-byte global
-header plus no more than four 512-byte frames and their 16-byte record headers.
+block state at the next `CAPTURE_KIND` or `PCAPNG BEGIN`. `PMKID` and `PARTIAL`
+carry PCAPNG only. `VALID` carries a same-exchange PCAPNG plus HCCAPX. Firmware
+1.7.12 advertises `hs_capture_pcapng_v1: true`; each artifact uses radiotap link
+type 127, microsecond timestamps, FCS-stripped frames and ESP-reported channel
+and RSSI. It can contain beacon, authentication, association and every observed
+M1-M4 frame, and is bounded by `HSX_ARTIFACT_MAX` at 4,096 bytes. Serial output
+does not include a duplicate classic PCAP block.
 
 The Wi-Fi callback only validates routing and copies eligible context/EAPOL
 frames into an eight-frame bounded pool; it does not parse exchanges, allocate,
