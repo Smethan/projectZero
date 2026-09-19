@@ -78,10 +78,10 @@ strip_fcs = callback.index("size_t len = sig_len - 4U", short_fcs)
 scope_check = callback.index("hst_frame_allowed(&handshake_scope, frame, len)")
 classification = callback.index("hs_capture_kind(frame, len)")
 assert sig_len < short_fcs < strip_fcs < scope_check < classification
-assert callback.count("hs_queue_frame(pkt, len,") == 3
+assert callback.count("hs_queue_frame(pkt, len,") == 4
 assert "copy->len = (uint16_t)len" in queue_frame
 assert "memcpy(copy->data, pkt->payload, len)" in queue_frame
-assert "hsx_ingest(" in process and "hs_capture_append_for_progress(" in process
+assert "hsx_ingest_radio(" in process and "hs_capture_append_for_progress(" in process
 
 # The immutable scope is enforced again immediately before active injection.
 # This protects all-except capture even if unrelated AP/client state somehow
@@ -128,7 +128,7 @@ assert hs_stop.index("handshake_attack_active = false") < hs_stop.index(
 assert 'return 1;' in hs_stop
 
 # File success is only possible after an exact write, flush, fsync, and close.
-# Any failure removes the partial path.  For a VALID capture, the PCAP is also
+# Any failure removes the partial path.  For a VALID capture, the PCAPNG is also
 # removed if its paired HCCAPX cannot be committed, and success text follows
 # both checked writes.
 assert write_checked.index("fwrite(data, 1, size, file) == size") < write_checked.index(
@@ -143,19 +143,20 @@ assert write_checked.index("fsync(fileno(file)) == 0") < write_checked.index(
 assert write_checked.index("fclose(file)") < write_checked.index("unlink(path)")
 assert "if (!ok) unlink(path)" in write_checked
 
-pcap_write = save_sd.index("hs_write_checked(pcap_path")
+pcapng_write = save_sd.index("hs_write_checked(pcapng_path")
 hccapx_write = save_sd.index("hs_write_checked(hccapx_path")
-remove_pcap = save_sd.index("unlink(pcap_path)", hccapx_write)
+remove_pcapng = save_sd.index("unlink(pcapng_path)", hccapx_write)
 valid_claim = save_sd.index('printf("HANDSHAKE IS COMPLETE AND VALID')
 return_success = save_sd.rindex("return true")
-assert pcap_write < hccapx_write < remove_pcap < valid_claim < return_success
-assert "size <= 24" in build_artifact
+assert pcapng_write < hccapx_write < remove_pcapng < valid_claim < return_success
+assert "hsx_build_pcapng_with_context(" in build_artifact
+assert "size <= 60" in build_artifact
 assert "entry->hccapx.essid_len" in complete_exchange
 
-# Large exchange state and the reusable 2.1 KiB artifact workspace must remain
+# Large exchange state and the reusable PCAPNG artifact workspace must remain
 # in PSRAM, never as locals on the 12 KiB capture task stack.
 assert "hs_exchange_state = heap_caps_calloc(1, sizeof(hsx_state_t), MALLOC_CAP_SPIRAM)" in psram_init
-assert "hs_artifact_buffer = heap_caps_malloc(HSX_PCAP_MAX, MALLOC_CAP_SPIRAM)" in psram_init
+assert "hs_artifact_buffer = heap_caps_malloc(HSX_ARTIFACT_MAX, MALLOC_CAP_SPIRAM)" in psram_init
 
 # A scan releases its busy flags before the terminal record, but copies token
 # and count locally first so an immediate replacement cannot relabel that

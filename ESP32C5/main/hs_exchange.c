@@ -171,8 +171,9 @@ void hsx_reset(hsx_state_t *state) {
     if (state) memset(state, 0, sizeof(*state));
 }
 
-bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
-                uint32_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
+bool hsx_ingest_radio(hsx_state_t *state, const uint8_t *frame, size_t len,
+                      uint32_t timestamp_us, uint8_t channel, int8_t rssi,
+                const uint8_t *ssid, size_t ssid_len,
                 hsx_result_t *result) {
     if (!state || !result || len > HSX_FRAME_MAX || ssid_len > 32 ||
         (ssid_len && !ssid)) return false;
@@ -213,6 +214,8 @@ bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
             hsx_frame_t *saved = &entry->messages[parsed.message - 1U];
             if (saved->len != len || memcmp(saved->data, frame, len)) {
                 saved->len = (uint16_t)len;
+                saved->channel = channel;
+                saved->rssi = rssi;
                 saved->timestamp_us = timestamp_us;
                 memcpy(saved->data, frame, len);
                 result->new_message = true;
@@ -224,15 +227,24 @@ bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
     }
     entry->message_mask |= bit;
     result->new_message = true;
-    if (parsed.message <= 3) {
+    if (parsed.message <= 4) {
         hsx_frame_t *saved = &entry->messages[parsed.message - 1U];
         saved->len = (uint16_t)len;
+        saved->channel = channel;
+        saved->rssi = rssi;
         saved->timestamp_us = timestamp_us;
         memcpy(saved->data, frame, len);
     }
     build_hccapx(entry);
     result->became_complete = !was_complete && entry->complete;
     return true;
+}
+
+bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
+                uint32_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
+                hsx_result_t *result) {
+    return hsx_ingest_radio(state, frame, len, timestamp_us, 0, 0,
+                            ssid, ssid_len, result);
 }
 
 void hsx_set_ap_ssid(hsx_state_t *state, const uint8_t bssid[6],
@@ -330,14 +342,96 @@ size_t hsx_build_pcap(const hsx_entry_t *entry, const hsx_frame_t *beacon,
         !pcap_frame(out, capacity, &used, association)) return 0;
     if (entry) {
         if (!entry->complete) return 0;
-        bool m12;
-        if (entry->hccapx.message_pair == 0) m12 = true;
-        else if (entry->hccapx.message_pair == 2) m12 = false;
-        else return 0;
-        const hsx_frame_t *first = &entry->messages[m12 ? 0 : 1];
-        const hsx_frame_t *second = &entry->messages[m12 ? 1 : 2];
-        if (!pcap_frame(out, capacity, &used, first) ||
-            !pcap_frame(out, capacity, &used, second)) return 0;
+        for (unsigned i = 0; i < 4; i++)
+            if (!pcap_frame(out, capacity, &used, &entry->messages[i])) return 0;
     }
     return used > 24 ? used : 0;
+}
+
+static size_t align4(size_t value) {
+    return (value + 3U) & ~3U;
+}
+
+static uint16_t channel_frequency(uint8_t channel, uint16_t *flags) {
+    if (flags) *flags = 0;
+    if (channel == 14) {
+        if (flags) *flags = 0x0080U;
+        return 2484;
+    }
+    if (channel >= 1 && channel <= 13) {
+        if (flags) *flags = 0x0080U;
+        return (uint16_t)(2407U + channel * 5U);
+    }
+    if (channel >= 15 && channel <= 233) {
+        if (flags) *flags = 0x0100U;
+        return (uint16_t)(5000U + channel * 5U);
+    }
+    return 0;
+}
+
+static bool pcapng_frame(uint8_t *out, size_t capacity, size_t *used,
+                         const hsx_frame_t *frame) {
+    if (!frame || !frame->len) return true;
+    if (frame->len > HSX_FRAME_MAX) return false;
+    const size_t radiotap_len = 15;
+    size_t packet_len = radiotap_len + frame->len;
+    size_t block_len = 32U + align4(packet_len);
+    if (*used + block_len > capacity) return false;
+    uint8_t *block = out + *used;
+    memset(block, 0, block_len);
+    put32(block, 6U);                  /* Enhanced Packet Block */
+    put32(block + 4, (uint32_t)block_len);
+    put32(block + 8, 0U);             /* interface 0 */
+    put32(block + 12, 0U);            /* timestamp high */
+    put32(block + 16, frame->timestamp_us);
+    put32(block + 20, (uint32_t)packet_len);
+    put32(block + 24, (uint32_t)packet_len);
+    uint8_t *packet = block + 28;
+    put16(packet + 2, (uint16_t)radiotap_len);
+    put32(packet + 4, 0x0000002aU);    /* flags, channel, dBm signal */
+    packet[8] = 0;                     /* FCS was stripped */
+    uint16_t channel_flags = 0;
+    put16(packet + 10, channel_frequency(frame->channel, &channel_flags));
+    put16(packet + 12, channel_flags);
+    packet[14] = (uint8_t)frame->rssi;
+    memcpy(packet + radiotap_len, frame->data, frame->len);
+    put32(block + block_len - 4, (uint32_t)block_len);
+    *used += block_len;
+    return true;
+}
+
+size_t hsx_build_pcapng_with_context(const hsx_entry_t *entry,
+                                     const hsx_frame_t *beacon,
+                                     const hsx_frame_t *authentication,
+                                     const hsx_frame_t *association,
+                                     uint8_t *out, size_t capacity) {
+    if (!out || capacity < 60) return 0;
+    memset(out, 0, 60);
+    /* Section Header Block: little endian, version 1.0, unknown length. */
+    put32(out, 0x0a0d0d0aU); put32(out + 4, 28U);
+    put32(out + 8, 0x1a2b3c4dU); put16(out + 12, 1U);
+    memset(out + 16, 0xff, 8); put32(out + 24, 28U);
+    /* Interface Description Block: radiotap, explicit microsecond resolution. */
+    uint8_t *idb = out + 28;
+    put32(idb, 1U); put32(idb + 4, 32U); put16(idb + 8, 127U);
+    put32(idb + 12, HSX_FRAME_MAX + 15U);
+    put16(idb + 16, 9U); put16(idb + 18, 1U); idb[20] = 6U;
+    put32(idb + 24, 0U); put32(idb + 28, 32U);
+    size_t used = 60;
+    if (!pcapng_frame(out, capacity, &used, beacon) ||
+        !pcapng_frame(out, capacity, &used, authentication) ||
+        !pcapng_frame(out, capacity, &used, association)) return 0;
+    if (entry) {
+        if (!entry->complete) return 0;
+        for (unsigned i = 0; i < 4; i++)
+            if (!pcapng_frame(out, capacity, &used, &entry->messages[i])) return 0;
+    }
+    return used > 60 ? used : 0;
+}
+
+size_t hsx_build_pcapng(const hsx_entry_t *entry, const hsx_frame_t *beacon,
+                        const hsx_frame_t *association, uint8_t *out,
+                        size_t capacity) {
+    return hsx_build_pcapng_with_context(entry, beacon, NULL, association,
+                                         out, capacity);
 }

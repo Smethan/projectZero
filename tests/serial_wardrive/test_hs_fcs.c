@@ -41,8 +41,10 @@ typedef struct {
     bool has_existing_file;
     bool partial_saved;
     bool association_has_pmkid;
+    int64_t complete_at_us;
     int64_t last_deauth_us;
     hsx_frame_t beacon;
+    hsx_frame_t authentication;
     hsx_frame_t association;
 } hs_ap_target_t;
 
@@ -59,6 +61,7 @@ typedef enum {
     HS_FRAME_AP_CONTEXT = 1,
     HS_FRAME_ASSOCIATION = 2,
     HS_FRAME_EAPOL = 3,
+    HS_FRAME_AUTHENTICATION = 4,
 } hs_frame_kind_t;
 
 typedef struct {
@@ -86,7 +89,7 @@ typedef enum {
 static hs_ap_target_t ap_storage[HS_MAX_APS];
 static hs_client_entry_t client_storage[HS_MAX_CLIENTS];
 static hsx_state_t exchange_storage;
-static uint8_t artifact_storage[HSX_PCAP_MAX];
+static uint8_t artifact_storage[HSX_ARTIFACT_MAX];
 static hs_ap_target_t *hs_ap_targets = ap_storage;
 static hs_client_entry_t *hs_clients = client_storage;
 static hsx_state_t *hs_exchange_state = &exchange_storage;
@@ -105,7 +108,7 @@ static QueueHandle_t hs_hint_queue;
 static atomic_bool hs_capture_accepting;
 static atomic_uint hs_capture_producers;
 static atomic_uint hs_capture_drops;
-static uint8_t hs_seen_context[HS_MAX_APS * 2][7];
+static uint8_t hs_seen_context[HS_MAX_APS * 3][7];
 static unsigned hs_seen_context_count;
 static portMUX_TYPE hs_seen_context_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -124,6 +127,14 @@ static void pcap_serializer_append_frame(const uint8_t *data, unsigned size,
     assert(progress_count < 8);
     progress_lengths[progress_count++] = size;
     progress_size += 16 + size;
+}
+static void pcap_serializer_append_frame_radio(const uint8_t *data,
+                                               unsigned size,
+                                               unsigned timestamp_us,
+                                               uint8_t channel,
+                                               int8_t rssi) {
+    assert(channel == 6 && rssi == -42);
+    pcap_serializer_append_frame(data, size, timestamp_us);
 }
 static unsigned pcap_serializer_get_size(void) { return progress_size; }
 
@@ -162,6 +173,16 @@ static size_t make_beacon(uint8_t *frame) {
     frame[pos++] = 1;
     frame[pos++] = 0;
     return pos;
+}
+
+static size_t make_authentication(uint8_t *frame) {
+    memset(frame, 0, HSX_FRAME_MAX);
+    frame[0] = 0xb0;
+    memcpy(frame + 4, ap, 6);
+    memcpy(frame + 10, sta, 6);
+    memcpy(frame + 16, ap, 6);
+    frame[26] = 1; /* authentication transaction 1 */
+    return 30;
 }
 
 #define EAPOL_FRAME_LEN 131
@@ -238,6 +259,13 @@ int main(void) {
     assert(!memcmp(hs_ap_targets[0].beacon.data, frame, beacon_len));
     assert(progress_count == 1 && progress_lengths[0] == beacon_len);
 
+    size_t authentication_len = make_authentication(frame);
+    offer_with_fcs(frame, authentication_len, WIFI_PKT_MGMT, 150);
+    assert(hs_capture_drain() == 1);
+    assert(hs_ap_targets[0].authentication.len == authentication_len);
+    assert(!memcmp(hs_ap_targets[0].authentication.data, frame,
+                   authentication_len));
+
     make_eapol(frame, 1, 70);
     offer_with_fcs(frame, EAPOL_FRAME_LEN, WIFI_PKT_DATA, 200);
     assert(hs_capture_drain() == 1);
@@ -250,35 +278,36 @@ int main(void) {
     assert(progress_lengths[2] == EAPOL_FRAME_LEN);
 
     hsx_entry_t *exchange = NULL;
-    size_t pcap_size = 0;
-    assert(hs_build_ap_artifact(0, true, &exchange, &pcap_size) ==
+    size_t pcapng_size = 0;
+    assert(hs_build_ap_artifact(0, true, &exchange, &pcapng_size) ==
            HS_ARTIFACT_VALID);
     assert(exchange && exchange->hccapx.message_pair == 0);
-    assert(pcap_size == 24 + 16 + beacon_len +
-                        2 * (16 + EAPOL_FRAME_LEN));
+    assert(get_le32(artifact_storage) == 0x0a0d0d0aU);
+    assert(get_le32(artifact_storage + 28) == 1U);
+    assert(artifact_storage[36] == 127 && artifact_storage[37] == 0);
 
-    size_t pos = 24;
-    assert(get_le32(artifact_storage + pos + 8) == beacon_len);
-    assert(get_le32(artifact_storage + pos + 12) == beacon_len);
-    pos += 16 + beacon_len;
-    assert(get_le32(artifact_storage + pos + 8) == EAPOL_FRAME_LEN);
-    assert(get_le32(artifact_storage + pos + 12) == EAPOL_FRAME_LEN);
-    pos += 16 + EAPOL_FRAME_LEN;
-    assert(get_le32(artifact_storage + pos + 8) == EAPOL_FRAME_LEN);
-    assert(get_le32(artifact_storage + pos + 12) == EAPOL_FRAME_LEN);
-    pos += 16 + EAPOL_FRAME_LEN;
-    assert(pos == pcap_size);
-
-    /* No stored frame or PCAP record can include the sentinel FCS. */
-    for (unsigned i = 0; i < 3; i++) {
-        const uint8_t *record = artifact_storage + 24;
-        if (i == 1) record += 16 + beacon_len;
-        if (i == 2) record += 16 + beacon_len + 16 + EAPOL_FRAME_LEN;
-        uint32_t len = get_le32(record + 8);
-        assert(len >= 4 && memcmp(record + 16 + len - 4, fcs, 4));
+    size_t pos = 60;
+    const size_t expected_lengths[] = {beacon_len, authentication_len,
+                                       EAPOL_FRAME_LEN, EAPOL_FRAME_LEN};
+    for (unsigned i = 0; i < 4; i++) {
+        assert(get_le32(artifact_storage + pos) == 6U);
+        uint32_t block_len = get_le32(artifact_storage + pos + 4);
+        uint32_t packet_len = get_le32(artifact_storage + pos + 20);
+        assert(packet_len == 15 + expected_lengths[i]);
+        assert(get_le32(artifact_storage + pos + block_len - 4) == block_len);
+        const uint8_t *radiotap = artifact_storage + pos + 28;
+        assert(radiotap[2] == 15 && radiotap[3] == 0);
+        assert(radiotap[8] == 0); /* FCS was stripped before serialization. */
+        assert(radiotap[14] == (uint8_t)-42);
+        assert(radiotap[10] == 0x85 && radiotap[11] == 0x09); /* 2437 MHz */
+        const uint8_t *saved = radiotap + 15;
+        assert(expected_lengths[i] >= 4 &&
+               memcmp(saved + expected_lengths[i] - 4, fcs, 4));
+        pos += block_len;
     }
+    assert(pos == pcapng_size);
 
     hs_capture_close();
     assert(!heap_live && !hs_frame_pool.frames && !hs_hint_queue);
-    puts("PASS: active HS beacon/EAPOL FCS stripping and PCAP record lengths");
+    puts("PASS: active HS FCS stripping and PCAPNG radiotap records");
 }

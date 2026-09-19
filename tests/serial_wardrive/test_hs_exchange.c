@@ -55,8 +55,9 @@ static hsx_result_t ingest(hsx_state_t *state, unsigned message,
     uint8_t frame[FRAME_LEN];
     make_eapol(frame, message, ap, sta, replay);
     hsx_result_t result;
-    assert(hsx_ingest(state, frame, sizeof(frame), message * 1000,
-                      (const uint8_t *)"network", 7, &result));
+    assert(hsx_ingest_radio(state, frame, sizeof(frame), message * 1000,
+                            6, (int8_t)(-40 - (int)message),
+                            (const uint8_t *)"network", 7, &result));
     assert(result.accepted && result.message == message);
     assert(!memcmp(result.bssid, ap, 6) && !memcmp(result.sta, sta, 6));
     return result;
@@ -65,8 +66,8 @@ static hsx_result_t ingest(hsx_state_t *state, unsigned message,
 static hsx_result_t ingest_frame(hsx_state_t *state, const uint8_t *frame,
                                  size_t len, uint32_t timestamp_us) {
     hsx_result_t result;
-    assert(hsx_ingest(state, frame, len, timestamp_us,
-                      (const uint8_t *)"network", 7, &result));
+    assert(hsx_ingest_radio(state, frame, len, timestamp_us, 6, -42,
+                            (const uint8_t *)"network", 7, &result));
     assert(result.accepted);
     return result;
 }
@@ -149,18 +150,65 @@ static void test_pair_choice_and_arrival_orders(void) {
         uint8_t pcap[HSX_PCAP_MAX];
         size_t size = hsx_build_pcap(result.entry, NULL, NULL, pcap,
                                      sizeof(pcap));
-        assert(size == 24 + 2 * (16 + FRAME_LEN));
+        assert(size == 24 + 3 * (16 + FRAME_LEN));
         const uint8_t *first = pcap + 24 + 16;
         const uint8_t *second = first + FRAME_LEN + 16;
-        if (result.entry->hccapx.message_pair == 0) {
-            assert(!memcmp(first, frames[0], FRAME_LEN));
-            assert(!memcmp(second, frames[1], FRAME_LEN));
-        } else {
-            assert(result.entry->hccapx.message_pair == 2);
-            assert(!memcmp(first, frames[1], FRAME_LEN));
-            assert(!memcmp(second, frames[2], FRAME_LEN));
-        }
+        const uint8_t *third = second + FRAME_LEN + 16;
+        assert(!memcmp(first, frames[0], FRAME_LEN));
+        assert(!memcmp(second, frames[1], FRAME_LEN));
+        assert(!memcmp(third, frames[2], FRAME_LEN));
     }
+}
+
+static uint32_t get32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint16_t get16(const uint8_t *p) {
+    return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+}
+
+static void test_rich_pcapng_and_m4_retention(void) {
+    hsx_state_t state;
+    hsx_reset(&state);
+    ingest(&state, 1, ap1, sta1, 70);
+    hsx_result_t result = ingest(&state, 2, ap1, sta1, 70);
+    assert(result.entry && result.entry->complete);
+    ingest(&state, 3, ap1, sta1, 71);
+    result = ingest(&state, 4, ap1, sta1, 71);
+    assert(result.entry && result.entry->message_mask == 0x0f);
+    assert(result.entry->messages[3].len == FRAME_LEN);
+
+    uint8_t pcap[HSX_PCAP_MAX];
+    size_t pcap_size = hsx_build_pcap(result.entry, NULL, NULL, pcap,
+                                      sizeof(pcap));
+    assert(pcap_size == 24 + 4 * (16 + FRAME_LEN));
+
+    uint8_t pcapng[HSX_PCAPNG_MAX];
+    size_t size = hsx_build_pcapng(result.entry, NULL, NULL, pcapng,
+                                   sizeof(pcapng));
+    assert(size > pcap_size && get32(pcapng) == 0x0a0d0d0aU);
+    assert(get32(pcapng + 4) == 28 && get32(pcapng + 24) == 28);
+    assert(get32(pcapng + 28) == 1 && get16(pcapng + 36) == 127);
+    unsigned packets = 0;
+    for (size_t offset = 60; offset < size;) {
+        assert(get32(pcapng + offset) == 6);
+        uint32_t block_size = get32(pcapng + offset + 4);
+        assert(block_size >= 32 && !(block_size & 3));
+        assert(get32(pcapng + offset + block_size - 4) == block_size);
+        uint32_t captured = get32(pcapng + offset + 20);
+        const uint8_t *packet = pcapng + offset + 28;
+        assert(captured == FRAME_LEN + 15 && get16(packet + 2) == 15);
+        assert(get16(packet + 10) == 2437 && get16(packet + 12) == 0x0080);
+        assert((int8_t)packet[14] < 0);
+        assert(!memcmp(packet + 15, result.entry->messages[packets].data,
+                       FRAME_LEN));
+        packets++;
+        offset += block_size;
+    }
+    assert(packets == 4);
+    assert(!hsx_build_pcapng(result.entry, NULL, NULL, pcapng, size - 1));
 }
 
 static void test_poisoned_candidate_and_retransmission(void) {
@@ -382,6 +430,7 @@ static void test_pmkid_context(void) {
 int main(void) {
     test_same_exchange_rules();
     test_pair_choice_and_arrival_orders();
+    test_rich_pcapng_and_m4_retention();
     test_poisoned_candidate_and_retransmission();
     test_independent_aps_and_reset();
     test_bounds_and_validation();

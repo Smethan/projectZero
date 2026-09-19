@@ -59,13 +59,15 @@ static size_t get_ssid_length(const uint8_t *ssid) {
     return len;
 }
 
-// Track which handshake messages we've captured to avoid duplicates in PCAP
+// Track which handshake messages we've captured to avoid duplicates in PCAPNG.
 static bool captured_m1 = false;
 static bool captured_m2 = false;
 static bool captured_m3 = false;
 static bool captured_m4 = false;
 static uint8_t handshake_frame_count = 0;
 static bool captured_beacon = false;
+static bool captured_authentication = false;
+static bool captured_association = false;
 
 // Deauth frame template
 static uint8_t deauth_frame_default[] = {
@@ -127,7 +129,7 @@ static void deauth_timer_callback(void *arg) {
  * @brief Callback for DATA_FRAME_EVENT_EAPOLKEY_FRAME event.
  * 
  * If EAPOL-Key frame is captured and DATA_FRAME_EVENT_EAPOLKEY_FRAME event is received from event pool, this method
- * appends the frame and serializes them into pcap and hccapx format.
+ * appends the frame and serializes them into PCAPNG and HCCAPX format.
  * 
  * @param args not used
  * @param event_base expects FRAME_ANALYZER_EVENTS
@@ -212,32 +214,41 @@ static uint8_t get_eapol_message_number(data_frame_t *frame) {
 /**
  * @brief Handler for MGMT frames (beacon/probe response)
  * 
- * Captures beacon frame from target AP to include ESSID in PCAP
+ * Captures beacon frame from target AP to include ESSID in PCAPNG.
  */
 static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    if (captured_beacon) {
-        return; // Already have beacon
-    }
-    
     wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
-    
-    // Check if this is a beacon (subtype 0x80) or probe response (0x50)
-    uint8_t frame_type = frame->payload[0];
-    if (frame_type != 0x80 && frame_type != 0x50) {
-        return; // Not beacon or probe response
-    }
-    
-    // Check if BSSID matches (offset 16 for beacon/probe response)
+    if (frame->rx_ctrl.sig_len <= 28) return;
+    unsigned capture_len = frame->rx_ctrl.sig_len - 4U;
+    uint8_t subtype = frame->payload[0] >> 4;
+
+    // Management frames use address 3 as the BSSID for this exchange.
     if (memcmp(&frame->payload[16], current_ap_record.bssid, 6) != 0) {
-        return; // Not our target AP
+        return;
     }
-    
-    // Save beacon to PCAP
-    pcap_serializer_append_frame(frame->payload, frame->rx_ctrl.sig_len, frame->rx_ctrl.timestamp);
-    captured_beacon = true;
-    
-    ESP_LOGI(TAG, "✓ BEACON frame captured and saved (ESSID: %s)", current_ap_record.ssid);
-    ESP_LOGI(TAG, "  This frame is needed for PMK calculation in hashcat/wpa-sec");
+
+    const char *label = NULL;
+    if ((subtype == 8 || subtype == 5) && !captured_beacon) {
+        captured_beacon = true;
+        label = "BEACON/PROBE RESPONSE";
+    } else if (subtype == 11 && !captured_authentication) {
+        captured_authentication = true;
+        label = "AUTHENTICATION";
+    } else if ((subtype == 0 || subtype == 2) && !captured_association) {
+        captured_association = true;
+        label = "ASSOCIATION REQUEST";
+    } else {
+        return;
+    }
+
+    // ESP-IDF promiscuous sig_len includes the trailing four-byte FCS.
+    pcap_serializer_append_frame_radio(frame->payload,
+                                       capture_len,
+                                       frame->rx_ctrl.timestamp,
+                                       frame->rx_ctrl.channel,
+                                       frame->rx_ctrl.rssi);
+    ESP_LOGI(TAG, "✓ %s captured and saved (ESSID: %s)", label,
+             current_ap_record.ssid);
 }
 
 static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -252,28 +263,28 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
     ESP_LOGI(TAG, ">>> EAPoL-Key frame #%lu captured (M%d) <<<", 
              (unsigned long)eapol_frame_count, msg_num);
     
-    // Only save to PCAP if it's a unique message we haven't captured yet
-    bool should_save_to_pcap = false;
+    // Only save to PCAPNG if it's a unique message we haven't captured yet.
+    bool should_save_to_pcapng = false;
     
     if (msg_num == 1 && !captured_m1) {
         captured_m1 = true;
-        should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M1 (ANonce from AP) - SAVED to PCAP");
+        should_save_to_pcapng = true;
+        ESP_LOGI(TAG, "  ✓ M1 (ANonce from AP) - SAVED to PCAPNG");
     }
     else if (msg_num == 2 && !captured_m2) {
         captured_m2 = true;
-        should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M2 (SNonce from STA + MIC) - SAVED to PCAP");
+        should_save_to_pcapng = true;
+        ESP_LOGI(TAG, "  ✓ M2 (SNonce from STA + MIC) - SAVED to PCAPNG");
     }
     else if (msg_num == 3 && !captured_m3) {
         captured_m3 = true;
-        should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M3 (ANonce + Install) - SAVED to PCAP");
+        should_save_to_pcapng = true;
+        ESP_LOGI(TAG, "  ✓ M3 (ANonce + Install) - SAVED to PCAPNG");
     }
     else if (msg_num == 4 && !captured_m4) {
         captured_m4 = true;
-        should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M4 (Final ACK) - SAVED to PCAP");
+        should_save_to_pcapng = true;
+        ESP_LOGI(TAG, "  ✓ M4 (Final ACK) - SAVED to PCAPNG");
     }
     else if (msg_num > 0) {
         ESP_LOGD(TAG, "  → M%d duplicate - SKIPPED", msg_num);
@@ -282,11 +293,15 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
         ESP_LOGW(TAG, "  → Unknown EAPOL type - SKIPPED");
     }
     
-    // Save to PCAP only if unique
-    if (should_save_to_pcap) {
-        pcap_serializer_append_frame(frame->payload, frame->rx_ctrl.sig_len, frame->rx_ctrl.timestamp);
+    // Save to PCAPNG only if unique. The driver length includes the FCS.
+    if (should_save_to_pcapng && frame->rx_ctrl.sig_len > 4) {
+        pcap_serializer_append_frame_radio(frame->payload,
+                                           frame->rx_ctrl.sig_len - 4U,
+                                           frame->rx_ctrl.timestamp,
+                                           frame->rx_ctrl.channel,
+                                           frame->rx_ctrl.rssi);
         handshake_frame_count++;
-        ESP_LOGI(TAG, "  → Total unique frames in PCAP: %d/4", handshake_frame_count);
+        ESP_LOGI(TAG, "  → Total unique frames in PCAPNG: %d/4", handshake_frame_count);
     }
     
     // Always process for HCCAPX (it has its own logic)
@@ -349,6 +364,8 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     captured_m3 = false;
     captured_m4 = false;
     captured_beacon = false;
+    captured_authentication = false;
+    captured_association = false;
     
     method = attack_method;
     memcpy(&current_ap_record, ap_record, sizeof(wifi_ap_record_t));
@@ -654,7 +671,7 @@ static void format_mac_suffix(const uint8_t *mac_addr, char *output) {
  * @brief Saves complete handshake to SD card
  * 
  * Files are saved to /sdcard/lab/handshakes/ with format:
- * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcap|hccapx}
+ * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcapng|hccapx}
  * 
  * SSID is sanitized using whitelist (alphanumeric, -, _, ., space).
  * MAC suffix (6 hex digits from AP MAC) prevents filename collisions.
@@ -700,13 +717,13 @@ bool attack_handshake_save_to_sd() {
         return false;
     }
     
-    // Get PCAP data
-    unsigned pcap_size;
-    uint8_t *pcap_buf = pcap_serializer_get_buffer();
-    pcap_size = pcap_serializer_get_size();
+    // Get PCAPNG data
+    unsigned pcapng_size;
+    uint8_t *pcapng_buf = pcap_serializer_get_buffer();
+    pcapng_size = pcap_serializer_get_size();
     
-    if (!pcap_buf || pcap_size == 0) {
-        printf("✗ No PCAP data to save\n");
+    if (!pcapng_buf || pcapng_size <= 60) {
+        printf("✗ No PCAPNG packet data to save\n");
         return false;
     }
     
@@ -720,6 +737,7 @@ bool attack_handshake_save_to_sd() {
     
     // Generate filename with SSID, MAC suffix, and timestamp
     char filename[128];
+    char pcapng_filename[128];
     char ssid_safe[33];
     char mac_suffix[7]; // 6 hex digits + null terminator
     
@@ -734,38 +752,44 @@ bool attack_handshake_save_to_sd() {
     // Use timestamp for unique filename
     uint64_t timestamp = esp_timer_get_time() / 1000; // milliseconds
     
-    // Save PCAP file
-    // Format: /sdcard/lab/handshakes/{SSID}_{MAC_SUFFIX}_{TIMESTAMP}.pcap
-    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.pcap", 
+    // Save PCAPNG file
+    // Format: /sdcard/lab/handshakes/{SSID}_{MAC_SUFFIX}_{TIMESTAMP}.pcapng
+    snprintf(pcapng_filename, sizeof(pcapng_filename),
+             "/sdcard/lab/handshakes/%s_%s_%llu.pcapng",
              ssid_safe, mac_suffix, (unsigned long long)timestamp);
     
-    FILE *f = fopen(filename, "wb");
+    FILE *f = fopen(pcapng_filename, "wb");
     if (!f) {
-        printf("✗ Failed to open file for writing: %s\n", filename);
+        printf("✗ Failed to open file for writing: %s\n", pcapng_filename);
         return false;
     }
     
-    size_t written = fwrite(pcap_buf, 1, pcap_size, f);
+    size_t written = fwrite(pcapng_buf, 1, pcapng_size, f);
     fclose(f);
     sd_sync();
     
-    if (written != pcap_size) {
-        printf("✗ Failed to write complete PCAP (%zu/%u bytes)\n", written, pcap_size);
+    if (written != pcapng_size) {
+        unlink(pcapng_filename);
+        printf("✗ Failed to write complete PCAPNG (%zu/%u bytes)\n",
+               written, pcapng_size);
         return false;
     }
     
-    printf("✓ PCAP saved: %s (%u bytes)\n", filename, pcap_size);
+    printf("✓ PCAPNG saved: %s (%u bytes)\n", pcapng_filename, pcapng_size);
     
-    // Analyze PCAP content
-    printf("  PCAP Analysis:\n");
-    printf("    - Total PCAP size: %u bytes\n", pcap_size);
-    printf("    - PCAP header: 24 bytes\n");
-    printf("    - Frame data: ~%u bytes\n", pcap_size - 24);
+    // Summarize PCAPNG content.
+    printf("  PCAPNG Analysis:\n");
+    printf("    - Total PCAPNG size: %u bytes\n", pcapng_size);
+    printf("    - Radiotap metadata: channel and RSSI\n");
     printf("    - Captured BEACON: %s\n", captured_beacon ? "YES" : "NO");
+    printf("    - Captured AUTHENTICATION: %s\n",
+           captured_authentication ? "YES" : "NO");
+    printf("    - Captured ASSOCIATION: %s\n",
+           captured_association ? "YES" : "NO");
     printf("    - Unique handshake frames: %d/4\n", handshake_frame_count);
     
     if (!captured_beacon) {
-        printf("  WARNING: No BEACON frame! PCAP may fail validation.\n");
+        printf("  WARNING: No BEACON frame! PCAPNG may fail validation.\n");
         printf("  Tools need BEACON/PROBE RESPONSE for ESSID to calculate PMK.\n");
     }
     
@@ -780,6 +804,7 @@ bool attack_handshake_save_to_sd() {
     
     f = fopen(filename, "wb");
     if (!f) {
+        unlink(pcapng_filename);
         printf("✗ Failed to open HCCAPX file: %s\n", filename);
         return false;
     }
@@ -789,6 +814,8 @@ bool attack_handshake_save_to_sd() {
     sd_sync();
     
     if (written != sizeof(hccapx_t)) {
+        unlink(pcapng_filename);
+        unlink(filename);
         printf("✗ Failed to write complete HCCAPX\n");
         return false;
     }
@@ -799,4 +826,3 @@ bool attack_handshake_save_to_sd() {
     
     return true;
 }
-

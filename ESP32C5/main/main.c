@@ -140,7 +140,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.11"
+#define JANOS_VERSION "1.7.12"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -401,7 +401,7 @@ static TaskHandle_t sniffer_channel_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
 
-// PCAP capture state
+// PCAPNG capture state
 typedef enum {
     PCAP_MODE_NONE = 0,
     PCAP_MODE_RADIO,
@@ -410,6 +410,8 @@ typedef enum {
 
 typedef struct {
     uint16_t len;
+    uint8_t channel;
+    int8_t rssi;
     int64_t timestamp_us;
     uint8_t data[];
 } pcap_queued_frame_t;
@@ -566,8 +568,10 @@ typedef struct {
     bool has_existing_file;     // Already captured on SD
     bool partial_saved;
     bool association_has_pmkid;
+    int64_t complete_at_us;
     int64_t last_deauth_us;
     hsx_frame_t beacon;
+    hsx_frame_t authentication;
     hsx_frame_t association;
 } hs_ap_target_t;
 
@@ -586,7 +590,7 @@ static hs_ap_target_t *hs_ap_targets = NULL;     // PSRAM
 static int hs_ap_count = 0;
 static hs_client_entry_t *hs_clients = NULL;      // PSRAM
 static hsx_state_t *hs_exchange_state = NULL;     // PSRAM; per AP/STA/replay state
-static uint8_t *hs_artifact_buffer = NULL;        // PSRAM; one task-owned PCAP workspace
+static uint8_t *hs_artifact_buffer = NULL;        // PSRAM; one task-owned PCAPNG workspace
 static int hs_client_count = 0;
 static ducb_channel_t *ducb_channels = NULL;       // PSRAM
 static int ducb_channel_count = 0;
@@ -602,6 +606,7 @@ typedef enum {
     HS_FRAME_AP_CONTEXT = 1,
     HS_FRAME_ASSOCIATION = 2,
     HS_FRAME_EAPOL = 3,
+    HS_FRAME_AUTHENTICATION = 4,
 } hs_frame_kind_t;
 typedef struct {
     uint32_t timestamp_us;
@@ -623,7 +628,7 @@ static QueueHandle_t hs_hint_queue;
 static atomic_bool hs_capture_accepting;
 static atomic_uint hs_capture_producers;
 static atomic_uint hs_capture_drops;
-static uint8_t hs_seen_context[HS_MAX_APS * 2][7];
+static uint8_t hs_seen_context[HS_MAX_APS * 3][7];
 static unsigned hs_seen_context_count;
 static portMUX_TYPE hs_seen_context_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -1858,7 +1863,7 @@ static bool init_psram_buffers(void)
     hs_ap_targets = heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
     hs_exchange_state = heap_caps_calloc(1, sizeof(hsx_state_t), MALLOC_CAP_SPIRAM);
-    hs_artifact_buffer = heap_caps_malloc(HSX_PCAP_MAX, MALLOC_CAP_SPIRAM);
+    hs_artifact_buffer = heap_caps_malloc(HSX_ARTIFACT_MAX, MALLOC_CAP_SPIRAM);
     ducb_channels = heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
     wdp_seen_networks = heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     wdp_seen_capacity = WDP_INITIAL_CAPACITY;
@@ -2147,10 +2152,11 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
-// PCAP capture functions
+// PCAPNG capture functions
 static int find_next_pcap_file_number(void);
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
-static void pcap_enqueue_frame(const uint8_t *data, uint16_t len);
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len,
+                               uint8_t channel, int8_t rssi);
 static void pcap_writer_task(void *param);
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
@@ -5821,7 +5827,7 @@ static bool check_handshake_file_exists(const char *ssid) {
         }
     }
     
-    // Check if any PCAP file exists for this SSID
+    // Check if any PCAPNG (or legacy PCAP) file exists for this SSID.
     DIR *dir = opendir("/sdcard/lab/handshakes");
     if (dir == NULL) {
         return false; // Directory doesn't exist, so no files exist
@@ -5830,7 +5836,7 @@ static bool check_handshake_file_exists(const char *ssid) {
     struct dirent *entry;
     bool found = false;
     while ((entry = readdir(dir)) != NULL) {
-        // Check if filename starts with the SSID and ends with .pcap
+        // ".pcap" also matches the prefix of ".pcapng" here intentionally.
         if (strncmp(entry->d_name, ssid_safe, strlen(ssid_safe)) == 0 &&
             strstr(entry->d_name, ".pcap") != NULL &&
             strstr(entry->d_name, "_pmkid_") == NULL &&
@@ -7270,11 +7276,11 @@ static hsx_entry_t *hs_complete_exchange(const uint8_t bssid[6]) {
 
 static hs_artifact_kind_t hs_build_ap_artifact(int ap_idx, bool allow_partial,
                                                 hsx_entry_t **exchange,
-                                                size_t *pcap_size) {
+                                                size_t *pcapng_size) {
     if (exchange) *exchange = NULL;
-    if (pcap_size) *pcap_size = 0;
+    if (pcapng_size) *pcapng_size = 0;
     if (ap_idx < 0 || ap_idx >= hs_ap_count || !hs_artifact_buffer ||
-        !hs_exchange_state || !pcap_size) return HS_ARTIFACT_NONE;
+        !hs_exchange_state || !pcapng_size) return HS_ARTIFACT_NONE;
     hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
     hsx_entry_t *entry = hs_complete_exchange(ap->bssid);
     hs_artifact_kind_t kind = HS_ARTIFACT_NONE;
@@ -7285,11 +7291,12 @@ static hs_artifact_kind_t hs_build_ap_artifact(int ap_idx, bool allow_partial,
     } else {
         return HS_ARTIFACT_NONE;
     }
-    size_t size = hsx_build_pcap(entry, &ap->beacon, &ap->association,
-                                 hs_artifact_buffer, HSX_PCAP_MAX);
-    if (size <= 24) return HS_ARTIFACT_NONE;
+    size_t size = hsx_build_pcapng_with_context(
+        entry, &ap->beacon, &ap->authentication, &ap->association,
+        hs_artifact_buffer, HSX_ARTIFACT_MAX);
+    if (size <= 60) return HS_ARTIFACT_NONE;
     if (entry) *exchange = entry;
-    *pcap_size = size;
+    *pcapng_size = size;
     return kind;
 }
 
@@ -7312,15 +7319,15 @@ static bool hs_write_checked(const char *path, const void *data, size_t size) {
 
 static bool hs_save_ap_to_sd(int ap_idx, bool allow_partial) {
     hsx_entry_t *entry = NULL;
-    size_t pcap_size = 0;
+    size_t pcapng_size = 0;
     hs_artifact_kind_t kind = hs_build_ap_artifact(ap_idx, allow_partial,
-                                                   &entry, &pcap_size);
+                                                   &entry, &pcapng_size);
     if (kind == HS_ARTIFACT_NONE) return false;
     hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
     if (!hs_ensure_directory("/sdcard/lab") ||
         !hs_ensure_directory("/sdcard/lab/handshakes")) return false;
 
-    char ssid_safe[33], mac_suffix[7], pcap_path[160], hccapx_path[160];
+    char ssid_safe[33], mac_suffix[7], pcapng_path[160], hccapx_path[160];
     hs_sanitize_ssid(ssid_safe, (const uint8_t *)ap->ssid, ap->ssid_len,
                      sizeof(ssid_safe));
     snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X",
@@ -7328,11 +7335,11 @@ static bool hs_save_ap_to_sd(int ap_idx, bool allow_partial) {
     uint64_t timestamp = (uint64_t)esp_timer_get_time() / 1000U;
     const char *label = kind == HS_ARTIFACT_VALID ? "valid" :
                         kind == HS_ARTIFACT_PMKID ? "pmkid" : "partial";
-    snprintf(pcap_path, sizeof(pcap_path),
-             "/sdcard/lab/handshakes/%s_%s_%s_%llu.pcap",
+    snprintf(pcapng_path, sizeof(pcapng_path),
+             "/sdcard/lab/handshakes/%s_%s_%s_%llu.pcapng",
              ssid_safe, mac_suffix, label, (unsigned long long)timestamp);
-    if (!hs_write_checked(pcap_path, hs_artifact_buffer, pcap_size)) {
-        MY_LOG_INFO(TAG, "[HS-SAVE] PCAP write failed for '%s'", ap->display_ssid);
+    if (!hs_write_checked(pcapng_path, hs_artifact_buffer, pcapng_size)) {
+        MY_LOG_INFO(TAG, "[HS-SAVE] PCAPNG write failed for '%s'", ap->display_ssid);
         return false;
     }
 
@@ -7342,17 +7349,17 @@ static bool hs_save_ap_to_sd(int ap_idx, bool allow_partial) {
                  ssid_safe, mac_suffix, label, (unsigned long long)timestamp);
         if (!entry || !hs_write_checked(hccapx_path, &entry->hccapx,
                                          sizeof(entry->hccapx))) {
-            unlink(pcap_path);
+            unlink(pcapng_path);
             MY_LOG_INFO(TAG, "[HS-SAVE] HCCAPX write failed for '%s'", ap->display_ssid);
             return false;
         }
-        printf("PCAP saved: %s (%u bytes)\n", pcap_path, (unsigned)pcap_size);
+        printf("PCAPNG saved: %s (%u bytes)\n", pcapng_path, (unsigned)pcapng_size);
         printf("HCCAPX saved: %s\n", hccapx_path);
         printf("HANDSHAKE IS COMPLETE AND VALID\n");
         printf("Complete 4-way handshake saved for SSID: %s (MAC: %s)\n",
                ssid_safe, mac_suffix);
     } else {
-        printf("PCAP saved: %s (%u bytes)\n", pcap_path, (unsigned)pcap_size);
+        printf("PCAPNG saved: %s (%u bytes)\n", pcapng_path, (unsigned)pcapng_size);
         printf("%s capture saved for SSID: %s (MAC: %s)\n",
                kind == HS_ARTIFACT_PMKID ? "PMKID" : "Partial",
                ssid_safe, mac_suffix);
@@ -7379,7 +7386,7 @@ static bool hs_context_seen_or_add(const uint8_t bssid[6], uint8_t subtype,
             break;
         }
     }
-    if (!found && add && hs_seen_context_count < HS_MAX_APS * 2) {
+    if (!found && add && hs_seen_context_count < HS_MAX_APS * 3) {
         hs_seen_context[hs_seen_context_count][0] = subtype;
         memcpy(&hs_seen_context[hs_seen_context_count][1], bssid, 6);
         hs_seen_context_count++;
@@ -7443,8 +7450,13 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
                    !(frame[1] & 0x40) && !memcmp(frame + 4, frame + 16, 6)) {
             if (!hs_queue_frame(pkt, len, HS_FRAME_ASSOCIATION))
                 atomic_fetch_add(&hs_capture_drops, 1);
-        } else if (subtype == 11 && !memcmp(frame + 4, frame + 16, 6)) {
-            hs_queue_client(frame + 16, frame + 10, pkt->rx_ctrl.rssi);
+        } else if (subtype == 11 && len >= 30) {
+            const uint8_t *bssid = frame + 16;
+            if (!hs_context_seen_or_add(bssid, (uint8_t)subtype, false)) {
+                if (hs_queue_frame(pkt, len, HS_FRAME_AUTHENTICATION))
+                    hs_context_seen_or_add(bssid, (uint8_t)subtype, true);
+                else atomic_fetch_add(&hs_capture_drops, 1);
+            }
         }
         goto done;
     }
@@ -7467,7 +7479,9 @@ done:
 }
 
 static void hs_capture_append_for_progress(const hs_queued_frame_t *frame) {
-    pcap_serializer_append_frame(frame->data, frame->len, frame->timestamp_us);
+    pcap_serializer_append_frame_radio(frame->data, frame->len,
+                                       frame->timestamp_us, frame->channel,
+                                       frame->rssi);
     /* This serializer exists only as the HSC observation path in multi-AP
      * mode. Bound its otherwise reallocating backing store. */
     if (pcap_serializer_get_size() > 8192) pcap_serializer_init();
@@ -7510,6 +7524,8 @@ static void hs_copy_context(hsx_frame_t *dest,
                             const hs_queued_frame_t *source) {
     dest->len = source->len;
     dest->timestamp_us = source->timestamp_us;
+    dest->channel = source->channel;
+    dest->rssi = source->rssi;
     memcpy(dest->data, source->data, source->len);
 }
 
@@ -7557,6 +7573,23 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
         return;
     }
 
+    if (frame->kind == HS_FRAME_AUTHENTICATION) {
+        if (frame->len < 30 || (frame->data[1] & 0x40)) return;
+        const uint8_t *bssid = frame->data + 16;
+        int ap_idx = hs_find_ap(bssid);
+        if (ap_idx < 0)
+            ap_idx = hs_add_or_update_ap(bssid, NULL, 0, frame->channel,
+                                         WIFI_AUTH_WPA2_PSK, frame->rssi);
+        if (ap_idx < 0 || hs_ap_targets[ap_idx].has_existing_file) return;
+        hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+        if (!ap->authentication.len)
+            hs_copy_context(&ap->authentication, frame);
+        const uint8_t *sta = !memcmp(frame->data + 10, bssid, 6) ?
+                             frame->data + 4 : frame->data + 10;
+        hs_add_or_update_client(sta, ap_idx, frame->rssi);
+        return;
+    }
+
     if (frame->kind == HS_FRAME_EAPOL) {
         unsigned ds = frame->data[1] & 3;
         const uint8_t *bssid = ds == 1 ? frame->data + 4 :
@@ -7569,9 +7602,10 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
         if (ap_idx < 0 || hs_ap_targets[ap_idx].has_existing_file) return;
         hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
         hsx_result_t result;
-        if (!hsx_ingest(hs_exchange_state, frame->data, frame->len,
-                        frame->timestamp_us, (const uint8_t *)ap->ssid,
-                        ap->ssid_len, &result) || !result.accepted) return;
+        if (!hsx_ingest_radio(hs_exchange_state, frame->data, frame->len,
+                              frame->timestamp_us, frame->channel, frame->rssi,
+                              (const uint8_t *)ap->ssid, ap->ssid_len,
+                              &result) || !result.accepted) return;
         hs_add_or_update_client(result.sta, ap_idx, frame->rssi);
         hs_dwell_eapol_frames++;
         bool *message_flag = result.message == 1 ? &ap->captured_m1 :
@@ -7588,9 +7622,11 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
         }
         if (result.became_complete || (result.entry && result.entry->complete)) {
-            if (!ap->complete)
+            if (!ap->complete) {
                 MY_LOG_INFO(TAG, "Handshake captured for '%s' - valid same-exchange pair.",
                             ap->display_ssid);
+                ap->complete_at_us = esp_timer_get_time();
+            }
             ap->complete = true;
         }
     }
@@ -7647,7 +7683,7 @@ static void hs_capture_close(void) {
 }
 
 // ============================================================================
-// Serial PCAP/HCCAPX dump helpers (start_handshake_serial output)
+// Serial PCAPNG/HCCAPX dump helpers (start_handshake_serial output)
 // ============================================================================
 
 /**
@@ -7690,14 +7726,15 @@ static bool dump_base64_serial_locked(const char *begin_marker,
 /**
  * @brief Dump captured handshake data as base64 over serial.
  *
- * Outputs PCAP and HCCAPX buffers with markers that the Python app
+ * Outputs PCAPNG and HCCAPX buffers with markers that the Python app
  * (loot_manager.py) can parse. Also prints SSID/AP metadata.
  *
  * Expected format parsed by Python side:
- *   --- PCAP BEGIN ---
+ *   CAPTURE_FORMAT: PCAPNG
+ *   --- PCAPNG BEGIN ---
  *   <base64 lines>
- *   --- PCAP END ---
- *   PCAP_SIZE: <N>
+ *   --- PCAPNG END ---
+ *   PCAPNG_SIZE: <N>
  *   --- HCCAPX BEGIN ---
  *   <base64 lines>
  *   --- HCCAPX END ---
@@ -7705,9 +7742,9 @@ static bool dump_base64_serial_locked(const char *begin_marker,
  */
 static bool hs_dump_ap_serial(int ap_idx) {
     hsx_entry_t *entry = NULL;
-    size_t pcap_size = 0;
+    size_t pcapng_size = 0;
     hs_artifact_kind_t kind = hs_build_ap_artifact(ap_idx, true, &entry,
-                                                   &pcap_size);
+                                                   &pcapng_size);
     if (kind == HS_ARTIFACT_NONE) return false;
     hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
     char ssid_safe[33];
@@ -7719,9 +7756,10 @@ static bool hs_dump_ap_serial(int ap_idx) {
      * this/unknown lines while idle; metadata remains the sole commit line. */
     if (!serial_output_begin(1000)) return false;
     bool ok = hs_serial_printf_locked("CAPTURE_KIND: %s\n", label) &&
-        dump_base64_serial_locked("--- PCAP BEGIN ---", "--- PCAP END ---",
-                                  hs_artifact_buffer, pcap_size) &&
-        hs_serial_printf_locked("PCAP_SIZE: %u\n", (unsigned)pcap_size);
+        hs_serial_printf_locked("CAPTURE_FORMAT: PCAPNG\n") &&
+        dump_base64_serial_locked("--- PCAPNG BEGIN ---", "--- PCAPNG END ---",
+                                  hs_artifact_buffer, pcapng_size) &&
+        hs_serial_printf_locked("PCAPNG_SIZE: %u\n", (unsigned)pcapng_size);
     if (ok && kind == HS_ARTIFACT_VALID)
         ok = entry && dump_base64_serial_locked("--- HCCAPX BEGIN ---",
                                                 "--- HCCAPX END ---",
@@ -8150,7 +8188,13 @@ static void handshake_attack_task_sniffer(void) {
                                 total_handshakes_captured, ap->display_ssid,
                                 hs_ap_count, hs_client_count);
                 }
-                if (!handshake_serial_mode && hs_save_handshake_to_sd(i)) {
+                bool full_exchange = ap->captured_m1 && ap->captured_m2 &&
+                                     ap->captured_m3 && ap->captured_m4;
+                bool grace_elapsed = ap->complete_at_us > 0 &&
+                                     now - ap->complete_at_us >= 2000000;
+                if (!handshake_serial_mode &&
+                    (full_exchange || grace_elapsed) &&
+                    hs_save_handshake_to_sd(i)) {
                     ap->has_existing_file = true;
                     hsx_remove_ap(hs_exchange_state, ap->bssid);
                     MY_LOG_INFO(TAG, "Handshake #%d captured and saved.",
@@ -8361,7 +8405,7 @@ static int cmd_start_handshake(int argc, char **argv) {
     BaseType_t result = xTaskCreate(
         handshake_attack_task,
         "handshake_attack",
-        12288, // Stack size (larger for sniffer mode PCAP/HCCAPX operations)
+        12288, // Stack size (larger for sniffer mode PCAPNG/HCCAPX operations)
         NULL,
         5,     // Priority
         &handshake_attack_task_handle
@@ -8377,7 +8421,7 @@ static int cmd_start_handshake(int argc, char **argv) {
 }
 
 static int cmd_save_handshake(int argc, char **argv) {
-    oled_display_update_full("> Save Capture", "  Writing PCAP", "  /lab/handshakes", "  SD Card...");
+    oled_display_update_full("> Save Capture", "  Writing PCAPNG", "  /lab/handshakes", "  SD Card...");
     // Avoid compiler warnings
     (void)argc; (void)argv;
     
@@ -8395,7 +8439,7 @@ static int cmd_save_handshake(int argc, char **argv) {
 }
 
 // ============================================================================
-// start_handshake_serial — handshake capture with serial PCAP output (no SD)
+// start_handshake_serial — handshake capture with serial PCAPNG output (no SD)
 // ============================================================================
 
 static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope) {
@@ -8433,17 +8477,17 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
 
     // Force sniffer + D-UCB mode (attack all visible networks, no selection needed)
     handshake_selected_mode = false;
-    // Enable serial output mode — cleanup will dump PCAP/HCCAPX as base64
+    // Enable serial output mode — cleanup dumps PCAPNG/HCCAPX as base64.
     handshake_serial_mode = serial_storage;
 
-    MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - %s", serial_storage ? "Serial PCAP Mode" : "SD Mode");
+    MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - %s", serial_storage ? "Serial PCAPNG Mode" : "SD Mode");
     MY_LOG_INFO(TAG, "Scope: %s (%u listed)",
                 !handshake_scope.count ? "all visible networks" :
                 handshake_scope.exclude ? "all except whitelisted BSSIDs" : "selected BSSIDs",
                 handshake_scope.count);
-    MY_LOG_INFO(TAG, "Files: %s",serial_storage ? "serial PCAP/HCCAPX (no SD)" : "ESP32 SD /lab/handshakes/");
+    MY_LOG_INFO(TAG, "Files: %s",serial_storage ? "serial PCAPNG/HCCAPX (no SD)" : "ESP32 SD /lab/handshakes/");
     MY_LOG_INFO(TAG, "Will run until 'stop' command");
-    MY_LOG_INFO(TAG, "Python app will parse and save .pcap/.hccapx files automatically");
+    MY_LOG_INFO(TAG, "Python app will parse and save .pcapng/.hccapx files automatically");
 
     // Start handshake attack task
     handshake_attack_active = true;
@@ -9624,12 +9668,12 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len) {
 }
 
 /**
- * @brief Upload a single .pcap file to wpa-sec.stanev.org
+ * @brief Upload a single .pcapng file to wpa-sec.stanev.org
  *
  * Uses esp_tls directly (not esp_http_client) for full control over
  * TLS settings, specifically to skip server certificate verification.
  *
- * @param filepath  Full path to .pcap file on SD card
+ * @param filepath  Full path to .pcapng file on SD card
  * @param filename  Just the filename (for the Content-Disposition header)
  * @return 0 on success, 1 on duplicate ("already submitted"), -1 on error
  */
@@ -9777,7 +9821,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
 
 static int cmd_wpasec_upload(int argc, char **argv) {
     (void)argc; (void)argv;
-    oled_display_update_full("> WPA-sec", "  Sending PCAPs", "  wpa-sec.stanev", "  Uploading...");
+    oled_display_update_full("> WPA-sec", "  Sending PCAPNG", "  wpa-sec.stanev", "  Uploading...");
 
     // 1. Check WiFi STA is connected
     wifi_ap_record_t ap_info;
@@ -9806,19 +9850,19 @@ static int cmd_wpasec_upload(int argc, char **argv) {
         return 1;
     }
 
-    // Count .pcap files first
+    // Count PCAPNG captures first.
     struct dirent *entry;
     int total_files = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) continue;
         size_t nlen = strlen(entry->d_name);
-        if (nlen > 5 && strcasecmp(entry->d_name + nlen - 5, ".pcap") == 0) {
+        if (nlen > 7 && strcasecmp(entry->d_name + nlen - 7, ".pcapng") == 0) {
             total_files++;
         }
     }
 
     if (total_files == 0) {
-        MY_LOG_INFO(TAG, "No .pcap files found in /sdcard/lab/handshakes/");
+        MY_LOG_INFO(TAG, "No .pcapng files found in /sdcard/lab/handshakes/");
         closedir(dir);
         return 0;
     }
@@ -9835,7 +9879,7 @@ static int cmd_wpasec_upload(int argc, char **argv) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) continue;
         size_t nlen = strlen(entry->d_name);
-        if (nlen <= 5 || strcasecmp(entry->d_name + nlen - 5, ".pcap") != 0) continue;
+        if (nlen <= 7 || strcasecmp(entry->d_name + nlen - 7, ".pcapng") != 0) continue;
 
         current++;
         char filepath[280];
@@ -11905,7 +11949,7 @@ static int stop_operations(bool reset_wifi) {
     // Stop AP locator if running
     ap_locator_stop();
 
-    // Stop PCAP capture if running
+    // Stop PCAPNG capture if running
     if (pcap_capture_active) {
         pcap_capture_active = false;
 
@@ -11960,7 +12004,7 @@ static int stop_operations(bool reset_wifi) {
             sd_sync();
         }
 
-        MY_LOG_INFO(TAG, "PCAP saved: %s (%lu frames, %lu drops)",
+        MY_LOG_INFO(TAG, "PCAPNG saved: %s (%lu frames, %lu drops)",
                     pcap_capture_filepath,
                     (unsigned long)pcap_capture_frame_count,
                     (unsigned long)pcap_capture_drop_count);
@@ -15369,6 +15413,18 @@ static int cmd_start_sniffer(int argc, char **argv) {
     return 0;
 }
 
+static void pcapng_put_le16(uint8_t *dest, uint16_t value) {
+    dest[0] = (uint8_t)value;
+    dest[1] = (uint8_t)(value >> 8);
+}
+
+static void pcapng_put_le32(uint8_t *dest, uint32_t value) {
+    dest[0] = (uint8_t)value;
+    dest[1] = (uint8_t)(value >> 8);
+    dest[2] = (uint8_t)(value >> 16);
+    dest[3] = (uint8_t)(value >> 24);
+}
+
 static int cmd_start_pcap(int argc, char **argv) {
     pcap_capture_mode_t mode = PCAP_MODE_RADIO;
 
@@ -15384,7 +15440,7 @@ static int cmd_start_pcap(int argc, char **argv) {
     }
 
     if (pcap_capture_active) {
-        MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        MY_LOG_INFO(TAG, "PCAPNG capture already active. Use 'stop' first.");
         return 1;
     }
 
@@ -15422,7 +15478,7 @@ static int cmd_start_pcap(int argc, char **argv) {
 
     int file_num = find_next_pcap_file_number();
     snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
-             "/sdcard/lab/pcaps/sniff_%d.pcap", file_num);
+             "/sdcard/lab/pcaps/sniff_%d.pcapng", file_num);
 
     pcap_capture_file = fopen(pcap_capture_filepath, "wb");
     if (!pcap_capture_file) {
@@ -15430,17 +15486,29 @@ static int cmd_start_pcap(int argc, char **argv) {
         return 1;
     }
 
-    uint32_t linktype = (mode == PCAP_MODE_RADIO) ? 105 : 1;
-    pcap_global_header_t ghdr = {
-        .magic_number = 0xa1b2c3d4,
-        .version_major = 2,
-        .version_minor = 4,
-        .thiszone = 0,
-        .sigfigs = 0,
-        .snaplen = 65535,
-        .network = linktype
-    };
-    fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    uint8_t pcapng_header[60] = {0};
+    pcapng_put_le32(pcapng_header, 0x0a0d0d0aU);
+    pcapng_put_le32(pcapng_header + 4, 28);
+    pcapng_put_le32(pcapng_header + 8, 0x1a2b3c4dU);
+    pcapng_put_le16(pcapng_header + 12, 1);
+    memset(pcapng_header + 16, 0xff, 8);
+    pcapng_put_le32(pcapng_header + 24, 28);
+    pcapng_put_le32(pcapng_header + 28, 1);
+    pcapng_put_le32(pcapng_header + 32, 32);
+    pcapng_put_le16(pcapng_header + 36, mode == PCAP_MODE_RADIO ? 127 : 1);
+    pcapng_put_le32(pcapng_header + 40, 65535);
+    pcapng_put_le16(pcapng_header + 44, 9); /* if_tsresol */
+    pcapng_put_le16(pcapng_header + 46, 1);
+    pcapng_header[48] = 6;           /* microseconds */
+    pcapng_put_le32(pcapng_header + 56, 32);
+    if (fwrite(pcapng_header, 1, sizeof(pcapng_header), pcap_capture_file) !=
+        sizeof(pcapng_header)) {
+        MY_LOG_INFO(TAG, "Failed to write PCAPNG header to %s", pcap_capture_filepath);
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        unlink(pcap_capture_filepath);
+        return 1;
+    }
     fflush(pcap_capture_file);
 
     pcap_capture_frame_count = 0;
@@ -15448,7 +15516,7 @@ static int cmd_start_pcap(int argc, char **argv) {
 
     pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
     if (!pcap_packet_queue) {
-        MY_LOG_INFO(TAG, "Failed to create PCAP packet queue");
+        MY_LOG_INFO(TAG, "Failed to create PCAPNG packet queue");
         fclose(pcap_capture_file);
         pcap_capture_file = NULL;
         return 1;
@@ -15469,8 +15537,8 @@ static int cmd_start_pcap(int argc, char **argv) {
         esp_wifi_set_promiscuous_rx_cb(pcap_radio_promiscuous_cb);
         esp_wifi_set_promiscuous(true);
 
-        oled_display_update_full("> PCAP Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
-        MY_LOG_INFO(TAG, "PCAP radio capture started -> %s", pcap_capture_filepath);
+        oled_display_update_full("> PCAPNG Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
+        MY_LOG_INFO(TAG, "PCAPNG radio capture started -> %s", pcap_capture_filepath);
     } else {
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (!sta_netif) {
@@ -15515,7 +15583,7 @@ static int cmd_start_pcap(int argc, char **argv) {
             }
         }
         if (!gw_found) {
-            MY_LOG_INFO(TAG, "PCAP net: Gateway not in ARP table, sending ARP request...");
+            MY_LOG_INFO(TAG, "PCAPNG net: Gateway not in ARP table, sending ARP request...");
             ip4_addr_t gw_ip = { .addr = pcap_arp_gateway_ip };
             etharp_request(lwip_nif, &gw_ip);
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -15533,16 +15601,16 @@ static int cmd_start_pcap(int argc, char **argv) {
             }
         }
         if (!gw_found) {
-            MY_LOG_INFO(TAG, "PCAP net: Could not find gateway MAC. Continuing without ARP spoof.");
+            MY_LOG_INFO(TAG, "PCAPNG net: Could not find gateway MAC. Continuing without ARP spoof.");
         } else {
-            MY_LOG_INFO(TAG, "PCAP net: Gateway %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X",
+            MY_LOG_INFO(TAG, "PCAPNG net: Gateway %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X",
                         ip4_addr1_val(ip_info.gw), ip4_addr2_val(ip_info.gw),
                         ip4_addr3_val(ip_info.gw), ip4_addr4_val(ip_info.gw),
                         pcap_arp_gateway_mac[0], pcap_arp_gateway_mac[1], pcap_arp_gateway_mac[2],
                         pcap_arp_gateway_mac[3], pcap_arp_gateway_mac[4], pcap_arp_gateway_mac[5]);
 
-            oled_display_update_full("> PCAP Net", "  ARP scanning...", "  Discovering hosts", "");
-            MY_LOG_INFO(TAG, "PCAP net: Scanning subnet for hosts...");
+            oled_display_update_full("> PCAPNG Net", "  ARP scanning...", "  Discovering hosts", "");
+            MY_LOG_INFO(TAG, "PCAPNG net: Scanning subnet for hosts...");
 
             uint32_t ip_h = ntohl(ip_info.ip.addr);
             uint32_t mask_h = ntohl(ip_info.netmask.addr);
@@ -15556,7 +15624,7 @@ static int cmd_start_pcap(int argc, char **argv) {
                 req_sent++;
                 if (req_sent % 10 == 0) vTaskDelay(pdMS_TO_TICKS(10));
             }
-            MY_LOG_INFO(TAG, "PCAP net: Sent %d ARP requests, waiting for responses...", req_sent);
+            MY_LOG_INFO(TAG, "PCAPNG net: Sent %d ARP requests, waiting for responses...", req_sent);
             vTaskDelay(pdMS_TO_TICKS(3000));
 
             pcap_arp_host_count = 0;
@@ -15573,12 +15641,12 @@ static int cmd_start_pcap(int argc, char **argv) {
                 }
             }
 
-            MY_LOG_INFO(TAG, "PCAP net: Found %d hosts to spoof", pcap_arp_host_count);
+            MY_LOG_INFO(TAG, "PCAPNG net: Found %d hosts to spoof", pcap_arp_host_count);
 
             if (pcap_arp_host_count > 0) {
                 pcap_arp_active = true;
                 xTaskCreate(pcap_arp_spoof_task, "pcap_arp", 4096, NULL, 5, &pcap_arp_task_handle);
-                MY_LOG_INFO(TAG, "PCAP net: ARP spoof MITM started (IP forwarding enabled)");
+                MY_LOG_INFO(TAG, "PCAPNG net: ARP spoof MITM started (IP forwarding enabled)");
             }
         }
         // --- End ARP spoof setup ---
@@ -15591,9 +15659,9 @@ static int cmd_start_pcap(int argc, char **argv) {
         {
             char oled_l3[32];
             snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
-            oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
+            oled_display_update_full("> PCAPNG Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
         }
-        MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
+        MY_LOG_INFO(TAG, "PCAPNG net capture started -> %s", pcap_capture_filepath);
     }
 
     MY_LOG_INFO(TAG, "Use 'stop' to stop capture and save file.");
@@ -17207,7 +17275,7 @@ static int cmd_file_delete(int argc, char **argv)
 {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: file_delete <path>");
-        MY_LOG_INFO(TAG, "Example: file_delete lab/handshakes/sample.pcap");
+        MY_LOG_INFO(TAG, "Example: file_delete lab/handshakes/sample.pcapng");
         return 1;
     }
 
@@ -21046,7 +21114,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t handshake_serial_cmd = {
         .command = "start_handshake_serial",
-        .help = "Captures WPA handshakes (sniffer mode) and dumps PCAP/HCCAPX as base64 via serial. No SD card needed.",
+        .help = "Captures WPA handshakes and dumps PCAPNG/HCCAPX via serial. No SD card needed.",
         .hint = NULL,
         .func = &cmd_start_handshake_serial,
         .argtable = NULL
@@ -21068,7 +21136,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wpasec_upload_cmd = {
         .command = "wpasec_upload",
-        .help = "Upload all .pcap handshakes from SD card to wpa-sec.stanev.org",
+        .help = "Upload all .pcapng handshakes from SD card to wpa-sec.stanev.org",
         .hint = NULL,
         .func = &cmd_wpasec_upload,
         .argtable = NULL
@@ -21422,7 +21490,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t pcap_cmd = {
         .command = "start_pcap",
-        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net",
+        .help = "Capture WiFi traffic to PCAPNG: start_pcap radio|net",
         .hint = "radio|net",
         .func = &cmd_start_pcap,
         .argtable = NULL
@@ -22790,16 +22858,19 @@ static void sniffer_channel_task(void *pvParameters) {
 }
 
 // ============================================================================
-// PCAP capture functions
+// PCAPNG capture functions
 // ============================================================================
 
-static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len,
+                               uint8_t channel, int8_t rssi) {
     if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
 
     pcap_queued_frame_t *frame = malloc(sizeof(pcap_queued_frame_t) + len);
     if (!frame) return;
 
     frame->len = len;
+    frame->channel = channel;
+    frame->rssi = rssi;
     frame->timestamp_us = esp_timer_get_time();
     memcpy(frame->data, data, len);
 
@@ -22813,8 +22884,9 @@ static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     if (!pcap_capture_active) return;
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     uint16_t len = pkt->rx_ctrl.sig_len;
-    if (len == 0) return;
-    pcap_enqueue_frame(pkt->payload, len);
+    if (len <= 4) return;
+    pcap_enqueue_frame(pkt->payload, len - 4U, pkt->rx_ctrl.channel,
+                       pkt->rx_ctrl.rssi);
 }
 
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
@@ -22822,7 +22894,7 @@ static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
         if (copied > 0) {
-            pcap_enqueue_frame(tmp, copied);
+            pcap_enqueue_frame(tmp, copied, 0, 0);
         }
     }
     return pcap_original_input(p, inp);
@@ -22833,10 +22905,47 @@ static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
         if (copied > 0) {
-            pcap_enqueue_frame(tmp, copied);
+            pcap_enqueue_frame(tmp, copied, 0, 0);
         }
     }
     return pcap_original_linkoutput(netif, p);
+}
+
+static bool pcapng_write_queued_frame(const pcap_queued_frame_t *frame) {
+    bool radio = pcap_capture_mode == PCAP_MODE_RADIO;
+    uint32_t packet_len = frame->len + (radio ? 15U : 0U);
+    uint32_t padded = (packet_len + 3U) & ~3U;
+    uint32_t block_len = 32U + padded;
+    uint8_t header[28] = {0};
+    uint64_t timestamp = (uint64_t)frame->timestamp_us;
+    pcapng_put_le32(header, 6);
+    pcapng_put_le32(header + 4, block_len);
+    pcapng_put_le32(header + 12, (uint32_t)(timestamp >> 32));
+    pcapng_put_le32(header + 16, (uint32_t)timestamp);
+    pcapng_put_le32(header + 20, packet_len);
+    pcapng_put_le32(header + 24, packet_len);
+    if (fwrite(header, 1, sizeof(header), pcap_capture_file) != sizeof(header))
+        return false;
+
+    if (radio) {
+        uint8_t radiotap[15] = {0};
+        pcapng_put_le16(radiotap + 2, sizeof(radiotap));
+        pcapng_put_le32(radiotap + 4, 0x2aU);
+        uint16_t frequency = frame->channel == 14 ? 2484 :
+            frame->channel <= 13 ? (uint16_t)(2407 + 5 * frame->channel) :
+            (uint16_t)(5000 + 5 * frame->channel);
+        pcapng_put_le16(radiotap + 10, frequency);
+        pcapng_put_le16(radiotap + 12, frame->channel <= 14 ? 0x00c0U : 0x0140U);
+        radiotap[14] = (uint8_t)frame->rssi;
+        if (fwrite(radiotap, 1, sizeof(radiotap), pcap_capture_file) !=
+            sizeof(radiotap)) return false;
+    }
+    if (fwrite(frame->data, 1, frame->len, pcap_capture_file) != frame->len)
+        return false;
+    uint8_t tail[7] = {0};
+    unsigned padding = padded - packet_len;
+    pcapng_put_le32(tail + padding, block_len);
+    return fwrite(tail, 1, padding + 4U, pcap_capture_file) == padding + 4U;
 }
 
 static void pcap_writer_task(void *param) {
@@ -22844,18 +22953,11 @@ static void pcap_writer_task(void *param) {
     uint32_t flush_counter = 0;
     pcap_queued_frame_t *frame = NULL;
 
-    MY_LOG_INFO(TAG, "PCAP writer task started");
+    MY_LOG_INFO(TAG, "PCAPNG writer task started");
 
     while (pcap_capture_active) {
         if (xQueueReceive(pcap_packet_queue, &frame, pdMS_TO_TICKS(200)) == pdTRUE) {
-            pcap_record_header_t rec = {
-                .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
-                .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
-                .incl_len = frame->len,
-                .orig_len = frame->len
-            };
-            fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-            fwrite(frame->data, 1, frame->len, pcap_capture_file);
+            if (!pcapng_write_queued_frame(frame)) pcap_capture_drop_count++;
             free(frame);
             pcap_capture_frame_count++;
             flush_counter++;
@@ -22867,14 +22969,7 @@ static void pcap_writer_task(void *param) {
     }
 
     while (xQueueReceive(pcap_packet_queue, &frame, 0) == pdTRUE) {
-        pcap_record_header_t rec = {
-            .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
-            .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
-            .incl_len = frame->len,
-            .orig_len = frame->len
-        };
-        fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-        fwrite(frame->data, 1, frame->len, pcap_capture_file);
+        if (!pcapng_write_queued_frame(frame)) pcap_capture_drop_count++;
         free(frame);
         pcap_capture_frame_count++;
     }
@@ -22884,7 +22979,7 @@ static void pcap_writer_task(void *param) {
     pcap_capture_file = NULL;
     sd_sync();
 
-    MY_LOG_INFO(TAG, "PCAP writer done: %s (%lu frames, %lu drops)",
+    MY_LOG_INFO(TAG, "PCAPNG writer done: %s (%lu frames, %lu drops)",
                 pcap_capture_filepath,
                 (unsigned long)pcap_capture_frame_count,
                 (unsigned long)pcap_capture_drop_count);
@@ -24261,7 +24356,7 @@ static int find_next_pcap_file_number(void) {
     int max_number = 0;
     char filename[64];
     for (int i = 1; i <= 9999; i++) {
-        snprintf(filename, sizeof(filename), "/sdcard/lab/pcaps/sniff_%d.pcap", i);
+        snprintf(filename, sizeof(filename), "/sdcard/lab/pcaps/sniff_%d.pcapng", i);
         struct stat file_stat;
         if (stat(filename, &file_stat) == 0) {
             max_number = i;

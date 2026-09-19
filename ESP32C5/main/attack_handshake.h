@@ -39,10 +39,10 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
 void attack_handshake_stop();
 
 /**
- * @brief Returns captured handshake data in PCAP format
+ * @brief Returns captured handshake data in PCAPNG format
  * 
  * @param size pointer to store the size of captured data
- * @return uint8_t* pointer to PCAP buffer or NULL if no data
+ * @return uint8_t* pointer to PCAPNG buffer or NULL if no data
  */
 uint8_t *attack_handshake_get_pcap(unsigned *size);
 
@@ -58,7 +58,7 @@ void *attack_handshake_get_hccapx();
  * 
  * Only saves if a complete 4-way handshake was captured.
  * Files are saved to /sdcard/lab/handshakes/ with format:
- * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcap|hccapx}
+ * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcapng|hccapx}
  * 
  * SSID is sanitized (alphanumeric, -, _, ., space allowed).
  * MAC suffix prevents filename collisions when different SSIDs sanitize to same name.
@@ -79,4 +79,3 @@ bool attack_handshake_save_to_sd();
 bool attack_handshake_is_complete();
 
 #endif
-

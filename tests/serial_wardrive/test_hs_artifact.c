@@ -25,7 +25,7 @@ static uint8_t artifact[96];
 static uint8_t *hs_artifact_buffer = artifact;
 static hsx_entry_t entry;
 static hs_artifact_kind_t next_kind;
-static size_t next_pcap_size;
+static size_t next_pcapng_size;
 
 static char wire[8192];
 static size_t wire_len;
@@ -35,11 +35,11 @@ static bool fail_begin;
 
 static hs_artifact_kind_t hs_build_ap_artifact(int ap_idx, bool allow_partial,
                                                 hsx_entry_t **exchange,
-                                                size_t *pcap_size) {
+                                                size_t *pcapng_size) {
     assert(ap_idx == 0 && allow_partial);
     *exchange = next_kind == HS_ARTIFACT_VALID ? &entry : NULL;
-    *pcap_size = next_pcap_size;
-    memset(artifact, 0x5a, next_pcap_size);
+    *pcapng_size = next_pcapng_size;
+    memset(artifact, 0x5a, next_pcapng_size);
     return next_kind;
 }
 
@@ -105,7 +105,7 @@ static void reset(hs_artifact_kind_t kind) {
     memset(&entry, 0, sizeof(entry));
     memset(&entry.hccapx, 0x33, sizeof(entry.hccapx));
     next_kind = kind;
-    next_pcap_size = 40;
+    next_pcapng_size = 80;
     wire_len = lock_depth = begin_calls = end_calls = write_calls = 0;
     fail_write_call = 0;
     fail_begin = false;
@@ -126,9 +126,12 @@ int main(void) {
     reset(HS_ARTIFACT_VALID);
     assert(hs_dump_ap_serial(0));
     assert(lock_depth == 0 && begin_calls == 1 && end_calls == 1);
-    assert_order("CAPTURE_KIND: VALID", "--- PCAP BEGIN ---");
-    assert_order("--- PCAP END ---", "PCAP_SIZE: 40");
-    assert_order("PCAP_SIZE: 40", "--- HCCAPX BEGIN ---");
+    assert_order("CAPTURE_KIND: VALID", "CAPTURE_FORMAT: PCAPNG");
+    assert_order("CAPTURE_FORMAT: PCAPNG", "--- PCAPNG BEGIN ---");
+    assert_order("--- PCAPNG END ---", "PCAPNG_SIZE: 80");
+    assert_order("PCAPNG_SIZE: 80", "--- HCCAPX BEGIN ---");
+    assert(!strstr(wire, "--- PCAP BEGIN ---"));
+    assert(!strstr(wire, "PCAP_SIZE:"));
     assert_order("--- HCCAPX END ---", "SSID: Evil__AP_X  AP: 02:11:22:33:44:55");
     assert(strstr(wire, "SSID: Evil__AP_X  AP: 02:11:22:33:44:55\n") +
            strlen("SSID: Evil__AP_X  AP: 02:11:22:33:44:55\n") == wire + wire_len);
