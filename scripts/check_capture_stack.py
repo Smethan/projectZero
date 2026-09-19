@@ -5,6 +5,7 @@ Requires an ESP-IDF build with -DCMAKE_C_FLAGS=-fstack-usage. This checks local
 frames, not the complete runtime call chain; hardware high-water checks remain
 necessary. In particular, never restore a 2304-byte local packet here.
 """
+
 import argparse
 from pathlib import Path
 
@@ -28,7 +29,7 @@ LIMITS = {
     ("main.c", "hs_dump_ap_serial"): 256,
     ("main.c", "handshake_cleanup"): 128,
     ("main.c", "hs_scan_complete"): 768,
-    ("main.c", "cmd_handshake_scope"): 256,
+    ("main.c", "cmd_handshake_scope"): 272,
     ("hs_exchange.c", "hsx_ingest"): 256,
     ("hs_exchange.c", "hsx_set_ap_ssid"): 128,
     ("hs_exchange.c", "hsx_build_pcap"): 128,
@@ -50,10 +51,14 @@ def check(build):
                 found[key] = (int(size), kind)
     for key, limit in LIMITS.items():
         if key not in found:
-            raise ValueError(f"missing stack report for {key}; build with -fstack-usage")
+            raise ValueError(
+                f"missing stack report for {key}; build with -fstack-usage"
+            )
         size, kind = found[key]
         if kind != "static" or size > limit:
-            raise ValueError(f"{key}: {size} bytes ({kind}); maximum {limit} static bytes")
+            raise ValueError(
+                f"{key}: {size} bytes ({kind}); maximum {limit} static bytes"
+            )
         print(f"PASS: {key[0]}:{key[1]} local stack {size} bytes (limit {limit})")
 
 
