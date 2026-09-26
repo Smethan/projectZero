@@ -87,7 +87,7 @@ token_copy = hs_complete.index("memcpy(token,hs_scan_snapshot.token")
 count_copy = hs_complete.index("snapshot_count=hs_scan_snapshot.count")
 ap_loop = hs_complete.index("for(unsigned i=0;i<snapshot_count;i++)")
 success_release = hs_complete.rindex("hs_scan_release_event_owner();")
-done_emit = hs_complete.rindex('hs_scan_event(token,"scan_done"')
+done_emit = hs_complete.rindex("hs_scan_done_event(&hs_scan_snapshot)")
 assert token_copy < count_copy < ap_loop < success_release < done_emit
 assert "hs_scan_snapshot.count" not in hs_complete[success_release:done_emit]
 assert hs_complete.count("hs_scan_release_event_owner();") == 4

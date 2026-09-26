@@ -223,6 +223,7 @@ turn derives from the original [C5Lab/projectZero](https://github.com/C5Lab/proj
 - LAB Discord: https://discord.gg/57wmJzzR8C
 
 ## Fork Changes
+- 2026-09-26 JanOS 1.7.13 - Packet Sniffer client/packet/probe intelligence in HS Capture and Evil Twin, with acknowledged/redacted Evil Twin lifecycle
 - 2026-09-19 JanOS 1.7.12 - PCAPNG-only handshake and packet captures with radiotap channel/RSSI metadata
 - 2026-03-09 JanOS 1.5.5 - Handshake capture via serial (no SD card required), PCAP/HCCAPX streamed as base64 to host
 - 2026-03-09 JanOS 1.5.5 - Custom captive portal upload via serial (`set_html` chunked protocol, 1 MB PSRAM buffer)

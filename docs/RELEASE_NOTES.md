@@ -1,5 +1,32 @@
 # Smethan fork firmware
 
+## 1.7.13 — Packet Sniffer intelligence and acknowledged Evil Twin lifecycle
+
+- Add fresh per-session Packet Sniffer counters for total packets, BSSID-keyed
+  client links and packets, and unique requester/SSID probe pairs. Remove the
+  traffic-volume-triggered channel hop so the existing timer is the sole dwell
+  owner. `start_sniffer_all` explicitly clears stale selected-network scope.
+- Add `show_sniffer_intel TOKEN`, a bounded `SNIFF:` JSON transaction with
+  summary, AP, probe and terminal records. Preserve the completed sample after
+  stop and advertise `sniffer_intel_v1`, `sniffer_scope_v1` and
+  `target_intel_v1`.
+- Extend `hs_scan` AP rows with `clients`, `packets` and `probes`, and its final
+  record with sample availability, total packets, total probes and age. Metrics
+  are copied from the latest completed sniffer window; the scan token and
+  existing all-or-nothing publication rules still apply.
+- Add `clear_html` so a host can explicitly restore the built-in portal after a
+  custom upload. Emit Evil Twin success only after its deauthentication task is
+  running, clean up portal/credential state on every startup failure, and pin
+  credential verification to the selected target BSSID.
+- Remove submitted passwords and raw form bodies from serial logs, securely
+  clear candidate credentials after failure/stop/save, and retain verified SD
+  storage under the existing on-device policy.
+
+Native harnesses cover the structured metrics, token/count bounds, HST
+publication, timer-owned hopping, portal reset, BSSID-pinned verification,
+redacted logs and startup cleanup. RF client attribution, dual-band dwell,
+portal association and credential verification remain physically unvalidated.
+
 ## 1.7.12 — PCAPNG capture context and WPA-Sec packaging
 
 - Emit new active handshake artifacts as PCAPNG only. Serial storage announces

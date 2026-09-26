@@ -67,7 +67,11 @@ Every machine line begins `WDG:` and contains compact JSON. Firmware emits a lea
 
 ## Records
 
-Capabilities: `v:1`, `kind:"capabilities"`, `wardrive_serial_v1:true`, `bands:["wifi24","wifi5","ble"]`, `wifi_mgmt:true`, `ble_raw_ad:true`, `ble_extended:false`, `max_line:1024`.
+Capabilities include `v:1`, `kind:"capabilities"`,
+`wardrive_serial_v1:true`, `sniffer_intel_v1:true`,
+`sniffer_scope_v1:true`, `target_intel_v1:true`,
+`bands:["wifi24","wifi5","ble"]`, `wifi_mgmt:true`,
+`ble_raw_ad:true`, `ble_extended:false`, and `max_line:1024`.
 
 All session records carry `v:1`, `kind`, `session`, and strictly increasing `seq`. Sequence gaps can reflect rejected/dropped transmissions. The host rejects stale sessions, duplicate sequences, unsupported versions and malformed records.
 
@@ -145,6 +149,41 @@ one in-progress frame, counts remaining drops, frees the queue and emits stopped
 WDG writes PCAPNG and identifies visible PMKIDs on the uConsole; receiving EAPOL
 does not by itself establish handshake completeness.
 
+## Packet Sniffer intelligence extension (firmware 1.7.13)
+
+`start_sniffer_all` clears any earlier `select_networks` state, performs the
+normal AP scan and starts an all-network Packet Sniffer observation window.
+Each new sniffer start resets packet, client and probe metrics. The AP catalog
+may be retained for identity matching, but an older window's measurements are
+never carried into the new window. Channel dwell is controlled only by the
+timer-owned hopping task; packet volume does not trigger extra hops.
+
+After `stop` has emitted the final `All operations stopped.` acknowledgement,
+`show_sniffer_intel TOKEN` exports the preserved window. `TOKEN` must match
+`[A-Za-z0-9_-]{1,32}`. Each record begins `SNIFF:` and contains compact JSON
+version 1 with the same `session` token:
+
+| Kind | Fields |
+| --- | --- |
+| `summary` | `available`, total `packets`, `aps`, `probes`, `age_ms` |
+| `ap` | contiguous `seq`, `bssid`, `ssid_hex`, `channel`, `clients`, `packets`, `probes` |
+| `probe` | contiguous `seq`, station `mac`, `ssid_hex`, `rssi` |
+| `done` | `aps`, `probes` |
+
+The host commits the result only after one summary, every AP in order, every
+probe in order and a terminal count matching both collections. The firmware
+bounds the export to 100 APs, 50 client links per AP, 200 unique probe records,
+32 SSID bytes and 384 bytes per AP/probe line. `available:false` means no valid
+sniffer session exists; it is not a measured empty session.
+
+AP packet counts include beacon, qualifying management and data frames that can
+be attributed to that BSSID. Total packets include every frame reaching the
+sniffer callback. Probe requests do not contain a destination BSSID. Therefore
+an AP row's `probes` value is the number of unique station/SSID records matching
+that row's exact SSID, not BSSID-addressed evidence. Duplicate BSSIDs remain
+separate for clients and packets; duplicate SSIDs legitimately share this probe
+count.
+
 ## Active HS target-selection extension
 
 Firmware 1.7.9 advertises `hs_capture_targets_v1: true`. This extension adds an
@@ -161,8 +200,8 @@ draining. Machine records use a separate `HST:` prefix and JSON version 1:
 | Kind | Fields |
 | --- | --- |
 | `scan_started` | `scan`, `count`, `error` |
-| `ap` | `scan`, `seq`, `bssid`, `ssid_hex`, `channel`, `rssi`, `auth` |
-| `scan_done` | `scan`, `count`, `error` |
+| `ap` | `scan`, `seq`, `bssid`, `ssid_hex`, `channel`, `rssi`, `auth`, plus optional `clients`, `packets`, `probes` |
+| `scan_done` | `scan`, `count`, `error`, plus optional `intel`, total `packets`, total `probes`, `intel_age_ms` |
 | `scan_error` | `scan`, `count`, `error` |
 
 `ssid_hex` is zero to 32 binary-safe bytes; `auth` is the ESP-IDF numeric Wi-Fi
@@ -170,6 +209,13 @@ authentication value. AP sequence numbers start at 1 and must be contiguous.
 The terminal `scan_done.count` must equal the number of AP rows. A host accepts
 the snapshot only after the matching token has one `scan_started`, every row in
 order and `scan_done`.
+
+Firmware 1.7.13 advertises `target_intel_v1:true` and fills the optional fields
+from the latest Packet Sniffer window. `clients` and per-row `packets` are
+BSSID-keyed. Per-row `probes` has the exact-SSID meaning documented above.
+`intel:false` means the row metrics are unavailable, not measured zeros. Older
+firmware omits these fields and remains compatible with the original target
+selection protocol.
 
 The firmware retrieves the driver's AP list once per scan event and emits at
 most 64 APs. It suppresses the ordinary CSV copy for this scan. Each serial

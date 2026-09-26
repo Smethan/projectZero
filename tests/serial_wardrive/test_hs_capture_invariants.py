@@ -164,7 +164,7 @@ assert "hs_artifact_buffer = heap_caps_malloc(HSX_ARTIFACT_MAX, MALLOC_CAP_SPIRA
 copy_token = scan_complete.index("memcpy(token,hs_scan_snapshot.token")
 copy_count = scan_complete.index("snapshot_count=hs_scan_snapshot.count")
 release = scan_complete.rindex("hs_scan_release_event_owner()")
-done = scan_complete.rindex('hs_scan_event(token,"scan_done"')
+done = scan_complete.rindex("hs_scan_done_event(&hs_scan_snapshot)")
 assert copy_token < copy_count < release < done
 assert "hs_scan_snapshot.count" not in scan_complete[release:done]
 

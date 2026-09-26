@@ -30,8 +30,18 @@ typedef struct {
 typedef struct {
     char token[33];
     uint16_t count;
+    bool intel_available;
+    uint32_t intel_packets;
+    uint16_t intel_probes;
+    uint32_t intel_age_ms;
     wifi_ap_record_t records[TEST_AP_LIMIT];
 } hs_scan_snapshot_t;
+
+typedef struct {
+    uint8_t bssid[6];
+    int client_count;
+    uint32_t packet_count;
+} sniffer_ap_t;
 
 static uint16_t g_scan_count;
 static wifi_ap_record_t g_scan_results[TEST_AP_LIMIT];
@@ -39,6 +49,8 @@ static bool hs_scan_pending;
 static bool hs_scan_ready;
 static char hs_scan_token[33];
 static hs_scan_snapshot_t hs_scan_snapshot;
+static sniffer_ap_t sniffer_aps[TEST_AP_LIMIT];
+static int sniffer_ap_count;
 static atomic_bool hs_scan_output_active;
 static atomic_bool hs_scan_start_authorized;
 static atomic_bool handshake_cleanup_active;
@@ -47,6 +59,8 @@ static bool g_scan_in_progress;
 static bool g_scan_cancel_pending;
 static bool g_scan_teardown_in_progress;
 static bool operation_stop_requested;
+static bool sniffer_active;
+static bool sniffer_scan_phase;
 static bool handshake_attack_active;
 static void *handshake_attack_task_handle;
 
@@ -70,6 +84,17 @@ static unsigned scan_command_calls;
 static int scan_command_result;
 
 static int64_t esp_timer_get_time(void) { return now_us; }
+
+static int sniffer_find_ap(const uint8_t *bssid) {
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        if (!memcmp(sniffer_aps[i].bssid, bssid, 6)) return i;
+    }
+    return -1;
+}
+
+static unsigned sniffer_probe_count_for_ssid(const uint8_t *ssid) {
+    return !strcmp((const char *)ssid, "network-00") ? 2U : 0U;
+}
 
 static bool serial_output(const char *data, unsigned len, unsigned timeout_ms) {
     (void)timeout_ms;
@@ -134,11 +159,18 @@ static void reset_state(void) {
     hs_scan_ready = false;
     snprintf(hs_scan_token, sizeof(hs_scan_token), "active-token");
     memset(&hs_scan_snapshot, 0, sizeof(hs_scan_snapshot));
+    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    sniffer_ap_count = 1;
+    memcpy(sniffer_aps[0].bssid, g_scan_results[0].bssid, 6);
+    sniffer_aps[0].client_count = 3;
+    sniffer_aps[0].packet_count = 421;
     hs_scan_completed_us = 0;
     g_scan_in_progress = false;
     g_scan_cancel_pending = false;
     g_scan_teardown_in_progress = false;
     operation_stop_requested = false;
+    sniffer_active = false;
+    sniffer_scan_phase = false;
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
     atomic_store(&hs_scan_output_active, false);
@@ -168,6 +200,10 @@ static void begin_completion(const char *token) {
     snprintf(hs_scan_token, sizeof(hs_scan_token), "%s", token);
     snprintf(hs_scan_snapshot.token, sizeof(hs_scan_snapshot.token), "%s", token);
     hs_scan_snapshot.count = g_scan_count;
+    hs_scan_snapshot.intel_available = true;
+    hs_scan_snapshot.intel_packets = 913;
+    hs_scan_snapshot.intel_probes = 7;
+    hs_scan_snapshot.intel_age_ms = 1500;
     memcpy(hs_scan_snapshot.records, g_scan_results,
            g_scan_count * sizeof(g_scan_results[0]));
     hs_scan_pending = true;
@@ -189,6 +225,8 @@ static void test_success_and_publication_order(void) {
     assert(ap_saw_output_owner && ap_saw_in_progress);
     assert(strstr(output, "\"kind\":\"ap\""));
     assert(strstr(output, "\"kind\":\"scan_done\""));
+    assert(strstr(output, "\"clients\":3,\"packets\":421,\"probes\":2"));
+    assert(strstr(output, "\"intel\":true,\"packets\":913,\"probes\":7"));
 
     /* The completion routine snapshots its token. A concurrent command-side
      * mutation cannot relabel later AP rows or the terminal record. */
@@ -312,6 +350,12 @@ static void test_command_lifecycle(void) {
     assert_busy_preserves_token();
     reset_state();
     g_scan_cancel_pending = true;
+    assert_busy_preserves_token();
+    reset_state();
+    sniffer_active = true;
+    assert_busy_preserves_token();
+    reset_state();
+    sniffer_scan_phase = true;
     assert_busy_preserves_token();
     reset_state();
     atomic_store(&hs_scan_output_active, true);

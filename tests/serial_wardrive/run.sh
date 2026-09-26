@@ -19,3 +19,4 @@ cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -Wno-deprecated-decla
 python3 test_usb_buffer_patch.py
 python3 test_scan_cancel_barrier.py
 python3 test_hs_capture_invariants.py
+python3 test_sniffer_evil_twin_invariants.py

