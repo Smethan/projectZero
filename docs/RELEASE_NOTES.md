@@ -1,5 +1,22 @@
 # Smethan fork firmware
 
+## 1.7.14 — Live OUI notification hints alongside wardrive batches
+
+- Advertise `wardrive_live_oui_v1` and accept a validated optional
+  `live_oui=HHHHHH,...` filter on both v2 wardrive start commands. WDG supplies
+  the prefixes; firmware has no Flock/Axon labels or signature policy.
+- Emit bounded `live_oui` records from the worker during collection, after the
+  full observation has entered the normal ten-second batch. Match eligible
+  Wi-Fi transmitters/BSSIDs and public BLE addresses only, never receivers or
+  random/private BLE addresses. Callbacks remain queue-only.
+- Attempt at most 32 distinct hints per batch, with no retry or evidence loss
+  when serial output fails. Preserve existing batch records, standalone scan
+  behavior and old-host/old-firmware compatibility through negotiation.
+- Add native coverage for filter validation, callback isolation, eligibility,
+  deduplication, bounds, failed delivery, cleanup and early worker ordering.
+  Extend local stack-frame checks to the batch/hint path. Synthetic timing and
+  build checks do not constitute physical RF/USB latency validation.
+
 ## 1.7.13 — Packet Sniffer intelligence and acknowledged Evil Twin lifecycle
 
 - Add fresh per-session Packet Sniffer counters for total packets, BSSID-keyed

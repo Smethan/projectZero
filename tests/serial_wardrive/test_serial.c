@@ -2,11 +2,18 @@
 #include "../../ESP32C5/main/serial_wardrive.c"
 bool uota_busy(void){return false;}
 static bool radio_ok=true, prepare_ok=true;
-static int stopped_radios, hops;
-bool sw_prepare(void){return prepare_ok;}
+static int stopped_radios, hops, prepare_calls;
+static bool inject_live;
+bool sw_prepare(void){prepare_calls++;return prepare_ok;}
 bool sw_radio_start(void){return radio_ok;}
 void sw_radio_stop(void){stopped_radios++;}
-void sw_radio_hop(unsigned i){hops++;}
+void sw_radio_hop(unsigned i){
+    hops++;
+    if(inject_live && atomic_load(&collecting)) {
+        uint8_t addr[]={1,0,0,0x52,0x1e,0xb4},ad[]={4,9,'a','b','c'};
+        sw_ble(addr,0,-62,0,ad,sizeof(ad));inject_live=false;
+    }
+}
 static void fresh(void){
     atomic_store(&active,false);atomic_store(&collecting,false);
     test_clock=1000;output_capture[0]=0;transport_limit=1024;radio_ok=true;
@@ -136,5 +143,64 @@ int main(void){
     assert(strstr(output_capture,"\"kind\":\"batch_done\"") && strstr(output_capture,"\"state\":\"stopped\""));
     assert(!machine_mode && !heap_live);
     capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_batch_serial_v2\":true"));
+    assert(strstr(output_capture,"\"wardrive_live_oui_v1\":true") && strstr(output_capture,"\"live_oui_max\":8"));
+
+    /* Validate the optional bounded filter before preparing or touching radio state. */
+    const char *invalid[]={"live_oui=", "live_oui=B41E5", "live_oui=B41E5Z", "live_oui=B41E52,",
+        "live_oui=B41E52,B41e52", "wrong=B41E52", "live_oui=B41E5200",
+        "live_oui=000001,000002,000003,000004,000005,000006,000007,000008,000009"};
+    int prepares_before=prepare_calls;
+    for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        char *args[]={"start_wardrive_batch_serial","live",(char *)invalid[i]};
+        assert(start(3,args)==1 && !sw_active() && !heap_live);
+    }
+    char *wrong_mode[]={"start_wardrive_serial","live","live_oui=B41E52"};
+    assert(start(3,wrong_mode)==1 && prepare_calls==prepares_before);
+    char *live_args[]={"start_wardrive_batch_serial","live","live_oui=b41e52,0025DF"};
+    test_clock=1000;output_capture[0]=0;assert(start(3,live_args)==0 && live_oui_count==2);
+    atomic_store(&collecting,true);
+    unsigned allocations=heap_live;
+    beacon(8,45);assert(!output_capture[0] && heap_live==allocations); /* callback only queues */
+    assert(xQueueReceive(queue,&o,0));batch_observe(&o,1);
+    assert(strstr(output_capture,"\"kind\":\"live_oui\"") && !strstr(output_capture,"ssid_hex"));
+    assert(!strstr(output_capture,"\"kind\":\"wifi\""));
+    assert(live_identity_count==1);
+    output_capture[0]=0;batch_observe(&o,1);assert(!output_capture[0] && live_identity_count==1);
+    observation candidate={.kind=2,.addr_type=0,.rssi=-62,.at=1000};
+    uint8_t axon[]={0,0x25,0xdf,0,0,1};memcpy(candidate.addr,axon,6);
+    candidate.addr_type=1;batch_observe(&candidate,1);assert(!output_capture[0]);
+    candidate.addr_type=2;batch_observe(&candidate,1);assert(!output_capture[0]);
+    candidate.addr_type=0;batch_observe(&candidate,1);assert(strstr(output_capture,"00:25:DF:00:00:01"));
+    output_capture[0]=0;
+    candidate.kind=1;candidate.addr[0]=2;batch_observe(&candidate,1);assert(!output_capture[0]);
+    /* Receiver-only OUI never alerts. A distinct eligible beacon BSSID does. */
+    candidate.event=4;memcpy(candidate.rx,axon,6);batch_observe(&candidate,1);assert(!output_capture[0]);
+    candidate.event=8;memcpy(candidate.bssid,axon,6);batch_observe(&candidate,1);
+    assert(strstr(output_capture,"\"radio\":\"wifi\"") && strstr(output_capture,"00:25:DF:00:00:01"));
+    output_capture[0]=0;candidate.kind=2;candidate.event=0;candidate.addr_type=0;memcpy(candidate.addr,axon,6);
+    candidate.addr[5]=2;candidate.at=-1001;batch_observe(&candidate,1);assert(!output_capture[0]);
+    /* A failed hint is still saved and can be emitted with all evidence later. */
+    candidate.at=test_clock;transport_limit=0;old=atomic_load(&drops);
+    batch_observe(&candidate,1);assert(atomic_load(&drops)==old+1);
+    bool retained=false;
+    for(unsigned i=0;i<batch_capacity;i++) if(batch_slots[i].used && observation_equal(&batch_slots[i].value,&candidate)) retained=true;
+    assert(retained);transport_limit=1024;emit_version(&candidate,2,1);
+    assert(strstr(output_capture,"\"kind\":\"ble\""));
+    output_capture[0]=0;
+    for(unsigned i=3;i<80;i++) {candidate.addr[5]=i;batch_observe(&candidate,1);}
+    assert(live_identity_count==LIVE_OUI_IDENTITIES && heap_live==allocations);
+    output_capture[0]=0;candidate.addr[5]=90;batch_observe(&candidate,1);assert(!output_capture[0]);
+    atomic_store(&stopping,true);test_task(NULL);
+    assert(!heap_live && !live_oui_count && !live_identity_count);
+    assert(start(2,batch_args)==0 && !live_oui_count);atomic_store(&stopping,true);test_task(NULL);
+    /* End-to-end worker ordering and fake-clock latency: a hint is emitted
+       within 10ms while collection continues; complete evidence waits 10s. */
+    test_clock=1000;output_capture[0]=0;inject_live=true;
+    assert(start(3,live_args)==0);test_task(NULL);
+    const char *hint=strstr(output_capture,"\"kind\":\"live_oui\"");
+    const char *results=strstr(output_capture,"\"kind\":\"batch_results\"");
+    const char *full=strstr(output_capture,"\"kind\":\"ble\"");
+    assert(hint && results && full && hint<results && results<full);
+    assert(strstr(hint,"\"age_ms\":10") && !heap_live && !machine_mode);
     puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, v2 batching and mode transitions");
 }

@@ -54,6 +54,59 @@ unstable performance. Batching reduces serial and host-processing pressure; it
 does not change that RF coexistence classification. The Wi-Fi-only v2 command
 used by All Wardrive (host BLE) avoids ESP-side BLE coexistence.
 
+## Optional live OUI hints with v2 batches (firmware 1.7.14)
+
+`wardrive_live_oui_v1:true` and `live_oui_max:8` advertise an optional
+notification-only side channel. Both batch start commands accept a third
+argument, for example:
+
+```text
+start_wardrive_batch_serial TOKEN live_oui=0025DF,B41E52
+start_wardrive_wifi_batch_serial TOKEN live_oui=0025DF,B41E52
+```
+
+The filter contains 1-8 unique three-byte prefixes, each written as exactly six
+case-insensitive hex digits separated by commas. Empty, duplicate, malformed
+or oversized lists are rejected before preparing the radios. Omitting the
+argument preserves the ordinary batch-only behavior; v1 commands do not accept
+it. New hosts must negotiate the capability before sending it to older firmware.
+
+While collecting, the worker saves the full observation in the batch and then
+compares eligible addresses against the host-supplied prefixes. It never parses
+vendor names or decides that an address is a camera. It checks Wi-Fi transmitters
+and distinct beacon/probe-response BSSIDs, never receivers; BLE OUI hints require
+public address type 0. Multicast and locally administered addresses are excluded.
+The callbacks remain queue-only, with no allocation or serial I/O added.
+
+Matching observations can produce a compact record before `batch_results`:
+
+```json
+{"v":2,"kind":"live_oui","session":"TOKEN","seq":3,"batch":1,"capture_ms":1000,"age_ms":10,"radio":"ble","mac":"00:25:DF:00:00:01","rssi":-62,"addr_type":0}
+```
+
+`radio` is `wifi` or `ble`; BLE requires `addr_type`. The record carries the
+normal session/sequence/batch identifiers, a full MAC, RSSI, capture uptime and
+age of at most 2000 ms, but no SSID or advertising payload. There is no control
+`state` field. At most 32 unique radio/address-type/MAC hints are attempted per
+batch, once per identity, using fixed worker-owned storage. The limit resets at
+the next collection window. Each attempt uses the ordinary 100 ms best-effort
+deadline, without retries. Failure increments `drops` but does not remove or
+alter saved evidence; complete records still arrive in the normal batch.
+
+WDG classifies the OUI on the host and applies category toggles, rule/device
+mutes and whitelist policy. Hints only enqueue provisional popups: no ordinary
+inventory, XP, WiGLE row, persisted notable evidence, trail observation or map
+marker is created. Raw serial logging still records the transport message.
+Complete records later run the normal detector, save evidence and update the
+map. A matching identity/category already alerted by a hint does not enqueue a
+second popup for that batch, even if payload evidence strengthens the result.
+Other categories and records without an accepted hint retain normal alerts.
+
+Hints count as data liveness, not control heartbeats or full Wi-Fi/BLE batch
+counts. Loss, capacity limits and USB congestion can delay an alert until the
+batch fallback. The sub-second target applies to a normally flowing transport,
+not a guaranteed RF/USB deadline. Standalone scans and host BLE are unchanged.
+
 ## Streaming transport v1
 
 ## Commands and ownership

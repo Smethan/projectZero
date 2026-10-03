@@ -21,6 +21,11 @@
 #include "sdkconfig.h"
 #define QLEN 64
 #define CACHE 128
+#define LIVE_OUI_MAX 8
+#define LIVE_OUI_IDENTITIES 32
+static uint8_t live_ouis[LIVE_OUI_MAX][3];
+static unsigned live_oui_count, live_identity_count;
+static struct { uint8_t kind, addr_type, addr[6]; } live_identities[LIVE_OUI_IDENTITIES];
 static atomic_bool active, stopping, collecting;
 static bool passive_hs;
 static bool wifi_only;
@@ -206,18 +211,73 @@ static bool batch_open(void) {
 static void batch_close(void) {
     heap_caps_free(batch_slots); batch_slots=NULL; batch_capacity=0;
 }
-static void batch_add(const observation *o) {
+static bool batch_add(const observation *o) {
     uint32_t hash=observation_hash(o);
     for(unsigned probe=0;probe<batch_capacity;probe++) {
         batch_slot *slot=&batch_slots[(hash+probe)%batch_capacity];
-        if(!slot->used) { slot->used=true;slot->hash=hash;slot->value=*o;return; }
+        if(!slot->used) { slot->used=true;slot->hash=hash;slot->value=*o;return true; }
         if(slot->hash==hash && observation_equal(&slot->value,o)) {
             if(o->rssi>slot->value.rssi) slot->value.rssi=o->rssi;
             slot->value.at=o->at;
-            return;
+            return true;
         }
     }
     atomic_fetch_add(&drops,1);
+    return false;
+}
+/* Notification hints only. Full evidence stays in the batch. All filtering and
+ * serial I/O run in the worker, never the WiFi/NimBLE callbacks. */
+static void live_oui_emit(const observation *o,const uint8_t *addr,unsigned batch) {
+    int64_t age=now_ms()-o->at;
+    if(!live_oui_count || age<0 || age>2000 || (addr[0]&3) ||
+       (o->kind==2 && o->addr_type!=0)) return;
+    bool match=false;
+    for(unsigned i=0;i<live_oui_count;i++)
+        if(!memcmp(addr,live_ouis[i],3)) { match=true;break; }
+    if(!match) return;
+    for(unsigned i=0;i<live_identity_count;i++)
+        if(live_identities[i].kind==o->kind && live_identities[i].addr_type==o->addr_type &&
+           !memcmp(addr,live_identities[i].addr,6)) return;
+    if(live_identity_count>=LIVE_OUI_IDENTITIES) return;
+    unsigned slot=live_identity_count++;
+    live_identities[slot].kind=o->kind; live_identities[slot].addr_type=o->addr_type;
+    memcpy(live_identities[slot].addr,addr,6);
+    char a[18],b[384],type[32]="";
+    mac(a,addr);
+    if(o->kind==2) snprintf(type,sizeof(type),",\"addr_type\":%u",o->addr_type);
+    snprintf(b,sizeof(b),"{\"v\":2,\"kind\":\"live_oui\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"radio\":\"%s\",\"mac\":\"%s\",\"rssi\":%d%s}",
+             session,next_seq(),batch,(long long)o->at,(long long)age,o->kind==2?"ble":"wifi",a,o->rssi,type);
+    /* One best-effort attempt per identity/batch. A failed hint cannot discard
+     * or mutate its saved batch record, and normal host detection is fallback. */
+    output(b);
+}
+static void batch_observe(const observation *o,unsigned batch) {
+    if(!batch_add(o)) return;
+    live_oui_emit(o,o->addr,batch);
+    if(o->kind==1 && (o->event==8 || o->event==5) && memcmp(o->addr,o->bssid,6))
+        live_oui_emit(o,o->bssid,batch);
+}
+static int hex_digit(char c) {
+    if(c>='0' && c<='9') return c-'0';
+    if(c>='a' && c<='f') return c-'a'+10;
+    if(c>='A' && c<='F') return c-'A'+10;
+    return -1;
+}
+static bool parse_live_ouis(const char *arg,uint8_t values[LIVE_OUI_MAX][3],unsigned *count) {
+    if(strncmp(arg,"live_oui=",9)) return false;
+    const char *p=arg+9; *count=0;
+    do {
+        if(*count>=LIVE_OUI_MAX || strlen(p)<6) return false;
+        for(unsigned i=0;i<3;i++) {
+            int hi=hex_digit(p[2*i]),lo=hex_digit(p[2*i+1]);
+            if(hi<0 || lo<0) return false;
+            values[*count][i]=(hi<<4)|lo;
+        }
+        for(unsigned i=0;i<*count;i++) if(!memcmp(values[i],values[*count],3)) return false;
+        (*count)++; p+=6;
+        if(!*p) return true;
+        if(*p++!=',' || !*p) return false;
+    } while(true);
 }
 static void hs_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!buf ||
@@ -274,6 +334,7 @@ static void batch_worker_loop(void) {
     while(!atomic_load(&stopping) && now_ms()-atomic_load(&lease)<15000) {
         unsigned current=atomic_fetch_add(&batch_number,1)+1;
         memset(batch_slots,0,sizeof(*batch_slots)*batch_capacity);
+        live_identity_count=0;
         memset(seen,0,sizeof(seen)); xQueueReset(queue);
         atomic_store(&batch_phase,1); atomic_store(&collecting,true);
         batch_status("batch_start","running",",\"window_ms\":10000");
@@ -281,7 +342,7 @@ static void batch_worker_loop(void) {
         while(!atomic_load(&stopping) && now_ms()<deadline && now_ms()-atomic_load(&lease)<15000) {
             if(now_ms()-hop>=160) { sw_radio_hop(hop_index++);hop=now_ms(); }
             observation o;
-            if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) batch_add(&o);
+            if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) batch_observe(&o,current);
             if(now_ms()-heartbeat>=2000) {
                 batch_status("heartbeat","running",""); heartbeat=now_ms();
             }
@@ -289,7 +350,7 @@ static void batch_worker_loop(void) {
         atomic_store(&collecting,false);
         while(atomic_load(&producers) && !atomic_load(&stopping)) vTaskDelay(1);
         observation pending;
-        while(xQueueReceive(queue,&pending,0)==pdTRUE) batch_add(&pending);
+        while(xQueueReceive(queue,&pending,0)==pdTRUE) batch_observe(&pending,current);
         if(atomic_load(&stopping) || now_ms()-atomic_load(&lease)>=15000) break;
         atomic_store(&batch_phase,2);
         unsigned wifi=0,ble=0;
@@ -364,6 +425,7 @@ static void worker(void *unused) {
         batch_status("stopped","stopped","");
         linenoiseSetMachineMode(false);
         batch_close();
+        live_oui_count=live_identity_count=0;
     } else status("stopped","");
     atomic_store(&active,false);
     vTaskDelete(NULL);
@@ -375,11 +437,16 @@ bool sw_stop(void) {
     return !sw_active();
 }
 static int start(int argc,char **argv) {
-    if(argc!=2 || !argv[1][0] || strlen(argv[1])>32) return 1;
+    if((argc!=2 && argc!=3) || !argv[1][0] || strlen(argv[1])>32) return 1;
     for(char *p=argv[1];*p;p++) if(!isalnum((unsigned char)*p) && *p!='-' && *p!='_') return 1;
     if(sw_active()) return 1;
+    bool requested_batch=strstr(argv[0],"_batch_serial")!=NULL;
+    uint8_t requested_ouis[LIVE_OUI_MAX][3]; unsigned requested_count=0;
+    if(argc==3 && (!requested_batch || !parse_live_ouis(argv[2],requested_ouis,&requested_count))) return 1;
+    live_oui_count=requested_count; live_identity_count=0;
+    memcpy(live_ouis,requested_ouis,requested_count*3);
     passive_hs = !strcmp(argv[0], "start_hs_sniff_serial");
-    batch_mode = strstr(argv[0],"_batch_serial")!=NULL;
+    batch_mode = requested_batch;
     wifi_only = !strcmp(argv[0], "start_wardrive_wifi_serial") || !strcmp(argv[0], "start_wardrive_wifi_batch_serial");
     if(!queue) queue=xQueueCreateStatic(QLEN,sizeof(observation),queue_bytes,&queue_storage);
     xQueueReset(queue); memset(seen,0,sizeof(seen));
@@ -421,7 +488,7 @@ static int wardrive_status(int argc,char **argv) {
     return 0;
 }
 static int capabilities(int argc,char **argv) {
-    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"hs_capture_pcapng_v1\":true,\"sniffer_intel_v1\":true,\"sniffer_scope_v1\":true,\"target_intel_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"wardrive_live_oui_v1\":true,\"live_oui_max\":8,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"hs_capture_pcapng_v1\":true,\"sniffer_intel_v1\":true,\"sniffer_scope_v1\":true,\"target_intel_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 /* All main console commands share an ownership gate, including attack commands.
  * Registration retains the original handlers and changes no idle behavior. */
@@ -449,8 +516,8 @@ void sw_register(void) {
     const esp_console_cmd_t cmds[]={
         {.command="start_wardrive_serial",.help="WiFi + BLE over serial, no GPS/SD: <session>",.func=start},
         {.command="start_wardrive_wifi_serial",.help="WiFi only over serial for host BLE, no GPS/SD: <session>",.func=start},
-        {.command="start_wardrive_batch_serial",.help="10s batched WiFi + BLE over serial: <session>",.func=start},
-        {.command="start_wardrive_wifi_batch_serial",.help="10s batched WiFi only for host BLE: <session>",.func=start},
+        {.command="start_wardrive_batch_serial",.help="10s batched WiFi + BLE: <session> [live_oui=HHHHHH,...]",.func=start},
+        {.command="start_wardrive_wifi_batch_serial",.help="10s batched WiFi only: <session> [live_oui=HHHHHH,...]",.func=start},
         {.command="start_hs_sniff_serial",.help="Passive EAPOL/PMKID and management PCAP over serial, no SD: <session>",.func=start},
         {.command="wardrive_keepalive",.help="Renew serial session lease: <session>",.func=keepalive},
         {.command="wardrive_status",.help="Repeat current batched wardrive state: <session>",.func=wardrive_status},
