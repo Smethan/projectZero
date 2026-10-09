@@ -18,7 +18,10 @@
 /* Console commands are serialized; keep block storage off the REPL stack. */
 static uint8_t block_data[BLOCK];
 #define META_MAGIC 0x554f5431u
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define BOARD "waveshare-zero"
+#define FAST_FIELDS ",\"block_size\":4096,\"encoding\":\"base64\",\"line_size\":8192"
+#elif CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #define BOARD "xiao"
 #define FAST_FIELDS ",\"block_size\":4096,\"encoding\":\"base64\",\"line_size\":8192"
 #else
@@ -99,7 +102,16 @@ static int status_cmd(int argc,char **argv) {
     load();response("status",NULL);return 0;
 }
 static int fail(const char *reason) { response("error",reason);return 1; }
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define UOTA_REJECT_UNSUPPORTED_LAYOUT() do { return fail("unsupported_layout"); } while(0)
+#else
+#define UOTA_REJECT_UNSUPPORTED_LAYOUT() do { } while(0)
+#endif
 static int begin_cmd(int argc,char **argv) {
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    (void)argc; (void)argv;
+    return fail("unsupported_layout");
+#else
     uint32_t size;
     if(argc!=3||!number(argv[1],&size)||!hash_ok(argv[2]))return fail("arguments");
     load();
@@ -130,6 +142,7 @@ static int begin_cmd(int argc,char **argv) {
     }
     if(err!=ESP_OK)return fail("begin");
     active=true;linenoiseSetMachineMode(true);response("ready",NULL);return 0;
+#endif
 }
 static int write_block(uint32_t at, const uint8_t *data, unsigned size) {
     uint8_t previous[CHUNK];
@@ -151,6 +164,7 @@ static int write_block(uint32_t at, const uint8_t *data, unsigned size) {
     response("ack",NULL);return 0;
 }
 static int chunk_cmd(int argc,char **argv) {
+    UOTA_REJECT_UNSUPPORTED_LAYOUT();
     uint32_t at,expected_crc;
     if(argc!=5||!active||strcmp(argv[1],meta.hash)||!number(argv[2],&at)||!number(argv[3],&expected_crc))return fail("chunk_arguments");
     unsigned chars=strlen(argv[4]);
@@ -191,6 +205,7 @@ static unsigned decode_block(const char *text) {
     return used;
 }
 static int block_cmd(int argc,char **argv) {
+    UOTA_REJECT_UNSUPPORTED_LAYOUT();
     uint32_t at,expected_crc;
     if(argc!=5||!active||strcmp(argv[1],meta.hash)||!number(argv[2],&at)||!number(argv[3],&expected_crc))return fail("chunk_arguments");
     unsigned size=decode_block(argv[4]);
@@ -204,6 +219,7 @@ static int block_cmd(int argc,char **argv) {
     return write_block(at,block_data,size);
 }
 static int finish_cmd(int argc,char **argv) {
+    UOTA_REJECT_UNSUPPORTED_LAYOUT();
     if(argc!=2||!active||strcmp(argv[1],meta.hash)||offset!=meta.size)return fail("incomplete");
     uint8_t data[1024],digest[32];char hex[65];
     psa_hash_operation_t sha=PSA_HASH_OPERATION_INIT;size_t digest_size=0;
@@ -229,6 +245,7 @@ static int finish_cmd(int argc,char **argv) {
     return 0;
 }
 static int abort_cmd(int argc,char **argv) {
+    UOTA_REJECT_UNSUPPORTED_LAYOUT();
     if(argc!=2)return fail("arguments");
     load();
     if(meta.magic==META_MAGIC&&strcmp(argv[1],meta.hash))return fail("image_mismatch");

@@ -32,7 +32,7 @@ def function(signature: str) -> str:
 
 callback = function("static void hs_sniffer_promiscuous_cb(")
 queue_frame = function("static bool hs_queue_frame(")
-process = function("static void hs_process_queued_frame(")
+process = function("void hs_process_queued_frame(")
 close = function("static void hs_capture_close(void)")
 cleanup = function("static void handshake_cleanup(void)")
 stop = function("static int stop_operations(bool reset_wifi)")

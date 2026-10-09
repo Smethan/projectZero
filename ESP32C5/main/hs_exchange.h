@@ -4,7 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO) && CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define HSX_EXCHANGE_LIMIT 4
+#else
 #define HSX_EXCHANGE_LIMIT 32
+#endif
 #define HSX_FRAME_MAX 512
 #define HSX_CAPTURE_FRAME_COUNT 7 /* beacon, auth, association and M1-M4 */
 #define HSX_PCAP_MAX (24 + HSX_CAPTURE_FRAME_COUNT * (16 + HSX_FRAME_MAX))

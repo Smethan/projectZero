@@ -39,7 +39,7 @@ signatures = (
     "static void hs_capture_append_for_progress(",
     "static bool hs_parse_ap_context(",
     "static void hs_copy_context(",
-    "static void hs_process_queued_frame(",
+    "void hs_process_queued_frame(",
     "static unsigned hs_capture_drain(",
     "static bool hs_capture_open(void)",
     "static void hs_capture_close(void)",

@@ -23,6 +23,7 @@ typedef int portMUX_TYPE;
 #define portEXIT_CRITICAL(x) ((void)0)
 typedef struct {int size,count,head,capacity;bool dynamic;uint8_t *data;} StaticQueue_t;
 typedef StaticQueue_t *QueueHandle_t;
+typedef void *TaskHandle_t;
 static int64_t test_clock;
 static int64_t esp_timer_get_time(void){return test_clock*1000;}
 static int queue_fail_after=-1;
@@ -34,20 +35,32 @@ static int xQueueReceive(QueueHandle_t q,void *p,int ticks){test_clock+=ticks;if
 static int uxQueueMessagesWaiting(QueueHandle_t q){return q->count;}
 static void xQueueReset(QueueHandle_t q){q->head=q->count=0;}
 static void (*test_task)(void*);
+static void *test_task_arg;
+static TaskHandle_t test_task_handle;
 static int task_ok=1;
-static int xTaskCreate(void (*f)(void*),const char *name,int stack,void *arg,int pri,void *handle){test_task=f;return task_ok;}
+static int xTaskCreate(void (*f)(void*),const char *name,int stack,void *arg,int pri,TaskHandle_t *handle){test_task=f;test_task_arg=arg;if(handle){test_task_handle=(TaskHandle_t)f;*handle=test_task_handle;}return task_ok;}
 static void vTaskDelay(int ms){test_clock+=ms;}
 static void vTaskDelete(void *task){}
 #define WIFI_PKT_MGMT 0
 #define WIFI_PKT_DATA 1
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
 #define WIFI_PROMIS_FILTER_MASK_DATA 2
+#define WIFI_SECOND_CHAN_NONE 0
 typedef int wifi_promiscuous_pkt_type_t;
 typedef struct {int filter_mask;} wifi_promiscuous_filter_t;
+#define WIFI_COUNTRY_POLICY_AUTO 0
+#define WIFI_COUNTRY_POLICY_MANUAL 1
+#define CHANNEL_TO_BIT(channel) (1u << ((channel)<=14?(channel):(channel)<=64?((channel)-36)/4+1:(channel)<=144?((channel)-100)/4+9:((channel)-149)/4+21))
+typedef struct {char cc[3];uint8_t schan,nchan;int policy;uint32_t wifi_5g_channel_mask;} wifi_country_t;
+static bool test_country_available;
+static wifi_country_t test_country;
+static int esp_wifi_get_country(wifi_country_t *country){if(!test_country_available||!country)return 1;*country=test_country;return ESP_OK;}
 typedef struct {struct {int sig_len;uint8_t channel;int8_t rssi;uint32_t timestamp;}rx_ctrl;uint8_t payload[512];}wifi_promiscuous_pkt_t;
 static int esp_wifi_set_promiscuous_filter(const wifi_promiscuous_filter_t *f){return 0;}
 static int esp_wifi_set_promiscuous_rx_cb(void (*f)(void*,wifi_promiscuous_pkt_type_t)){return 0;}
 static int esp_wifi_set_promiscuous(bool on){return 0;}
+static int test_channel_result;
+static int esp_wifi_set_channel(uint8_t primary,int second){return test_channel_result;}
 static char output_capture[65536];
 static int transport_limit=1024;
 static int usb_serial_jtag_write_bytes(const char *buf,int n,int ticks){int count=n>256?0:(n<transport_limit?n:transport_limit);strncat(output_capture,buf,count);return count;}
@@ -63,6 +76,7 @@ static void *heap_caps_malloc(size_t size,unsigned caps){
     void *p=malloc(size);if(p)heap_live++;return p;
 }
 static void heap_caps_free(void *p){if(p){assert(heap_live);heap_live--;free(p);}}
-static size_t heap_caps_get_free_size(unsigned caps){return 12345;}
+static size_t test_free_heap=12345;
+static size_t heap_caps_get_free_size(unsigned caps){return test_free_heap;}
 static size_t heap_caps_get_largest_free_block(unsigned caps){return 1234;}
 #define ESP_LOGI(tag,fmt,...) ((void)0)

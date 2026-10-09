@@ -157,7 +157,8 @@ static uint8_t get_eapol_message_number(data_frame_t *frame) {
     }
     
     // Read Key Information as uint16_t (little-endian)
-    uint16_t key_info_raw = *((uint16_t*)&eapol_key->key_information);
+    uint16_t key_info_raw;
+    memcpy(&key_info_raw, &eapol_key->key_information, sizeof(key_info_raw));
     
     // Extract flags from raw value (little-endian byte order)
     // Key Information structure in network byte order:

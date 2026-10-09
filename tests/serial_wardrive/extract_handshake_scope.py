@@ -19,7 +19,7 @@ def extract_function(source: str, signature: str) -> str:
 
 
 source = Path("../../ESP32C5/main/main.c").read_text()
-body = extract_function(source, "static int cmd_handshake_scope(int argc,char **argv)")
+body = extract_function(source, "int cmd_handshake_scope(int argc,char **argv)")
 Path(sys.argv[1], "handshake_scope_under_test.inc").write_text(body + "\n")
 
 scan_start = source.index("static bool hs_scan_event(")

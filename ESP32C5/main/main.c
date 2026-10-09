@@ -8,6 +8,7 @@
 #include "usb_ota.h"
 #include "capture_memory.h"
 #include "esp_wifi_default.h"
+#include "cJSON.h"
 // main.c
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,25 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define ZERO_STACK_NOINLINE __attribute__((noinline))
+#else
+#define ZERO_STACK_NOINLINE
+#endif
+
+static int cmd_start_sae_overflow(int argc,char **argv);
+static bool ensure_wifi_mode(void);
+static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope);
+static bool is_bssid_whitelisted(const uint8_t *bssid);
+static int cmd_start_deauth(int argc,char **argv);
+static int cmd_start_evil_twin(int argc,char **argv);
+static int cmd_start_sniffer(int argc,char **argv);
+static int cmd_start_blackout(int argc,char **argv);
+static int cmd_start_portal(int argc,char **argv);
+static int cmd_show_sniffer_results(int argc,char **argv);
+static int cmd_scan_bt(int argc,char **argv);
+static int cmd_scan_airtag(int argc,char **argv);
+static int stop_operations(bool reset_wifi);
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -82,7 +102,6 @@
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_crt_bundle.h"
-#include "cJSON.h"
 #include "esp_netif.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -109,6 +128,13 @@
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
 #include <math.h>
+
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO && CONFIG_SPIRAM
+#error "Waveshare ESP32-C5 Zero profile must not enable PSRAM"
+#endif
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO && !CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#error "Waveshare ESP32-C5 Zero requires native USB-Serial/JTAG console"
+#endif
 
 // NimBLE includes for BLE scanning
 #include "nimble/nimble_port.h"
@@ -140,7 +166,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.14"
+#define JANOS_VERSION "1.8.0"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -217,12 +243,36 @@
 #define SD_CLK_PIN         6
 #define SD_CS_PIN          10
 
-#define MY_LOG_INFO(tag, fmt, ...) printf("" fmt "\n", ##__VA_ARGS__)
+static void projectzero_log_info(const char *fmt, ...) {
+    char line[340];
+    va_list args; va_start(args,fmt);
+    vsnprintf(line,sizeof(line),fmt,args);
+    va_end(args);
+    if(sw_job_owned()) sw_job_emit_legacy_line(line);
+    else printf("%s\n",line);
+}
+static bool projectzero_emit_legacy_serial_line(const char *text) {
+    if (!sw_job_owned() || !text) return false;
+    while (*text == '\n' || *text == '\r') text++;
+    char line[701]; size_t len=strnlen(text,sizeof(line)-1);
+    while (len && (text[len-1]=='\n' || text[len-1]=='\r')) len--;
+    memcpy(line,text,len); line[len]=0;
+    sw_job_emit_legacy_line(line);
+    return true;
+}
+#define MY_LOG_INFO(tag, fmt, ...) projectzero_log_info("" fmt, ##__VA_ARGS__)
 
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define MAX_AP_CNT 8
+#define MAX_CLIENTS_PER_AP 16
+#define MAX_SNIFFER_APS 16
+#define MAX_PROBE_REQUESTS 64
+#else
 #define MAX_AP_CNT 64
 #define MAX_CLIENTS_PER_AP 50
 #define MAX_SNIFFER_APS 100
 #define MAX_PROBE_REQUESTS 200
+#endif
 
 static const uint8_t channel_view_24ghz_channels[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
@@ -455,12 +505,20 @@ static TaskHandle_t blackout_attack_task_handle = NULL;
 static volatile bool blackout_attack_active = false;
 
 // Target BSSID monitoring (allocated in PSRAM)
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define MAX_TARGET_BSSIDS 8
+#else
 #define MAX_TARGET_BSSIDS 50
+#endif
 static target_bssid_t *target_bssids = NULL;                // ~2.3 KB in PSRAM
 static int target_bssid_count = 0;
 
 // Selected stations for targeted deauth (allocated in PSRAM)
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define MAX_SELECTED_STATIONS 16
+#else
 #define MAX_SELECTED_STATIONS 32
+#endif
 static selected_station_t *selected_stations = NULL;
 static int selected_stations_count = 0;
 static uint32_t last_channel_check_time = 0;
@@ -531,7 +589,11 @@ static atomic_bool hs_scan_output_active;
 static atomic_bool hs_scan_start_authorized;
 static atomic_bool handshake_cleanup_active;
 static void hs_scan_release_event_owner(void);
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+static void hs_scan_complete(bool success) __attribute__((noinline));
+#else
 static void hs_scan_complete(bool success);
+#endif
 static bool handshake_selected_mode = false; // true if networks were selected, false for scan-all mode
 static bool handshake_serial_mode = false;   // true = dump pcap/hccapx via serial (base64) instead of SD
 static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
@@ -543,8 +605,13 @@ static int handshake_current_index = 0;
 // Sniffer-based Handshake Attack with D-UCB Channel Selection (scan-all mode)
 // ============================================================================
 
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define HS_MAX_APS      8
+#define HS_MAX_CLIENTS  32
+#else
 #define HS_MAX_APS      64
 #define HS_MAX_CLIENTS  128
+#endif
 #define DUCB_GAMMA      0.99    // Discount factor (recent observations matter more)
 #define DUCB_C          1.0     // Exploration constant
 #define HS_DEAUTH_COOLDOWN_US  (10 * 1000000LL)  // 10s cooldown between deauths per client
@@ -577,9 +644,11 @@ typedef struct {
     bool association_has_pmkid;
     int64_t complete_at_us;
     int64_t last_deauth_us;
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
     hsx_frame_t beacon;
     hsx_frame_t authentication;
     hsx_frame_t association;
+#endif
 } hs_ap_target_t;
 
 // Client discovered by sniffing
@@ -623,6 +692,8 @@ typedef struct {
     int8_t rssi;
     uint8_t data[HSX_FRAME_MAX];
 } hs_queued_frame_t;
+static void hs_capture_close(void);
+static unsigned hs_job_packet_id;
 typedef struct {
     uint8_t bssid[6];
     uint8_t sta[6];
@@ -705,7 +776,11 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_DWELL_PRIMARY_MS      500
 #define WDP_DWELL_DEFAULT_MS      400
 #define WDP_DWELL_DFS_MS          250
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define WDP_INITIAL_CAPACITY      64
+#else
 #define WDP_INITIAL_CAPACITY      256
+#endif
 #define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
 #define WDP_FILE_FLUSH_INTERVAL   50
@@ -826,7 +901,11 @@ static TaskHandle_t bt_scan_task_handle = NULL;
 static volatile bool nimble_initialized = false;
 
 // BLE device tracking for deduplication
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+#define BT_INITIAL_CAPACITY 32
+#else
 #define BT_INITIAL_CAPACITY 128
+#endif
 static uint8_t (*bt_found_devices)[6] = NULL;
 static int bt_found_device_count = 0;
 static int bt_found_device_capacity = 0;
@@ -1596,7 +1675,7 @@ static void beacon_spam_task(void *pvParameters) {
                     if (bcn_now_us - bcn_oled_last_us > 400000) {
                         bcn_oled_last_us = bcn_now_us;
                         char bcn_l2[64], bcn_l3[64], bcn_l4[64];
-                        snprintf(bcn_l2, sizeof(bcn_l2), ">> %s", beacon_ssids[i]);
+                        snprintf(bcn_l2, sizeof(bcn_l2), ">> %.32s", beacon_ssids[i]);
                         snprintf(bcn_l3, sizeof(bcn_l3), "  Ch %d/%d", current_channel, last_channel);
                         snprintf(bcn_l4, sizeof(bcn_l4), "  %d SSIDs TX", beacon_ssid_count);
                         oled_display_update_full("> Beacon Spam", bcn_l2, bcn_l3, bcn_l4);
@@ -1887,6 +1966,347 @@ static bool init_psram_buffers(void)
     return true;
 }
 
+static wifi_ap_record_t zero_job_blackout_targets[16];
+static unsigned zero_job_blackout_target_count;
+static bool zero_job_blackout_selected;
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+enum {
+    ZERO_RES_SNIFFER = 1u << 0,
+    ZERO_RES_TARGETS = 1u << 1,
+    ZERO_RES_BLE = 1u << 2,
+    ZERO_RES_HANDSHAKE = 1u << 3,
+    ZERO_RES_WARDRIVE = 1u << 4,
+    ZERO_RES_PORTAL = 1u << 5,
+};
+#define ZERO_JOB_MEMORY_CAP (48u * 1024u)
+#define ZERO_JOB_MEMORY_RESERVE (32u * 1024u)
+static void *zero_job_allocations[16];
+static unsigned zero_job_allocation_count;
+static size_t zero_job_allocated_bytes;
+static uint32_t zero_job_resource_mask;
+
+static void *zero_job_calloc(size_t count,size_t size) {
+    if(!count || !size || count>SIZE_MAX/size || zero_job_allocation_count>=16) return NULL;
+    size_t bytes=count*size;
+    if(zero_job_allocated_bytes+bytes>ZERO_JOB_MEMORY_CAP) return NULL;
+    void *memory=heap_caps_calloc(count,size,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if(!memory) return NULL;
+    zero_job_allocations[zero_job_allocation_count++]=memory;
+    zero_job_allocated_bytes+=bytes;
+    return memory;
+}
+
+static size_t zero_job_resource_estimate(uint32_t mask) {
+    /* The token/lease supervisor is part of every managed Zero job's live
+       internal-RAM working set and is created after this admission succeeds. */
+    size_t bytes=6144;
+    if(mask&ZERO_RES_SNIFFER) bytes+=MAX_SNIFFER_APS*sizeof(sniffer_ap_t)+MAX_PROBE_REQUESTS*sizeof(probe_request_t);
+    if(mask&ZERO_RES_TARGETS) bytes+=MAX_TARGET_BSSIDS*sizeof(target_bssid_t)+MAX_SELECTED_STATIONS*sizeof(selected_station_t)+MAX_WHITELISTED_BSSIDS*sizeof(whitelisted_bssid_t);
+    if(mask&ZERO_RES_BLE) bytes+=BT_INITIAL_CAPACITY*(sizeof(*bt_found_devices)+sizeof(bt_device_info_t));
+    if(mask&ZERO_RES_HANDSHAKE) bytes+=MAX_AP_CNT*sizeof(wifi_ap_record_t)+HS_MAX_APS*sizeof(hs_ap_target_t)+HS_MAX_CLIENTS*sizeof(hs_client_entry_t)+dual_band_channels_count*sizeof(ducb_channel_t)+HS_FRAME_POOL_COUNT*sizeof(hs_queued_frame_t)+15360;
+    if(mask&ZERO_RES_WARDRIVE) bytes+=WDP_INITIAL_CAPACITY*sizeof(wdp_network_t)+MAX_AP_CNT*sizeof(wifi_ap_record_t);
+    /* Portal mode owns a 4 KiB DNS task stack, HTTP server task/control
+       allocations, and short-lived AP setup buffers. Reserve their bounded
+       internal-RAM envelope before the legacy HTTP server allocates them. */
+    if(mask&ZERO_RES_PORTAL) bytes+=24u*1024u;
+    return bytes;
+}
+
+static bool zero_job_resources_open(uint32_t mask) {
+    size_t estimate=zero_job_resource_estimate(mask);
+    if(!mask || zero_job_resource_mask || estimate>ZERO_JOB_MEMORY_CAP ||
+       heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)<estimate+ZERO_JOB_MEMORY_RESERVE) return false;
+    bool ok=true;
+    if((mask&ZERO_RES_SNIFFER) &&
+       (!(sniffer_aps=zero_job_calloc(MAX_SNIFFER_APS,sizeof(*sniffer_aps))) ||
+        !(probe_requests=zero_job_calloc(MAX_PROBE_REQUESTS,sizeof(*probe_requests)))) ) ok=false;
+    if(ok && (mask&ZERO_RES_TARGETS) &&
+       (!(target_bssids=zero_job_calloc(MAX_TARGET_BSSIDS,sizeof(*target_bssids))) ||
+        !(selected_stations=zero_job_calloc(MAX_SELECTED_STATIONS,sizeof(*selected_stations))) ||
+        !(whiteListedBssids=zero_job_calloc(MAX_WHITELISTED_BSSIDS,sizeof(*whiteListedBssids)))) ) ok=false;
+    if(ok && (mask&ZERO_RES_BLE) &&
+       (!(bt_found_devices=zero_job_calloc(BT_INITIAL_CAPACITY,sizeof(*bt_found_devices))) ||
+        !(bt_devices=zero_job_calloc(BT_INITIAL_CAPACITY,sizeof(*bt_devices)))) ) ok=false;
+    if(ok && (mask&ZERO_RES_HANDSHAKE) &&
+       (!(wardrive_scan_results=zero_job_calloc(MAX_AP_CNT,sizeof(*wardrive_scan_results))) ||
+        !(handshake_targets=zero_job_calloc(MAX_AP_CNT,sizeof(*handshake_targets))) ||
+        !(hs_ap_targets=zero_job_calloc(HS_MAX_APS,sizeof(*hs_ap_targets))) ||
+        !(hs_clients=zero_job_calloc(HS_MAX_CLIENTS,sizeof(*hs_clients))) ||
+        !(ducb_channels=zero_job_calloc(dual_band_channels_count,sizeof(*ducb_channels)))) ) ok=false;
+    if(ok && (mask&ZERO_RES_WARDRIVE) &&
+       (!(wdp_seen_networks=zero_job_calloc(WDP_INITIAL_CAPACITY,sizeof(*wdp_seen_networks))) ||
+        !(wardrive_scan_results=zero_job_calloc(MAX_AP_CNT,sizeof(*wardrive_scan_results)))) ) ok=false;
+    if(!ok) {
+        for(unsigned i=0;i<zero_job_allocation_count;i++) heap_caps_free(zero_job_allocations[i]);
+        memset(zero_job_allocations,0,sizeof(zero_job_allocations));
+        zero_job_allocation_count=0;zero_job_allocated_bytes=0;
+        sniffer_aps=NULL;probe_requests=NULL;target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
+        bt_found_devices=NULL;bt_devices=NULL;wardrive_scan_results=NULL;handshake_targets=NULL;
+        hs_ap_targets=NULL;hs_clients=NULL;hs_exchange_state=NULL;hs_artifact_buffer=NULL;ducb_channels=NULL;wdp_seen_networks=NULL;
+        return false;
+    }
+    zero_job_resource_mask=mask;
+    bt_found_device_capacity=(mask&ZERO_RES_BLE)?BT_INITIAL_CAPACITY:0;
+    bt_device_capacity=(mask&ZERO_RES_BLE)?BT_INITIAL_CAPACITY:0;
+    wdp_seen_capacity=(mask&ZERO_RES_WARDRIVE)?WDP_INITIAL_CAPACITY:0;
+    return true;
+}
+static void zero_job_resources_close(void) {
+    if(hs_frame_pool.frames) hs_capture_close();
+    for(unsigned i=0;i<zero_job_allocation_count;i++) heap_caps_free(zero_job_allocations[i]);
+    memset(zero_job_allocations,0,sizeof(zero_job_allocations));
+    zero_job_allocation_count=0;zero_job_allocated_bytes=0;zero_job_resource_mask=0;
+    sniffer_aps=NULL;probe_requests=NULL;target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
+    bt_found_devices=NULL;bt_devices=NULL;bt_found_device_capacity=0;bt_device_capacity=0;
+    wardrive_scan_results=NULL;handshake_targets=NULL;wdp_seen_networks=NULL;wdp_seen_capacity=0;
+    hs_ap_targets=NULL;hs_clients=NULL;hs_exchange_state=NULL;hs_artifact_buffer=NULL;ducb_channels=NULL;
+    target_bssid_count=selected_stations_count=0;hs_ap_count=hs_client_count=ducb_channel_count=0;
+    zero_job_blackout_target_count=0;zero_job_blackout_selected=false;
+}
+#endif
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+enum { ZERO_RES_SNIFFER=1u<<0,ZERO_RES_TARGETS=1u<<1,ZERO_RES_BLE=1u<<2,
+       ZERO_RES_HANDSHAKE=1u<<3,ZERO_RES_WARDRIVE=1u<<4,ZERO_RES_PORTAL=1u<<5 };
+#endif
+static int job_whitelist_restore_count = -1;
+static uint8_t zero_job_exclusions[HS_EXCLUSION_LIMIT][6];
+static unsigned zero_job_exclusion_count;
+static bool job_resources_open(uint32_t mask) {
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    return zero_job_resources_open(mask);
+#else
+    if((mask&ZERO_RES_SNIFFER)&&(!sniffer_aps||!probe_requests))return false;
+    if((mask&ZERO_RES_TARGETS)&&(!target_bssids||!selected_stations||!whiteListedBssids))return false;
+    if((mask&ZERO_RES_BLE)&&(!bt_found_devices||!bt_devices))return false;
+    if((mask&ZERO_RES_HANDSHAKE)&&(!handshake_targets||!hs_ap_targets||!hs_clients))return false;
+    if((mask&ZERO_RES_WARDRIVE)&&(!wdp_seen_networks||!wardrive_scan_results))return false;
+    return true;
+#endif
+}
+static void job_resources_close(void) {
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    zero_job_resources_close();
+#endif
+    zero_job_blackout_target_count=0;zero_job_blackout_selected=false;
+    if(job_whitelist_restore_count>=0) {
+        whitelistedBssidsCount=job_whitelist_restore_count;
+        job_whitelist_restore_count=-1;
+    }
+    zero_job_exclusion_count=0;
+}
+static bool zero_parse_mac(const char *text,uint8_t mac[6]) {
+    if(!text||strlen(text)!=17)return false;
+    for(unsigned i=0;i<6;i++) {
+        int hi=isdigit((unsigned char)text[i*3])?text[i*3]-'0':tolower((unsigned char)text[i*3])-'a'+10;
+        int lo=isdigit((unsigned char)text[i*3+1])?text[i*3+1]-'0':tolower((unsigned char)text[i*3+1])-'a'+10;
+        if(hi<0||hi>15||lo<0||lo>15||(i<5&&text[i*3+2]!=':'))return false;
+        mac[i]=(uint8_t)((hi<<4)|lo);
+    }
+    static const uint8_t zero[6];
+    return !(mac[0]&1)&&memcmp(mac,zero,6)!=0;
+}
+
+static bool zero_hex_bytes(const char *text,uint8_t *out,size_t cap,size_t *out_len) {
+    if(!text)return false;
+    size_t n=strlen(text);
+    if((n&1)||n/2>cap)return false;
+    for(size_t i=0;i<n/2;i++) {
+        int hi=isdigit((unsigned char)text[2*i])?text[2*i]-'0':tolower((unsigned char)text[2*i])-'a'+10;
+        int lo=isdigit((unsigned char)text[2*i+1])?text[2*i+1]-'0':tolower((unsigned char)text[2*i+1])-'a'+10;
+        if(hi<0||hi>15||lo<0||lo>15)return false;
+        out[i]=(uint8_t)((hi<<4)|lo);
+    }
+    *out_len=n/2;return true;
+}
+
+static bool zero_parse_job_targets(const cJSON *request,wifi_ap_record_t out[16],
+                                   unsigned *count,hs_target_set *scope,bool required) {
+    cJSON *targets=cJSON_GetObjectItemCaseSensitive((cJSON *)request,"targets");
+    cJSON *exclude=cJSON_GetObjectItemCaseSensitive((cJSON *)request,"exclude");
+    int target_count=targets?cJSON_GetArraySize(targets):0;
+    int exclude_count=exclude?cJSON_GetArraySize(exclude):0;
+    unsigned max_targets=16;
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    max_targets=8;
+#endif
+    if(target_count>(int)max_targets||exclude_count>HS_EXCLUSION_LIMIT||(!target_count&&required))return false;
+    *count=0;zero_job_exclusion_count=0;memset(scope,0,sizeof(*scope));
+    if(target_count) {
+        for(int i=0;i<target_count;i++) {
+            cJSON *item=cJSON_GetArrayItem(targets,i),*bssid=cJSON_GetObjectItemCaseSensitive(item,"bssid"),
+                  *channel=cJSON_GetObjectItemCaseSensitive(item,"channel"),*auth=cJSON_GetObjectItemCaseSensitive(item,"auth"),
+                  *ssid=cJSON_GetObjectItemCaseSensitive(item,"ssid_hex");
+            wifi_ap_record_t *ap=&out[i];size_t ssid_len=0;
+            if(!cJSON_IsObject(item)||!cJSON_IsString(bssid)||!cJSON_IsNumber(channel)||
+               !cJSON_IsNumber(auth)||auth->valuedouble<0||auth->valuedouble>255||
+               auth->valuedouble!=(double)(unsigned)auth->valuedouble||!zero_parse_mac(bssid->valuestring,ap->bssid)||
+               channel->valuedouble<1||channel->valuedouble>177||
+               channel->valuedouble!=(double)(unsigned)channel->valuedouble)return false;
+            ap->primary=(uint8_t)channel->valuedouble;
+            if((ap->primary>14&&ap->primary<36)||ap->primary>165)return false;
+            ap->authmode=(wifi_auth_mode_t)(unsigned)auth->valuedouble;
+            if(ssid && (!cJSON_IsString(ssid)||!zero_hex_bytes(ssid->valuestring,ap->ssid,32,&ssid_len)))return false;
+            ap->ssid[ssid_len]=0;
+            if(is_bssid_whitelisted(ap->bssid))return false;
+            for(int j=0;j<i;j++)if(!memcmp(ap->bssid,out[j].bssid,6))return false;
+            memcpy(scope->mac[i],ap->bssid,6);scope->channel[i]=ap->primary;
+        }
+        scope->count=target_count;*count=(unsigned)target_count;
+    }
+    if(exclude_count) {
+        for(int i=0;i<exclude_count;i++) {
+            cJSON *entry=cJSON_GetArrayItem(exclude,i);uint8_t mac[6];
+            if(!cJSON_IsString(entry)||!zero_parse_mac(entry->valuestring,mac))return false;
+            for(int j=0;j<i;j++)if(!memcmp(zero_job_exclusions[j],mac,6))return false;
+            for(int j=0;j<target_count;j++)if(!memcmp(out[j].bssid,mac,6))return false;
+            memcpy(zero_job_exclusions[i],mac,6);
+        }
+        zero_job_exclusion_count=(unsigned)exclude_count;
+        if(!target_count) {
+            scope->count=exclude_count;scope->exclude=true;
+            for(int i=0;i<exclude_count;i++)memcpy(scope->mac[i],zero_job_exclusions[i],6);
+        }
+    }
+    return true;
+}
+
+static const char *zero_job_option_string(const cJSON *request,const char *name) {
+    cJSON *options=cJSON_GetObjectItemCaseSensitive((cJSON *)request,"options");
+    cJSON *item=cJSON_GetObjectItemCaseSensitive(options,name);
+    return cJSON_IsString(item)?item->valuestring:NULL;
+}
+static char projectzero_job_operation_name[24];
+
+static void zero_job_restore_sta_after_partial_portal(void) {
+    if(portal_server) {
+        (void)httpd_stop(portal_server);
+        portal_server=NULL;
+    }
+    if(portalSSID) { free(portalSSID); portalSSID=NULL; }
+    portal_active=false;
+    darksword_active=false;
+    karma_mode_active=false;
+    rogueap_mode_active=false;
+    esp_netif_t *ap=esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if(ap) (void)esp_netif_dhcps_stop(ap);
+    bool reset_wifi=ap || ap_netif_handle || wifi_initialized || current_radio_mode==RADIO_MODE_WIFI;
+    if(reset_wifi) {
+        (void)esp_wifi_stop();
+        (void)esp_wifi_deinit();
+    }
+    if(ap) (void)esp_netif_destroy(ap);
+    ap_netif_handle=NULL;
+    if(reset_wifi) {
+        wifi_initialized=false;
+        current_radio_mode=RADIO_MODE_NONE;
+    }
+    if(!wifi_initialized || current_radio_mode==RADIO_MODE_NONE) (void)ensure_wifi_mode();
+}
+
+static int zero_job_start_operation(const cJSON *request,const char *token) {
+    (void)token;
+    cJSON *op_item=cJSON_GetObjectItemCaseSensitive((cJSON *)request,"op");
+    if(!cJSON_IsString(op_item))return 1;
+    const char *op=op_item->valuestring;
+    snprintf(projectzero_job_operation_name,sizeof(projectzero_job_operation_name),"%s",op);
+    bool targeted=!strcmp(op,"deauth")||!strcmp(op,"sae")||!strcmp(op,"evil_twin");
+    bool handshake=!strcmp(op,"handshake");
+    bool sniffer=!strcmp(op,"sniffer");
+    bool portal=!strcmp(op,"portal");
+    bool blackout=!strcmp(op,"blackout");
+    bool bt_track=!strcmp(op,"bt_track");
+    bool airtag=!strcmp(op,"airtag_scan");
+    if(!targeted&&!handshake&&!sniffer&&!portal&&!blackout&&!bt_track&&!airtag)return 1;
+    const char *requested_scope=zero_job_option_string(request,"scope");
+    bool scope_all=requested_scope&&!strcmp(requested_scope,"all");
+    wifi_ap_record_t parsed[16];unsigned target_count=0;hs_target_set scope;
+    if(!zero_parse_job_targets(request,parsed,&target_count,&scope,targeted))return 1;
+    if((targeted&&scope_all)||(handshake&&!scope_all&&!target_count))return 1;
+    if(handshake&&scope_all&&target_count)return 1;
+    if(blackout && ((scope_all&&target_count)||(!scope_all&&!target_count)))return 1;
+    if(!strcmp(op,"evil_twin") && target_count>1) {
+        for(unsigned i=1;i<target_count;i++)if(parsed[i].primary!=parsed[0].primary) {
+            sw_job_emit_lifecycle("error","error","\"message\":\"evil_twin_channel_mismatch\"");
+            return 1;
+        }
+    }
+    uint32_t resources=0;
+    if(targeted||blackout)resources|=ZERO_RES_TARGETS;
+    if(handshake)resources|=ZERO_RES_HANDSHAKE|ZERO_RES_TARGETS;
+    if(sniffer)resources|=ZERO_RES_SNIFFER;
+    if(portal)resources|=ZERO_RES_PORTAL;
+    if(bt_track||airtag)resources|=ZERO_RES_BLE;
+    if(zero_job_exclusion_count)resources|=ZERO_RES_TARGETS;
+    if(resources&&!job_resources_open(resources))return 1;
+    if(zero_job_exclusion_count) {
+        if(!whiteListedBssids || whitelistedBssidsCount<0 ||
+           zero_job_exclusion_count>(unsigned)(MAX_WHITELISTED_BSSIDS-whitelistedBssidsCount)) {
+            sw_job_emit_lifecycle("error","error","\"message\":\"exclusion_capacity_exceeded\"");
+            if(resources)job_resources_close();
+            return 1;
+        }
+        job_whitelist_restore_count=whitelistedBssidsCount;
+        for(unsigned i=0;i<zero_job_exclusion_count;i++)
+            memcpy(whiteListedBssids[whitelistedBssidsCount++].bssid,zero_job_exclusions[i],6);
+    }
+    if(target_count) {
+        memset(g_scan_results,0,sizeof(g_scan_results));memset(g_selected_indices,0,sizeof(g_selected_indices));
+        memcpy(g_scan_results,parsed,target_count*sizeof(parsed[0]));
+        g_scan_count=(uint16_t)target_count;g_selected_count=(int)target_count;
+        for(unsigned i=0;i<target_count;i++)g_selected_indices[i]=(int)i;
+        g_scan_done=true;g_scan_in_progress=false;
+    } else {g_selected_count=0;}
+    zero_job_blackout_selected=blackout&&!scope_all;
+    zero_job_blackout_target_count=zero_job_blackout_selected?target_count:0;
+    if(zero_job_blackout_selected)
+        memcpy(zero_job_blackout_targets,parsed,target_count*sizeof(parsed[0]));
+    char *args[3]={(char *)op,NULL,NULL};int rc=1;
+    if(!strcmp(op,"deauth"))rc=cmd_start_deauth(1,args);
+    else if(!strcmp(op,"sae")) {
+        if(target_count==1 && (parsed[0].authmode==WIFI_AUTH_WPA3_PSK || parsed[0].authmode==WIFI_AUTH_WPA2_WPA3_PSK))
+            rc=cmd_start_sae_overflow(1,args);
+    }
+    else if(!strcmp(op,"evil_twin"))rc=cmd_start_evil_twin(1,args);
+    else if(handshake) {
+        const char *storage=zero_job_option_string(request,"storage");
+        rc=start_handshake_scoped(!storage||strcmp(storage,"sd")!=0,&scope);
+    }
+    else if(sniffer)rc=cmd_start_sniffer(1,args);
+    else if(blackout)rc=cmd_start_blackout(1,args);
+    else if(portal) {
+        const char *ssid_hex=zero_job_option_string(request,"ssid_hex");uint8_t ssid[32];size_t n=0;
+        if(ssid_hex&&zero_hex_bytes(ssid_hex,ssid,sizeof(ssid),&n)&&n) {
+            char text[33];memcpy(text,ssid,n);text[n]=0;args[1]=text;
+            rc=cmd_start_portal(2,args);
+        }
+    }
+    else if(bt_track) {
+        const char *mac=zero_job_option_string(request,"mac");
+        if(mac) { args[1]=(char *)mac;rc=cmd_scan_bt(2,args); }
+    }
+    else if(airtag)rc=cmd_scan_airtag(1,args);
+    if(rc!=0) {
+        /* Some legacy handlers mutate Wi-Fi/AP state before they can fail. */
+        (void)stop_operations(false);
+        if(portal||!strcmp(op,"evil_twin")) zero_job_restore_sta_after_partial_portal();
+        if(resources)job_resources_close();
+        projectzero_job_operation_name[0]=0;
+    }
+    return rc;
+}
+
+static int zero_job_stop_operation(const char *token) {
+    if(!sw_job_owner_matches(token))return 1;
+    int rc=stop_operations(false);
+    if(rc==0) {
+        /* Publish the completed source-bound snapshot before releasing its tables. */
+        if(!strcmp(projectzero_job_operation_name,"sniffer")) (void)cmd_show_sniffer_results(1,NULL);
+        projectzero_job_operation_name[0]=0;
+        job_resources_close();
+    }
+    return rc;
+}
+
 #define VENDOR_RECORD_SIZE 64
 #define VENDOR_RECORD_NAME_BYTES (VENDOR_RECORD_SIZE - 4)
 #define MAX_VENDOR_NAME_LEN (VENDOR_RECORD_NAME_BYTES + 1)
@@ -2064,7 +2484,11 @@ static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void hs_sanitize_ssid(char *out, const uint8_t *in, size_t in_len,
                              size_t out_size);
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+static void handshake_cleanup(void) __attribute__((noinline));
+#else
 static void handshake_cleanup(void);
+#endif
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
 static const char *display_mode_to_str(display_type_t mode);
 static bool display_mode_from_str(const char *s, display_type_t *out_mode);
@@ -2188,7 +2612,7 @@ static bool is_bssid_whitelisted(const uint8_t *bssid);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void inject_sae_commit_frame();
-static void prepareAttack(const wifi_ap_record_t ap_record);
+static bool prepareAttack(const wifi_ap_record_t ap_record);
 static void update_spoofed_src_random(void);
 static int crypto_init(void);
 static int trng_random_callback(void *ctx, unsigned char *output, size_t len);
@@ -3698,6 +4122,7 @@ failed:
 
 static esp_err_t wifi_apply_extended_country(void)
 {
+    if(sw_job_owned())return ESP_OK;
     wifi_country_t wifi_country = {
         .cc = "PH",
         .schan = 1,
@@ -4189,6 +4614,10 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
     
     for (int i = 0; i < target_bssid_count; ++i) {
         if (!target_bssids[i].active) continue;
+
+        if(sw_job_owned() && !sw_job_channel_allowed(target_bssids[i].channel)) {
+            continue;
+        }
         
         if (!periodic_rescan_in_progress) {
             MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
@@ -5185,7 +5614,9 @@ static bool hs_scan_event(const char *token,const char *kind,const char *error,u
     char line[256];
     int n=snprintf(line,sizeof(line),"\nHST:{\"v\":1,\"kind\":\"%s\",\"scan\":\"%s\",\"count\":%u,\"error\":\"%s\"}\n",
         kind,token,count,error?error:"");
-    return n>0&&n<(int)sizeof(line)&&serial_output(line,(unsigned)n,250);
+    if(n<=0||n>=(int)sizeof(line)) return false;
+    if(projectzero_emit_legacy_serial_line(line)) return true;
+    return serial_output(line,(unsigned)n,250);
 }
 static bool hs_scan_done_event(const hs_scan_snapshot_t *snapshot) {
     char line[320];
@@ -5196,7 +5627,9 @@ static bool hs_scan_done_event(const hs_scan_snapshot_t *snapshot) {
         (unsigned long)snapshot->intel_packets,
         (unsigned)snapshot->intel_probes,
         (unsigned long)snapshot->intel_age_ms);
-    return n>0&&n<(int)sizeof(line)&&serial_output(line,(unsigned)n,250);
+    if(n<=0||n>=(int)sizeof(line)) return false;
+    if(projectzero_emit_legacy_serial_line(line)) return true;
+    return serial_output(line,(unsigned)n,250);
 }
 static void hs_scan_release_event_owner(void) {
     /* The scan-done handler has already consumed the SDK-owned AP list and
@@ -5237,7 +5670,7 @@ static void hs_scan_complete(bool success) {
         int64_t left_ms=(output_deadline-esp_timer_get_time())/1000;
         unsigned timeout=left_ms>250?250:left_ms>0?(unsigned)left_ms:0;
         if(operation_stop_requested||n<=0||n>=(int)sizeof(line)||!timeout||
-           !serial_output(line,(unsigned)n,timeout)) {
+           !(projectzero_emit_legacy_serial_line(line) || serial_output(line,(unsigned)n,timeout))) {
             hs_scan_pending=false;hs_scan_ready=false;
             hs_scan_release_event_owner();
             hs_scan_event(token,"scan_error","serial_output_failed",0);return;
@@ -5812,6 +6245,25 @@ static void blackout_attack_task(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+
+        if(sw_job_owned() && zero_job_blackout_selected) {
+            int retained=0;
+            for(int i=0;i<g_scan_count;i++) {
+                bool selected=false;
+                for(unsigned j=0;j<zero_job_blackout_target_count;j++)
+                    if(!memcmp(g_scan_results[i].bssid,zero_job_blackout_targets[j].bssid,6)) { selected=true;break; }
+                if(!selected || is_bssid_whitelisted(g_scan_results[i].bssid) ||
+                   !sw_job_channel_allowed(g_scan_results[i].primary))continue;
+                if(retained!=i)g_scan_results[retained]=g_scan_results[i];
+                retained++;
+            }
+            g_scan_count=(uint16_t)retained;
+            if(!retained) {
+                MY_LOG_INFO(TAG,"No requested blackout targets found on the configured channels.");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+        }
         
         MY_LOG_INFO(TAG, "Found %d networks, sorting by channel...", g_scan_count);
         
@@ -5970,10 +6422,12 @@ static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
 // ============================================================================
 
 static void ducb_init(void) {
-    ducb_channel_count = dual_band_channels_count;
+    uint8_t job_channels[40];
+    size_t job_channel_count=sw_job_copy_channels(job_channels,sizeof(job_channels));
+    ducb_channel_count = job_channel_count ? (int)job_channel_count : dual_band_channels_count;
     ducb_discounted_total = 0.0;
     for (int i = 0; i < ducb_channel_count; i++) {
-        ducb_channels[i].channel = dual_band_channels[i];
+        ducb_channels[i].channel = job_channel_count ? job_channels[i] : dual_band_channels[i];
         ducb_channels[i].discounted_reward = 0.0;
         ducb_channels[i].discounted_pulls = 0.0;
         ducb_channels[i].total_pulls = 0;
@@ -6830,7 +7284,7 @@ bool sw_radio_start(void) {
         esp_wifi_get_promiscuous_filter(&sw_saved_filter) != ESP_OK ||
         esp_wifi_get_mode(&sw_saved_mode) != ESP_OK) return false;
     sw_saved_radio = true;
-    if (sw_wifi_only_mode()) {
+    if (sw_wifi_only_mode() || sw_ble_only_mode()) {
         /* NULL mode has no STA/AP traffic: no probes, association or deauth.
          * The serial ownership gate keeps other radio commands out. */
         if (nimble_initialized) bt_stop_scan();
@@ -6848,13 +7302,15 @@ void sw_radio_hop(unsigned index) {
 }
 void sw_radio_stop(void) {
     if (!sw_saved_radio) return;
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_promiscuous_rx_cb(NULL);
+    bool restored=true;
+    if(esp_wifi_set_promiscuous(false)!=ESP_OK)restored=false;
+    if(esp_wifi_set_promiscuous_rx_cb(NULL)!=ESP_OK)restored=false;
     if (nimble_initialized) bt_stop_scan();
-    esp_wifi_set_promiscuous_filter(&sw_saved_filter);
-    esp_wifi_set_band_mode(sw_saved_band);
-    if (sw_wifi_only_mode()) esp_wifi_set_mode(sw_saved_mode);
+    if(esp_wifi_set_promiscuous_filter(&sw_saved_filter)!=ESP_OK)restored=false;
+    if(esp_wifi_set_band_mode(sw_saved_band)!=ESP_OK)restored=false;
+    if((sw_wifi_only_mode() || sw_ble_only_mode()) && esp_wifi_set_mode(sw_saved_mode)!=ESP_OK)restored=false;
     sw_saved_radio = false;
+    if(!restored && sw_job_owned())sw_job_emit_lifecycle("error","stopping","\"message\":\"radio_restore_failed\"");
 }
 
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
@@ -7196,7 +7652,11 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const uint8_t *ssid,
             hs_ap_targets[idx].ssid_len = (uint8_t)ssid_len;
             hs_sanitize_ssid(hs_ap_targets[idx].display_ssid, ssid, ssid_len,
                              sizeof(hs_ap_targets[idx].display_ssid));
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+            if(hs_exchange_state)hsx_set_ap_ssid(hs_exchange_state, bssid, ssid, ssid_len);
+#else
             hsx_set_ap_ssid(hs_exchange_state, bssid, ssid, ssid_len);
+#endif
         }
         hs_ap_targets[idx].channel = channel;
         hs_ap_targets[idx].rssi = rssi;
@@ -7284,7 +7744,12 @@ static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
     wifi_second_chan_t second_chan;
     esp_wifi_get_channel(&current_channel, &second_chan);
     if (current_channel != channel) {
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if(!sw_job_apply_channel(channel)) {
+            MY_LOG_INFO(TAG,"Job channel apply failed for HS target channel %u",channel);
+            sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+            operation_stop_requested=true;
+            return;
+        }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     
@@ -7369,6 +7834,12 @@ static hsx_entry_t *hs_complete_exchange(const uint8_t bssid[6]) {
 static hs_artifact_kind_t hs_build_ap_artifact(int ap_idx, bool allow_partial,
                                                 hsx_entry_t **exchange,
                                                 size_t *pcapng_size) {
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    (void)ap_idx;(void)allow_partial;
+    if(exchange)*exchange=NULL;
+    if(pcapng_size)*pcapng_size=0;
+    return HS_ARTIFACT_NONE;
+#else
     if (exchange) *exchange = NULL;
     if (pcapng_size) *pcapng_size = 0;
     if (ap_idx < 0 || ap_idx >= hs_ap_count || !hs_artifact_buffer ||
@@ -7390,6 +7861,7 @@ static hs_artifact_kind_t hs_build_ap_artifact(int ap_idx, bool allow_partial,
     if (entry) *exchange = entry;
     *pcapng_size = size;
     return kind;
+#endif
 }
 
 static bool hs_ensure_directory(const char *path) {
@@ -7528,6 +8000,14 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     if (len < 24 || len > HSX_FRAME_MAX || (frame[0] & 3) ||
         !hst_frame_allowed(&handshake_scope, frame, len)) goto done;
 
+    if(sw_job_owned() && zero_job_exclusion_count) {
+        unsigned frame_type=(frame[0]>>2)&3,ds=frame[1]&3;
+        const uint8_t *bssid=frame_type==0?frame+16:
+            (frame_type==2&&ds!=3)?frame+(ds==1?4:ds==2?10:16):NULL;
+        if(bssid)for(unsigned i=0;i<zero_job_exclusion_count;i++)
+            if(!memcmp(bssid,zero_job_exclusions[i],6))goto done;
+    }
+
     unsigned frame_type = (frame[0] >> 2) & 3;
     unsigned subtype = frame[0] >> 4;
     if (type == WIFI_PKT_MGMT && frame_type == 0) {
@@ -7571,6 +8051,28 @@ done:
 }
 
 static void hs_capture_append_for_progress(const hs_queued_frame_t *frame) {
+    if (sw_job_owned()) {
+        unsigned packet=++hs_job_packet_id;
+        int64_t capture_ms=(int64_t)frame->timestamp_us/1000;
+        int64_t now_ms=esp_timer_get_time()/1000;
+        int64_t age_ms=now_ms>=capture_ms?now_ms-capture_ms:0;
+        for (unsigned offset=0;offset<frame->len;offset+=240) {
+            unsigned count=frame->len-offset;
+            if (count>240) count=240;
+            char fields[620],hex[481];
+            static const char digits[]="0123456789abcdef";
+            for (unsigned i=0;i<count;i++) {
+                hex[i*2]=digits[frame->data[offset+i]>>4];
+                hex[i*2+1]=digits[frame->data[offset+i]&15];
+            }
+            hex[count*2]=0;
+            snprintf(fields,sizeof(fields),"\"packet\":%u,\"offset\":%u,\"total\":%u,\"channel\":%u,\"rssi\":%d,\"capture_ms\":%lld,\"age_ms\":%lld,\"data_hex\":\"%s\"",
+                packet,offset,frame->len,frame->channel,frame->rssi,
+                (long long)capture_ms,(long long)age_ms,hex);
+            sw_job_emit_data("hs_packet",fields);
+        }
+        return;
+    }
     pcap_serializer_append_frame_radio(frame->data, frame->len,
                                        frame->timestamp_us, frame->channel,
                                        frame->rssi);
@@ -7612,6 +8114,7 @@ static bool hs_parse_ap_context(const hs_queued_frame_t *frame,
     return *authmode != WIFI_AUTH_OPEN;
 }
 
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
 static void hs_copy_context(hsx_frame_t *dest,
                             const hs_queued_frame_t *source) {
     dest->len = source->len;
@@ -7620,8 +8123,9 @@ static void hs_copy_context(hsx_frame_t *dest,
     dest->rssi = source->rssi;
     memcpy(dest->data, source->data, source->len);
 }
+#endif
 
-static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
+static ZERO_STACK_NOINLINE void hs_process_queued_frame(const hs_queued_frame_t *frame) {
     if (!frame || frame->len < 24 || frame->len > HSX_FRAME_MAX) return;
     if (frame->kind == HS_FRAME_AP_CONTEXT) {
         uint8_t ssid[32], channel;
@@ -7635,11 +8139,20 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
                                          channel, authmode, frame->rssi);
         if (ap_idx < 0) return;
         hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
-        if (ssid_len) hsx_set_ap_ssid(hs_exchange_state, ap->bssid, ssid,
-                                      ssid_len);
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+        if (hs_exchange_state && ssid_len) hsx_set_ap_ssid(hs_exchange_state, ap->bssid, ssid,
+                                                            ssid_len);
+#else
+        if(ssid_len)hsx_set_ap_ssid(hs_exchange_state,ap->bssid,ssid,ssid_len);
+#endif
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
         if (!ap->beacon.len || (!old_ssid_len && ssid_len))
             hs_copy_context(&ap->beacon, frame);
         ap->beacon_captured = ap->beacon.len != 0;
+#else
+        (void)old_ssid_len;
+        ap->beacon_captured = true;
+#endif
         if (hs_complete_exchange(ap->bssid)) ap->complete = true;
         hs_capture_append_for_progress(frame);
         return;
@@ -7657,11 +8170,18 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
         if (ap->has_existing_file) return;
         bool pmkid = hsx_assoc_has_pmkid(frame->data, frame->len);
         hs_add_or_update_client(frame->data + 10, ap_idx, frame->rssi);
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
         if (!ap->association.len || (pmkid && !ap->association_has_pmkid)) {
             hs_copy_context(&ap->association, frame);
             ap->association_has_pmkid = pmkid;
             hs_capture_append_for_progress(frame);
         }
+#else
+        if(pmkid && !ap->association_has_pmkid) {
+            ap->association_has_pmkid=true;
+            hs_capture_append_for_progress(frame);
+        }
+#endif
         return;
     }
 
@@ -7674,8 +8194,10 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
                                          WIFI_AUTH_WPA2_PSK, frame->rssi);
         if (ap_idx < 0 || hs_ap_targets[ap_idx].has_existing_file) return;
         hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
         if (!ap->authentication.len)
             hs_copy_context(&ap->authentication, frame);
+#endif
         const uint8_t *sta = !memcmp(frame->data + 10, bssid, 6) ?
                              frame->data + 4 : frame->data + 10;
         hs_add_or_update_client(sta, ap_idx, frame->rssi);
@@ -7693,6 +8215,21 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
                                          WIFI_AUTH_WPA2_PSK, frame->rssi);
         if (ap_idx < 0 || hs_ap_targets[ap_idx].has_existing_file) return;
         hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+        int message=hs_capture_kind(frame->data,frame->len);
+        if(message<1||message>4)return;
+        const uint8_t *sta=ds==1?frame->data+10:frame->data+4;
+        hs_add_or_update_client(sta,ap_idx,frame->rssi);
+        hs_dwell_eapol_frames++;
+        if(message==1)ap->captured_m1=true;
+        else if(message==2)ap->captured_m2=true;
+        else if(message==3)ap->captured_m3=true;
+        else ap->captured_m4=true;
+        hs_capture_append_for_progress(frame);
+        MY_LOG_INFO(TAG,"[HS-SNIFF] EAPOL M%d captured for '%s' (%02X:%02X:%02X:%02X:%02X:%02X)",
+                    message,ap->display_ssid,ap->bssid[0],ap->bssid[1],ap->bssid[2],
+                    ap->bssid[3],ap->bssid[4],ap->bssid[5]);
+#else
         hsx_result_t result;
         if (!hsx_ingest_radio(hs_exchange_state, frame->data, frame->len,
                               frame->timestamp_us, frame->channel, frame->rssi,
@@ -7721,6 +8258,7 @@ static void hs_process_queued_frame(const hs_queued_frame_t *frame) {
             }
             ap->complete = true;
         }
+#endif
     }
 }
 
@@ -7891,7 +8429,9 @@ static void handshake_cleanup(void) {
     hsm_stop();
 
     if (handshake_serial_mode) {
-        handshake_dump_serial();
+        /* Managed jobs stream bounded raw frames to the host. Keep legacy
+         * artifact dumps for unmanaged console sessions on every board. */
+        if (!sw_job_owned()) handshake_dump_serial();
     } else if (!handshake_selected_mode) {
         for (int i = 0; i < hs_ap_count; i++) {
             hs_ap_target_t *ap = &hs_ap_targets[i];
@@ -7899,7 +8439,7 @@ static void handshake_cleanup(void) {
             if (hs_save_ap_to_sd(i, true)) {
                 if (ap->complete) {
                     ap->has_existing_file = true;
-                    hsx_remove_ap(hs_exchange_state, ap->bssid);
+                    if(hs_exchange_state)hsx_remove_ap(hs_exchange_state, ap->bssid);
                 } else {
                     ap->partial_saved = true;
                 }
@@ -7921,7 +8461,7 @@ static void handshake_cleanup(void) {
     hs_dwell_eapol_frames = 0;
     if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
     if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
-    hsx_reset(hs_exchange_state);
+    if(hs_exchange_state)hsx_reset(hs_exchange_state);
     
     // Restore idle LED
     esp_err_t led_err = led_set_idle();
@@ -8117,7 +8657,9 @@ static void handshake_attack_task_sniffer(void) {
     MY_LOG_INFO(TAG, "Promiscuous sniffer with D-UCB channel selection");
     MY_LOG_INFO(TAG, "Targeted deauth on discovered clients");
     MY_LOG_INFO(TAG, "Channels: %d (2.4GHz + 5GHz)", dual_band_channels_count);
-    MY_LOG_INFO(TAG, "D-UCB gamma=%.3f, c=%.1f, dwell=%dms", DUCB_GAMMA, DUCB_C, HS_DWELL_TIME_MS);
+    unsigned job_dwell=sw_job_dwell_ms();
+    unsigned dwell_ms=sw_job_owned()?job_dwell:HS_DWELL_TIME_MS;
+    MY_LOG_INFO(TAG, "D-UCB gamma=%.3f, c=%.1f, dwell=%ums", DUCB_GAMMA, DUCB_C, dwell_ms);
     
     // 1. Initialize D-UCB
     ducb_init();
@@ -8134,7 +8676,7 @@ static void handshake_attack_task_sniffer(void) {
     hs_client_count = 0;
     memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
     memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
-    hsx_reset(hs_exchange_state);
+    if(hs_exchange_state)hsx_reset(hs_exchange_state);
     
     // 3. Initialize the task-owned telemetry serializer and bounded queues.
     if (!pcap_serializer_init() || !hs_capture_open()) {
@@ -8178,7 +8720,11 @@ static void handshake_attack_task_sniffer(void) {
         int channel = ducb_channels[ch_idx].channel;
         
         // Switch channel
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if(!sw_job_apply_channel((uint8_t)channel)) {
+            MY_LOG_INFO(TAG,"Job D-UCB channel apply failed for channel %d",channel);
+            sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+            break;
+        }
         
         {
             char hss_l2[64], hss_l3[64], hss_l4[64];
@@ -8195,7 +8741,7 @@ static void handshake_attack_task_sniffer(void) {
         // Dwell while continuously draining the callback pool. This keeps a
         // beacon burst from delaying EAPOL processing or exhausting the pool.
         for (unsigned waited = 0;
-             waited < HS_DWELL_TIME_MS && handshake_attack_active &&
+             waited < dwell_ms && handshake_attack_active &&
              !operation_stop_requested; waited += 10) {
             vTaskDelay(pdMS_TO_TICKS(10));
             hs_capture_drain();
@@ -8288,7 +8834,7 @@ static void handshake_attack_task_sniffer(void) {
                     (full_exchange || grace_elapsed) &&
                     hs_save_handshake_to_sd(i)) {
                     ap->has_existing_file = true;
-                    hsx_remove_ap(hs_exchange_state, ap->bssid);
+                    if(hs_exchange_state)hsx_remove_ap(hs_exchange_state, ap->bssid);
                     MY_LOG_INFO(TAG, "Handshake #%d captured and saved.",
                                 total_handshakes_captured);
                 }
@@ -8609,10 +9155,12 @@ static int cmd_start_handshake_serial(int argc,char **argv) {
 static int hs_scope_error(const char *storage,const char *error) {
     char line[256];
     int n=snprintf(line,sizeof(line),"\nHST:{\"v\":1,\"kind\":\"capture_error\",\"storage\":\"%s\",\"error\":\"%s\"}\n",storage,error);
-    if(n>0&&n<sizeof(line))serial_output(line,n,1000);
+    if(n>0&&n<sizeof(line)) {
+        if(!projectzero_emit_legacy_serial_line(line)) serial_output(line,n,1000);
+    }
     return 1;
 }
-static int cmd_handshake_scope(int argc,char **argv) {
+static ZERO_STACK_NOINLINE int cmd_handshake_scope(int argc,char **argv) {
     if(argc<3||(strcmp(argv[1],"sd")&&strcmp(argv[1],"serial")))return 1;
     bool serial_storage=!strcmp(argv[1],"serial");
     hs_target_set targets={0};
@@ -12603,6 +13151,12 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
     return why != NULL;
 }
 
+/* Read-only admission probe used by managed C5 jobs and device_info. */
+static bool serial_job_radio_busy_probe(void)
+{
+    return zig_recon_radio_busy(NULL, 0) || zig_recon_is_active();
+}
+
 static bool zig_recon_parse_u16(const char *text, uint16_t *out)
 {
     if (!text || !out || *text == '\0') {
@@ -13302,7 +13856,9 @@ static bool wifi_lookup_eviltwin_password(const char *ssid, char *out, size_t ou
         if (csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) &&
             csv_get_quoted_field(line, 1, saved_pass, sizeof(saved_pass)) &&
             strcmp(saved_ssid, ssid) == 0 && saved_pass[0] != '\0') {
-            snprintf(out, out_sz, "%s", saved_pass);
+            size_t pass_len = strnlen(saved_pass, sizeof(saved_pass));
+            if (!out_sz || pass_len >= out_sz || pass_len > 64) continue;
+            memcpy(out, saved_pass, pass_len + 1);
             found = true;
         }
     }
@@ -15816,7 +16372,7 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     }
     
     // Check if scan was previously performed
-    if (!g_scan_done || g_scan_count == 0) {
+    if ((!g_scan_done || g_scan_count == 0) && !sw_job_owned()) {
         MY_LOG_INFO(TAG, "Please scan_networks first.");
         return 1;
     }
@@ -15846,9 +16402,24 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     
     // Initialize dual-band channel hopping
     sniffer_channel_index = 0;
-    sniffer_current_channel = dual_band_channels[sniffer_channel_index];
+    if(sw_job_owned()) {
+        uint8_t applied=0;
+        if(!sw_job_radio_hop(0,&applied)) {
+            MY_LOG_INFO(TAG,"Job sniffer channel apply failed");
+            sniffer_active=false;
+            return 1;
+        }
+        sniffer_current_channel=applied;
+        sniffer_channel_index=1;
+    } else {
+        sniffer_current_channel = dual_band_channels[sniffer_channel_index];
+        if(esp_wifi_set_channel(sniffer_current_channel,WIFI_SECOND_CHAN_NONE)!=ESP_OK) {
+            MY_LOG_INFO(TAG,"Sniffer initial channel apply failed");
+            sniffer_active=false;
+            return 1;
+        }
+    }
     sniffer_last_channel_hop = esp_timer_get_time() / 1000;
-    esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
     
     // Start channel hopping task
     if (sniffer_channel_task_handle == NULL) {
@@ -15918,13 +16489,20 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         displayed_count++;
         
         // Print AP info in compact format: SSID, CH: CLIENT_COUNT
-        printf("%s, CH%d: %d\n", ap->ssid, ap->channel, ap->client_count);
+        if(sw_job_owned()) {
+            char line[128];snprintf(line,sizeof(line),"SNIFF:%s, CH%d: %d",ap->ssid,ap->channel,ap->client_count);
+            sw_job_emit_legacy_line(line);
+        } else printf("%s, CH%d: %d\n", ap->ssid, ap->channel, ap->client_count);
         
         // Print each client MAC on a separate line with 1 space indentation
         if (ap->client_count > 0) {
             for (int j = 0; j < ap->client_count; j++) {
                 sniffer_client_t *client = &ap->clients[j];
-                printf(" %02X:%02X:%02X:%02X:%02X:%02X\n",
+                if(sw_job_owned()) {
+                    char line[40];snprintf(line,sizeof(line),"SNIFF: %02X:%02X:%02X:%02X:%02X:%02X",
+                       client->mac[0],client->mac[1],client->mac[2],client->mac[3],client->mac[4],client->mac[5]);
+                    sw_job_emit_legacy_line(line);
+                } else printf(" %02X:%02X:%02X:%02X:%02X:%02X\n",
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5]);
             }
@@ -16038,7 +16616,7 @@ static int cmd_show_sniffer_intel(int argc, char **argv) {
         (unsigned long)packet_total, ap_total, probe_total,
         (unsigned long)age_ms);
     if (n <= 0 || n >= (int)sizeof(line) ||
-        !serial_output(line, (unsigned)n, 250)) return 1;
+        !(projectzero_emit_legacy_serial_line(line) || serial_output(line, (unsigned)n, 250))) return 1;
 
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < ap_total; i++) {
@@ -16058,7 +16636,7 @@ static int cmd_show_sniffer_intel(int argc, char **argv) {
             ap->channel, ap->client_count, (unsigned long)ap->packet_count,
             sniffer_probe_count_for_ssid((const uint8_t *)ap->ssid));
         if (n <= 0 || n >= (int)sizeof(line) ||
-            !serial_output(line, (unsigned)n, 250)) return 1;
+            !(projectzero_emit_legacy_serial_line(line) || serial_output(line, (unsigned)n, 250))) return 1;
     }
 
     for (int i = 0; i < probe_total; i++) {
@@ -16077,14 +16655,14 @@ static int cmd_show_sniffer_intel(int argc, char **argv) {
             probe->mac[3], probe->mac[4], probe->mac[5], ssid_hex,
             probe->rssi);
         if (n <= 0 || n >= (int)sizeof(line) ||
-            !serial_output(line, (unsigned)n, 250)) return 1;
+            !(projectzero_emit_legacy_serial_line(line) || serial_output(line, (unsigned)n, 250))) return 1;
     }
 
     n = snprintf(line, sizeof(line),
         "\nSNIFF:{\"v\":1,\"kind\":\"done\",\"session\":\"%s\",\"aps\":%d,\"probes\":%d}\n",
         argv[1], ap_total, probe_total);
     return n > 0 && n < (int)sizeof(line) &&
-           serial_output(line, (unsigned)n, 250) ? 0 : 1;
+           (projectzero_emit_legacy_serial_line(line) || serial_output(line, (unsigned)n, 250)) ? 0 : 1;
 }
 
 static int cmd_clear_sniffer_results(int argc, char **argv) {
@@ -19478,6 +20056,17 @@ static int cmd_start_darksword(int argc, char **argv) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
+    uint8_t portal_channel = 1;
+    if (sw_job_owned()) {
+        uint8_t channels[40];
+        size_t channel_count = sw_job_copy_channels(channels, sizeof(channels));
+        /* Reject an unusable managed channel plan before changing WiFi mode. */
+        if (!channel_count || !sw_job_channel_allowed(channels[0])) {
+            sw_job_emit_lifecycle("error", "error", "\"message\":\"portal_channel_unavailable\"");
+            return 1;
+        }
+        portal_channel = channels[0];
+    }
     oled_display_update_full("> Captive Portal",
         argc >= 2 ? argv[1] : "  No SSID",
         "  Password trap", "  Waiting...");
@@ -19535,6 +20124,10 @@ static int cmd_start_portal(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Failed to enable AP mode");
         return 1;
     }
+    if (sw_job_owned() && !sw_job_apply_channel(portal_channel)) {
+        sw_job_emit_lifecycle("error", "stopping", "\"message\":\"portal_channel_apply_failed\"");
+        return 1;
+    }
     
     // Stop DHCP server to configure custom IP
     esp_netif_dhcps_stop(ap_netif);
@@ -19556,7 +20149,7 @@ static int cmd_start_portal(int argc, char **argv) {
     wifi_config_t ap_config = {0};
     memcpy(ap_config.ap.ssid, ssid, ssid_len);
     ap_config.ap.ssid_len = ssid_len;
-    ap_config.ap.channel = 1;
+    ap_config.ap.channel = portal_channel;
     ap_config.ap.password[0] = '\0';
     ap_config.ap.max_connection = 4;
     ap_config.ap.authmode = WIFI_AUTH_OPEN;
@@ -21610,6 +22203,16 @@ static void register_commands(void)
     ESP_ERROR_CHECK(sw_register_command(&set_antisurv_sens_cmd));
 
     sw_register();
+    sw_register_radio_busy_probe(serial_job_radio_busy_probe);
+    (void)sw_register_job_operation_ex("handshake",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("deauth",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("sae",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("blackout",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("evil_twin",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("portal",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("sniffer",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("bt_track",zero_job_start_operation,zero_job_stop_operation);
+    (void)sw_register_job_operation_ex("airtag_scan",zero_job_start_operation,zero_job_stop_operation);
     uota_register(usb_ota_prepare, safe_restart);
 
     const esp_console_cmd_t wardrive_promisc_cmd = {
@@ -22076,6 +22679,35 @@ static void register_commands(void)
 
 void app_main(void) {
 
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    /* This board has neither PSRAM nor the legacy OLED/SD/GPS peripherals.
+     * Start only NVS, command registration and native USB console. The normal
+     * WROOM/XIAO initialization path below remains byte-for-byte in effect. */
+    printf("\n\n=== APP_MAIN START (Waveshare C5 Zero, v" JANOS_VERSION ") ===\n");
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+    /* Waveshare C5 Zero RF switch: LOW selects its onboard antenna. */
+    ESP_ERROR_CHECK(gpio_reset_pin(GPIO_NUM_26));
+    ESP_ERROR_CHECK(gpio_set_direction(GPIO_NUM_26, GPIO_MODE_OUTPUT));
+    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_26, 0));
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ota_load_channel_from_nvs();
+    ota_mark_valid_if_pending();
+    register_commands();
+    esp_console_register_help_command();
+
+    esp_console_repl_t *zero_repl = NULL;
+    esp_console_repl_config_t zero_repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    zero_repl_config.task_stack_size = 6144;
+    zero_repl_config.prompt = ">";
+    zero_repl_config.max_cmdline_length = 8192;
+    esp_console_dev_usb_serial_jtag_config_t zero_usb_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&zero_usb_config, &zero_repl_config, &zero_repl));
+    linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
+    ESP_ERROR_CHECK(esp_console_start_repl(zero_repl));
+    printf("BOARD READY: waveshare-zero; legacy display, SD and GPS startup skipped\\n");
+    return;
+#endif
+
 
     // printf("Heap regions:\n");
     // printf("  DRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_8BIT) / 1024));
@@ -22392,7 +23024,12 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         // If no clients connected or not evil twin mode, do normal channel hopping
         if (portal_connected_clients == 0 || applicationState != DEAUTH_EVIL_TWIN) {
             vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
-            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
+            if(!sw_job_apply_channel(target_bssids[i].channel)) {
+                MY_LOG_INFO(TAG,"Job deauth channel apply failed: %u",target_bssids[i].channel);
+                sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+                operation_stop_requested=true;
+                return;
+            }
             vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
         }
 
@@ -22422,7 +23059,12 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         // This ensures we're on the correct channel when clients try to connect to the portal
         if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
             uint8_t first_network_channel = target_bssids[0].channel;
-            esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
+            if(!sw_job_apply_channel(first_network_channel)) {
+                MY_LOG_INFO(TAG,"Job portal channel restore failed: %u",first_network_channel);
+                sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+                operation_stop_requested=true;
+                return;
+            }
         }
     }
     
@@ -22502,7 +23144,10 @@ static void sae_attack_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "SAE overflow task started.");
     
-    prepareAttack(*ap_record);
+    if(!prepareAttack(*ap_record)) {
+        sae_attack_active=false;sae_attack_task_handle=NULL;
+        free(ap_record);vTaskDelete(NULL);return;
+    }
     int frame_count_check = 0;
     
     while (sae_attack_active) {
@@ -22672,9 +23317,12 @@ void inject_sae_commit_frame() {
 }
 
 
-void prepareAttack(const wifi_ap_record_t ap_record) {
-
-    esp_wifi_set_channel(ap_record.primary, WIFI_SECOND_CHAN_NONE );
+bool prepareAttack(const wifi_ap_record_t ap_record) {
+    if(!sw_job_apply_channel(ap_record.primary)) {
+        MY_LOG_INFO(TAG,"Job SAE channel apply failed: %u",ap_record.primary);
+        sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+        return false;
+    }
 
     //globalDataCount = 1;
     //globalData[0] = strdup((char *)ap_record.ssid);
@@ -22683,14 +23331,14 @@ void prepareAttack(const wifi_ap_record_t ap_record) {
     next_src = 0;
     if (crypto_init() != 0) {
         ESP_LOGE(TAG, "Crypto initialization failed");
-        return;
+        return false;
     }
 
     //Enable promiscuous mode in order to listen to SAE Commit frames
     ESP_LOGI(TAG, "Enabling promiscuous mode for SAE Commit frames");
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_callback_v1);
     esp_wifi_set_promiscuous(true);
-
+    return true;
 }
 
 void wifi_sniffer_callback_v1(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -22896,6 +23544,7 @@ static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi) 
                        ap->ssid, rssi, ap->client_count);
         }
     } else {
+        sw_job_note_saturation();
         if (sniff_debug) {
             MY_LOG_INFO(TAG, "[DEBUG] add_client_to_ap: Cannot add client - AP %s is full (%d/%d clients)", 
                        ap->ssid, ap->client_count, MAX_CLIENTS_PER_AP);
@@ -23086,6 +23735,15 @@ static void sniffer_channel_hop(void) {
         if (sniffer_channel_index >= sniffer_selected_channels_count) {
             sniffer_channel_index = 0;
         }
+    } else if (sw_job_owned()) {
+        uint8_t applied = 0;
+        if (!sw_job_radio_hop((unsigned)sniffer_channel_index, &applied)) {
+            MY_LOG_INFO(TAG, "Job radio channel application failed at hop %d", sniffer_channel_index);
+            sw_job_emit_lifecycle("error", "running", "\"message\":\"channel_apply_failed\"");
+            return;
+        }
+        sniffer_current_channel = applied;
+        sniffer_channel_index++;
     } else {
         // Use dual-band channel hopping (like Marauder)
         sniffer_current_channel = dual_band_channels[sniffer_channel_index];
@@ -23096,7 +23754,10 @@ static void sniffer_channel_hop(void) {
         }
     }
     
-    esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+    if (!sw_job_owned() && esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Sniffer channel apply failed: %d", sniffer_current_channel);
+        return;
+    }
     sniffer_last_channel_hop = esp_timer_get_time() / 1000;
     
     // Optional: Log channel changes with band info (debug mode)
@@ -23119,7 +23780,8 @@ static void sniffer_channel_task(void *pvParameters) {
         
         // Force channel hop if 250ms passed
         int64_t current_time = esp_timer_get_time() / 1000;
-        bool time_expired = (current_time - sniffer_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        unsigned hop_delay_ms = sw_job_owned() ? sw_job_dwell_ms() : (unsigned)sniffer_channel_hop_delay_ms;
+        bool time_expired = (current_time - sniffer_last_channel_hop >= hop_delay_ms);
         
         if (time_expired) {
             sniffer_channel_hop();
@@ -23511,6 +24173,8 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 // Frame body starts with fixed parameters, then tagged parameters
                 // SSID is usually the first tagged parameter (Tag Number = 0)
                 
+                if (len > 24 && probe_request_count >= MAX_PROBE_REQUESTS)
+                    sw_job_note_saturation();
                 if (len > 24 && probe_request_count < MAX_PROBE_REQUESTS) {
                     const uint8_t *body = frame + 24; // Skip MAC header
                     int body_len = len - 24;
@@ -23607,6 +24271,8 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                                    sniffer_packet_counter, sniffer_aps[ap_index].ssid);
                     }
                 }
+                if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count >= MAX_SNIFFER_APS)
+                    sw_job_note_saturation();
                 
                 if (ap_index >= 0) {
                     sniffer_aps[ap_index].packet_count++;
@@ -23722,6 +24388,8 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                            ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
             }
         }
+        if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count >= MAX_SNIFFER_APS)
+            sw_job_note_saturation();
         
         if (ap_index >= 0) {
             sniffer_aps[ap_index].packet_count++;

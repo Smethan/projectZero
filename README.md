@@ -13,12 +13,13 @@ the uConsole host application.
 
 ### What this fork adds
 - **All Wardrive** — host-owned Wi-Fi/BLE scanning over serial without ESP GPS/SD.
+- **Multi-device C5 jobs** — firmware 1.8.0 advertises `c5_jobs_v1` for identity-bound, leased jobs across supported ESP32-C5 boards; see the [host operation guide](https://github.com/Smethan/WatchDogsGo/blob/v0.10.0/docs/MULTI_C5.md).
 - **Passive HS Sniff** — EAPOL/PMKID packets streamed to WDG without deauth or SD.
 - **Optional active HS targets** — `hs_scan` plus `start_handshake_scope` limits
   either SD or serial capture to as many as 16 explicit BSSIDs while retaining
   the original all-nearby mode, and `all-except` protects up to 32 host
   whitelisted BSSIDs from capture and deauthentication.
-- **Fork updates** — versioned XIAO/standard release packages and matching onboard OTA.
+- **Fork updates** — versioned XIAO, WROOM, and Waveshare Zero release packages with board-checked geometry; onboard USB OTA remains available only on XIAO/WROOM.
 - **Handshake capture without SD card** — radiotap PCAPNG/HCCAPX streamed as base64 over serial and saved on the host machine
 - **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
 - **SSID with spaces** in `start_portal` command
@@ -26,6 +27,7 @@ the uConsole host application.
 
 projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog, wardriving, and captive portal tools on top of ESP32-C5 dual-band (2.4/5 GHz) radios—and is the first to ship working WPA handshake capture on ESP32-C5 using ESP-IDF.
 - **ESP32-C5-WROOM-1** (USB CLI) scans, runs the embedded evil-twin portal, captures credentials, and verifies WPA2/WPA3 passwords—everything lives on the same board now.
+- **XIAO ESP32-C5** and **Waveshare ESP32-C5-Zero** are packaged as board-specific profiles; Zero uses a 4 MiB single-app layout and ROM updates only.
 - **Flipper Zero companion app** mirrors the CLI features and keeps the handheld navigation lightweight.
 - **LAB C5 board** is available on Tindie: https://www.tindie.com/products/lab/lab-esp32c5-flipper-zero-marauder/
 
@@ -146,10 +148,16 @@ In these filenames, `<version>` is the numeric release version without the leadi
   `projectZerobyLOCOSP.bin` application.
 - **XIAO ESP32-C5:** `projectZerobyLOCOSP-xiao-<version>.zip`, containing the
   `projectZerobyLOCOSP-xiao.bin` application.
+- **Waveshare ESP32-C5-Zero:** `projectZerobyLOCOSP-waveshare-zero-<version>.zip`,
+  containing `projectZerobyLOCOSP-waveshare-zero.bin`; use ROM download mode for
+  updates because this profile has no USB OTA slot.
 
 Each ZIP also contains `bootloader.bin`, `partition-table.bin`,
 `ota_data_initial.bin`, and a `manifest.json` with the board, offsets, sizes, and
-file hashes. The release's `SHA256SUMS` covers both ZIPs.
+file hashes and generated board geometry. The release's `SHA256SUMS` covers the
+board ZIPs. See [the C5 job protocol](docs/SERIAL_WARDRIVE_PROTOCOL.md#multi-device-job-protocol-c5_jobs_v1-firmware-180)
+and [hardware acceptance record](docs/HARDWARE_ACCEPTANCE_MULTI_C5.md) for the
+multi-device interface and physical validation state.
 
 ### Method 1: esptool (recommended manual method)
 
@@ -172,6 +180,11 @@ file hashes. The release's `SHA256SUMS` covers both ZIPs.
    python -m esptool --chip esp32c5 --port /dev/ttyACM0 --baud 460800 write-flash --flash-mode dio --flash-freq 80m 0x2000 bootloader.bin 0x8000 partition-table.bin 0xf000 ota_data_initial.bin 0x20000 projectZerobyLOCOSP-xiao.bin
    ```
 
+   Waveshare ESP32-C5-Zero:
+   ```bash
+   python -m esptool --chip esp32c5 --port /dev/ttyACM0 --baud 460800 write-flash --flash-mode dio --flash-freq 80m 0x2000 bootloader.bin 0x8000 partition-table.bin 0xf000 ota_data_initial.bin 0x20000 projectZerobyLOCOSP-waveshare-zero.bin
+   ```
+
    On Windows, use the board's COM port, such as `COM10`, in place of the
    `/dev/ttyUSB0` or `/dev/ttyACM0` example.
 5. The board reboots automatically after flashing.
@@ -180,7 +193,7 @@ file hashes. The release's `SHA256SUMS` covers both ZIPs.
 
 No installation needed — works in Chrome/Edge with WebSerial support.
 
-1. Download and unzip the correct WROOM or XIAO archive from the
+1. Download and unzip the correct WROOM, XIAO, or Zero archive from the
    [latest Smethan/projectZero release](https://github.com/Smethan/projectZero/releases/latest).
 2. Open [Espressif Web Flasher](https://espressif.github.io/esptool-js/) in your browser.
 3. Put the ESP32-C5 into download mode (hold **BOOT** + plug USB).
@@ -191,7 +204,7 @@ No installation needed — works in Chrome/Edge with WebSerial support.
    | `bootloader.bin` | `0x2000` |
    | `partition-table.bin` | `0x8000` |
    | `ota_data_initial.bin` | `0xf000` |
-   | `projectZerobyLOCOSP.bin` (WROOM) or `projectZerobyLOCOSP-xiao.bin` (XIAO) | `0x20000` |
+   | `projectZerobyLOCOSP.bin` (WROOM), `projectZerobyLOCOSP-xiao.bin` (XIAO), or `projectZerobyLOCOSP-waveshare-zero.bin` (Zero) | `0x20000` |
 6. Click **Program** and wait for it to finish.
 7. After flashing, copy `oui_wifi.bin` to the SD card at `/lab/oui_wifi.bin` (optional, for vendor name lookups).
 

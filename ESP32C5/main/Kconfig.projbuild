@@ -1,0 +1,10 @@
+menu "projectZero board profile"
+
+config PROJECTZERO_BOARD_WAVESHARE_ZERO
+    bool "Waveshare ESP32-C5 Zero board profile"
+    default n
+    help
+        Build the 4 MiB, no-PSRAM, native USB-Serial/JTAG Waveshare C5 Zero.
+        This profile skips the legacy display, SD, GPS and PSRAM startup path.
+
+endmenu

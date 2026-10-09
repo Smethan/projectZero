@@ -26,16 +26,19 @@ jobs:
         run: |
           bash tests/serial_wardrive/run.sh
           python3 scripts/package_release.py --check-version
-      - name: Build both board variants
+      - name: Build all board variants
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          for board in wroom xiao; do
+          for board in wroom xiao waveshare-zero; do
             build_source="$RUNNER_TEMP/firmware-$board"
             cp -a ESP32C5 "$build_source"
             if [ "$board" = xiao ]; then
               cat "$build_source/sdkconfig.xiao" >> "$build_source/sdkconfig"
+            fi
+            if [ "$board" = waveshare-zero ]; then
+              cat "$build_source/sdkconfig.waveshare-zero" >> "$build_source/sdkconfig"
             fi
             docker run --rm -v "$build_source:/project" -v "$PWD/tests:/tests:ro" -w /project "$IDF_IMAGE" \
               bash -c 'set -e; cmake -P tools/patch_idf_linenoise_machine.cmake; python /tests/serial_wardrive/test_linenoise_machine.py "$IDF_PATH/components/console/linenoise/linenoise.c"; idf.py --preview -DCMAKE_C_FLAGS=-fstack-usage build size' 2>&1 | tee "dist/build-$board.log"

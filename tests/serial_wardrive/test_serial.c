@@ -27,11 +27,70 @@ static void beacon(unsigned subtype,unsigned length){
     p.payload[pos]=0;p.payload[pos+1]=3;memcpy(p.payload+pos+2,"a\"b",3);
     wifi_cb(&p,WIFI_PKT_MGMT);
 }
+static void rsn_beacon(const uint8_t akms[][4],unsigned count){
+    wifi_promiscuous_pkt_t p={.rx_ctrl={.channel=6,.rssi=-55}};
+    p.payload[0]=0x80;p.payload[34]=0x10;
+    uint8_t addr[]={0xb4,0x1e,0x52,0,0,1};memcpy(p.payload+10,addr,6);memcpy(p.payload+16,addr,6);
+    unsigned pos=36;p.payload[pos++]=0;p.payload[pos++]=3;memcpy(p.payload+pos,"abc",3);pos+=3;
+    p.payload[pos++]=48;p.payload[pos++]=(uint8_t)(14+4*count);
+    p.payload[pos++]=1;p.payload[pos++]=0; /* RSN version */
+    uint8_t group[]={0,0x0f,0xac,4};memcpy(p.payload+pos,group,4);pos+=4;
+    p.payload[pos++]=1;p.payload[pos++]=0;memcpy(p.payload+pos,group,4);pos+=4;
+    p.payload[pos++]=(uint8_t)count;p.payload[pos++]=0;
+    for(unsigned i=0;i<count;i++){memcpy(p.payload+pos,akms[i],4);pos+=4;}
+    p.rx_ctrl.sig_len=(uint16_t)(pos+4);wifi_cb(&p,WIFI_PKT_MGMT);
+}
 int main(void){
+    char decoded_job[4097];size_t decoded_len=0;
+    assert(decode_job_json("eyJ4IjoyfQ",decoded_job,sizeof(decoded_job),&decoded_len));
+    assert(decoded_len==7 && !strcmp(decoded_job,"{\"x\":2}"));
+    assert(!decode_job_json("A",decoded_job,sizeof(decoded_job),&decoded_len));
+    char too_large_job[5464];memset(too_large_job,'A',5463);too_large_job[5463]=0;
+    assert(!decode_job_json(too_large_job,decoded_job,sizeof(decoded_job),&decoded_len));
+    output_capture[0]=0;
+    assert(device_info(1,NULL)==0);
+    assert(strstr(output_capture,"\"kind\":\"device_info\"") &&
+           strstr(output_capture,"\"capabilities\":{\"c5_jobs_v1\":true}") &&
+           strstr(output_capture,"\"board\":\"xiao\"") &&
+           strstr(output_capture,"\"updates\":[\"usb-ota\",\"rom\"]") &&
+           strstr(output_capture,"\"operation_limits\"") && strlen(output_capture)<1024);
+    test_country=(wifi_country_t){.cc={'U','S',0},.schan=1,.nchan=11};
+    test_country_available=true;
+    assert(valid_channel(11) && !valid_channel(12) && !valid_channel(14));
+    output_capture[0]=0;assert(device_info(1,NULL)==0);
+    assert(strstr(output_capture,"\"channels\":[1,2,3,4,5,6,7,8,9,10,11,36") &&
+           !strstr(output_capture,"\"channels\":[1,2,3,4,5,6,7,8,9,10,11,12"));
+    test_country_available=false;
+    output_capture[0]=0;int job_prepare_count=prepare_calls;
+    char *invalid_job[]={"job_start","invalid-token","!"};
+    assert(job_start(3,invalid_job)==1 && prepare_calls==job_prepare_count && !sw_active());
+    assert(strstr(output_capture,"\"v\":3") && strstr(output_capture,"\"message\":\"invalid_payload\""));
+    job_mode=true;memcpy(device_id,"aabbccddeeff",13);memcpy(boot_id,"0123456789abcdef",17);
+    snprintf(job_token,sizeof(job_token),"wire-fixture");output_capture[0]=0;
+    sw_job_emit_data("wifi","\"batch\":0,\"mac\":\"AA:BB:CC:DD:EE:FF\"");
+    assert(strstr(output_capture,"\"v\":3")&&strstr(output_capture,"\"device_id\":\"aabbccddeeff\""));
+    assert(strstr(output_capture,"\"boot_id\":\"0123456789abcdef\"")&&strstr(output_capture,"\"kind\":\"wifi\""));
+    assert(!strstr(output_capture,"job:data")&&!strstr(output_capture,"data_kind"));
+    output_capture[0]=0;sw_job_emit_lifecycle("heartbeat","running","");
+    assert(strstr(output_capture,"\"kind\":\"heartbeat\"")&&strstr(output_capture,"\"batch\":0")&&strstr(output_capture,"\"wifi_count\":0")&&strstr(output_capture,"\"ble_count\":0")&&strstr(output_capture,"\"drops\":0")&&strstr(output_capture,"\"losses\":{\"queue\":0,\"age\":0,\"output\":0,\"saturation\":0}"));
+    output_capture[0]=0;sw_job_emit_legacy_line("HST:{\"kind\":\"scan_done\"}");
+    assert(strstr(output_capture,"\"kind\":\"legacy\"")&&strstr(output_capture,"HST:{\\\"kind\\\":\\\"scan_done\\\"}"));
+    job_mode=false;
+
     fresh();atomic_store(&collecting,true);
     beacon(8,45);observation o;assert(xQueueReceive(queue,&o,0));emit(&o);
     assert(strstr(output_capture,"\"kind\":\"wifi\""));assert(strstr(output_capture,"615c") == NULL);
     assert(strstr(output_capture,"612262"));assert(strstr(output_capture,"B4:1E:52:00:00:01"));
+    const uint8_t sae[][4]={{0,0x0f,0xac,8}}, psk_sae[][4]={{0,0x0f,0xac,2},{0,0x0f,0xac,8}}, psk[][4]={{0,0x0f,0xac,2}};
+    const uint8_t *suite_sets[]={sae[0],psk_sae[0],psk[0]};unsigned suite_counts[]={1,2,1};
+    const char *auth_labels[]={"WPA3_PSK","WPA2_WPA3_PSK","WPA2_PSK"};
+    for(unsigned i=0;i<3;i++) {
+        atomic_store(&active,false);fresh();atomic_store(&collecting,true);output_capture[0]=0;
+        rsn_beacon((const uint8_t (*)[4])suite_sets[i],suite_counts[i]);
+        assert(xQueueReceive(queue,&o,0));emit(&o);assert(strstr(output_capture,auth_labels[i]));
+    }
+    atomic_store(&active,false);
+    fresh();atomic_store(&collecting,true);
     xQueueReset(queue);output_capture[0]=0;beacon(4,33);assert(xQueueReceive(queue,&o,0));emit(&o);
     assert(strstr(output_capture,"wifi_mgmt"));assert(!strstr(output_capture,"\"kind\":\"wifi\""));
     xQueueReset(queue);beacon(8,20);assert(!uxQueueMessagesWaiting(queue));
@@ -42,9 +101,9 @@ int main(void){
     sw_ble(a,1,-61,4,ad,sizeof(ad));assert(uxQueueMessagesWaiting(queue)==1); /* scan response */
     xQueueReset(queue);
     for(int i=0;i<100;i++){a[0]=i;sw_ble(a,1,-60,0,ad,sizeof(ad));}
-    assert(uxQueueMessagesWaiting(queue)==64);assert(atomic_load(&drops)>0);
-    assert(xQueueReceive(queue,&o,0));test_clock+=2001;unsigned old=atomic_load(&drops);emit(&o);assert(atomic_load(&drops)==old+1);
-    transport_limit=0;old=atomic_load(&drops);status("stats","");assert(atomic_load(&drops)==old+1);
+    assert(uxQueueMessagesWaiting(queue)==64);assert(atomic_load(&drops)>0 && atomic_load(&loss_queue)>0);
+    assert(xQueueReceive(queue,&o,0));test_clock+=2001;unsigned old=atomic_load(&drops),old_age=atomic_load(&loss_age);emit(&o);assert(atomic_load(&drops)==old+1 && atomic_load(&loss_age)==old_age+1);
+    transport_limit=0;old=atomic_load(&drops);unsigned old_output=atomic_load(&loss_output);status("stats","");assert(atomic_load(&drops)==old+1 && atomic_load(&loss_output)==old_output+1);
     fresh();test_task(NULL);assert(!sw_active());assert(hops>0 && stopped_radios>0);
     assert(strstr(output_capture,"started") && strstr(output_capture,"stats") && strstr(output_capture,"stopped"));
     fresh();radio_ok=false;test_task(NULL);assert(!strstr(output_capture,"started"));assert(strstr(output_capture,"error") && strstr(output_capture,"stopped"));
@@ -202,5 +261,8 @@ int main(void){
     const char *full=strstr(output_capture,"\"kind\":\"ble\"");
     assert(hint && results && full && hint<results && results<full);
     assert(strstr(hint,"\"age_ms\":10") && !heap_live && !machine_mode);
+    atomic_store(&seq,UINT32_MAX-1u);atomic_store(&sequence_exhausted,false);atomic_store(&stopping,false);
+    assert(next_seq()==UINT32_MAX && atomic_load(&sequence_exhausted) && atomic_load(&stopping));
+    assert(next_seq()==UINT32_MAX); /* saturates; never wraps back to sequence zero */
     puts("PASS: WiFi/BLE + passive EAPOL framing, malformed/protected data, queue overflow, age/backpressure, lease, cleanup, v2 batching and mode transitions");
 }

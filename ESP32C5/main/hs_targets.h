@@ -45,7 +45,7 @@ static bool hst_parse_limit(hs_target_set *set,const char *list,unsigned limit) 
     }
     return false;
 }
-static bool hst_parse(hs_target_set *set,const char *list) {
+static inline bool hst_parse(hs_target_set *set,const char *list) {
     return hst_parse_limit(set,list,HS_TARGET_LIMIT);
 }
 static bool hst_parse_exclusions(hs_target_set *set,const char *list) {

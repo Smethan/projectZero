@@ -112,6 +112,19 @@ static uint8_t hs_seen_context[HS_MAX_APS * 3][7];
 static unsigned hs_seen_context_count;
 static portMUX_TYPE hs_seen_context_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* The production callback now applies the job's independent exclusions and
+ * streams complete HS frames over the managed serial protocol. These test
+ * hooks keep the extracted production code linkable while the legacy FCS
+ * assertions exercise the unmanaged path. */
+static bool sw_job_owned(void) { return false; }
+static unsigned zero_job_exclusion_count;
+static uint8_t zero_job_exclusions[32][6];
+static unsigned hs_job_packet_id;
+static void sw_job_emit_data(const char *kind, const char *fields) {
+    (void)kind;
+    (void)fields;
+}
+
 static unsigned progress_count;
 static unsigned progress_lengths[8];
 static unsigned progress_size;

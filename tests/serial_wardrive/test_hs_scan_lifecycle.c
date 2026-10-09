@@ -84,6 +84,7 @@ static unsigned scan_command_calls;
 static int scan_command_result;
 
 static int64_t esp_timer_get_time(void) { return now_us; }
+static bool projectzero_emit_legacy_serial_line(const char *line) { (void)line; return false; }
 
 static int sniffer_find_ap(const uint8_t *bssid) {
     for (int i = 0; i < sniffer_ap_count; i++) {

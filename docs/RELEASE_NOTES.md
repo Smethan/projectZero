@@ -1,5 +1,27 @@
 # Smethan fork firmware
 
+## 1.8.0 — USB C5 job ownership and Waveshare Zero profile — 2026-10-08
+
+- Add opt-in `c5_jobs_v1` identity, boot nonce, immutable requests, token status,
+  lease renewal, terminal retry cache, source-scoped observations and captures.
+  One managed radio job owns a board; conflicts and legacy radio owners cannot
+  be preempted implicitly. Cleanup acknowledgements follow callback/worker drain.
+- Register the existing Wi-Fi/BLE operation families through the same job
+  interface. Apply assigned channels, dwell and target descriptors directly;
+  enforce exclusions on each board, and check channel/band transitions.
+- Add a native-USB, no-PSRAM Waveshare Zero profile with a 4 MiB flash layout,
+  factory app at `0x20000`, bounded operation resources and ROM-only updates.
+  Preserve XIAO/WROOM dual-slot USB OTA and existing release asset names.
+- Stream managed handshake evidence to the host for source-isolated artifact
+  validation. Passive Wi-Fi helpers disable BLE and use receive-only Wi-Fi mode.
+- Produce profile metadata, generated partition geometry, component offsets,
+  hashes and source fingerprints. Enforce release image limits and local stack
+  checks in disposable pinned ESP-IDF 6.0.1 builds.
+
+Software validation and measured packages are recorded in
+[the multi-C5 build report](MULTI_C5_VALIDATION.md). Physical acceptance remains unrun in
+[HARDWARE_ACCEPTANCE_MULTI_C5.md](HARDWARE_ACCEPTANCE_MULTI_C5.md).
+
 ## 1.7.14 — Live OUI notification hints alongside wardrive batches
 
 - Advertise `wardrive_live_oui_v1` and accept a validated optional

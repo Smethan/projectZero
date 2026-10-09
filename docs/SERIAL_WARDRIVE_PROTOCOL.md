@@ -356,3 +356,89 @@ valid; a row of progress sightings is still not that validation result.
 The scan/scope lifecycle, bounds, frame filtering, serial failures and exchange
 matching have native synthetic coverage. Both ESP32-C5 release variants build,
 but this release has not been physically RF-validated for targeted capture.
+
+## Multi-device job protocol (`c5_jobs_v1`, firmware 1.8.0)
+
+`get_device_info` returns a `WDG:` JSON `device_info` record with `v:3`, stable
+`device_id`, per-boot `boot_id`, board profile, flash/PSRAM size, supported
+operations, channels, resource limits, and update methods. It advertises
+`capabilities.c5_jobs_v1:true` when managed jobs are available. The host binds
+each serial endpoint to the reported identity and boot; records from another
+identity, a prior boot, a duplicate sequence, or a stale job are discarded.
+
+Start a job with `job_start TOKEN BASE64URLJSON`. The token is 1–32 URL-safe
+characters (`A-Z`, `a-z`, `0-9`, `_`, `-`). Decode the unpadded Base64 URL-safe
+argument as a JSON object no larger than 4096 bytes. The request contains the
+operation, assigned band/channels and dwell, BLE mode, explicit target and
+exclusion sets, and bounded operation options. Target records preserve BSSID,
+channel, numeric authentication value, and hex SSID. A request is rejected if
+it fails validation, exceeds the advertised device limits, or names a stale
+boot. Targets are immutable for the lifetime of the job.
+
+The request fields are:
+
+| Field | Contract |
+| --- | --- |
+| `boot_id` | Exact boot nonce from fresh device metadata. |
+| `op` | One advertised operation: `wardrive`, `wifi_scan`, `ble_scan`, `bt_track`, `airtag_scan`, `sniffer`, `hs_sniff`, `handshake`, `deauth`, `sae`, `blackout`, `evil_twin`, or `portal`. |
+| `band` | `wifi24`, `wifi5`, `both`, or `none`; must agree with the channel plan. |
+| `channels` | At most 40 unique supported channels; empty only for BLE-only work. The configured country filters the applied plan. |
+| `dwell_ms` | 40–2000 ms; default 160 ms for observation jobs and 400 ms for active handshake capture. |
+| `ble` | `off` or `scan`; Wi-Fi helpers always use `off`. |
+| `targets` | Immutable descriptors with `bssid`, `channel`, numeric `auth` and `ssid_hex`; capacity depends on the operation and board. |
+| `exclude` | At most 32 unique unicast BSSIDs. The complete protection set applies separately on every assigned board. |
+| `options` | Bounded `storage` (`serial` or `sd`), `scope` (`selected` or `all`), and operation-specific `mac`/`ssid_hex` values. |
+| `live_ouis` | At most eight unique six-hex-digit prefixes; valid only for `wardrive` and `wifi_scan`. |
+
+For example, a fixed-channel receive-only helper request is:
+
+```json
+{"boot_id":"0123456789ABCDEF","op":"hs_sniff","band":"wifi24","channels":[6],"dwell_ms":160,"ble":"off","targets":[{"bssid":"02:11:22:33:44:55","channel":6,"auth":3,"ssid_hex":"54657374"}],"exclude":[],"options":{"storage":"serial","scope":"selected"}}
+```
+
+Encode the exact JSON as unpadded Base64 URL-safe data. A retry must preserve
+the same token and encoded request. A rejected new start reports
+`request_error` and does not grant ownership. A `status` record may report
+`starting` while setup proceeds or `stopping` while callbacks and output drain;
+only `started`/running status confirms admission, and stopped status is the
+cleanup barrier. `device_info.legacy_busy` excludes unmanaged radio ownership
+from scheduler assignments until a new probe confirms the board is idle.
+
+Managed jobs retain the configured country; they do not apply the legacy
+country override. Candidate channels obey the configured 2.4 GHz range and,
+when manually configured, the C5 5 GHz channel mask. Before radio initialization
+the 2.4 GHz fallback is the world-safe channels 1–11. The SDK also enforces its
+country rules when applying a channel; a rejected initial channel prevents
+`started`, and subsequent channel failures stop the job.
+
+Managed records reuse the existing `started`, `stopped`, `error`, `heartbeat`,
+`status`, batch, Wi-Fi, BLE, live OUI, and handshake payloads. The outer v3
+envelope adds `device_id`, `boot_id`, job `session` token, and a boot-wide
+increasing `seq`; this preserves existing payload meanings. `hs_packet` carries
+at most 240 bytes per chunk. Structured output lines are limited to 1024 bytes;
+the USB console command buffer is 8192 bytes.
+
+Accepted-job lifecycle/status records include aggregate `drops` and a `losses` object with
+unsigned per-job `queue`, `age`, `output`, and `saturation` counters. Control
+records take priority over observation output. Queue overflow and bounded
+drain discards, expired observations, failed output/framing, and full working
+sets are reported explicitly. Counters reset when a new job is admitted.
+Request rejections and compact cached-terminal status replies can omit `losses`.
+
+`job_keepalive TOKEN` renews a 15-second lease; the host sends it every five
+seconds. Firmware heartbeats are sent every two seconds. Lease expiry stops the
+job after a disconnected host can no longer renew it. `job_status TOKEN` can
+recover current or cached terminal state. The last four terminal jobs are
+cached. A same-token, same-request retry is idempotent; a changed request for
+that token is rejected, and an overlapping active job reports busy. The host
+queries status and attempts bounded stop/compensation after uncertain serial
+delivery. A USB reconnect never resumes a job automatically.
+
+Multi-device scheduling assigns work to the device capabilities advertised in
+`device_info`. Host validation must preserve the whole target set and reject
+capacity or channel-plan mismatches instead of silently truncating it. WROOM
+and XIAO support at most 16 selected targets; Waveshare Zero supports 8; the
+exclusion set is limited to 32, and SAE accepts one target. Operation-specific
+AP/client/probe limits are board-reported. Multi-device UI, routing, and
+hardware acceptance are documented in the host [MULTI_C5.md](https://github.com/Smethan/WatchDogsGo/blob/v0.10.0/docs/MULTI_C5.md)
+and the [hardware acceptance record](HARDWARE_ACCEPTANCE_MULTI_C5.md).
