@@ -49,6 +49,13 @@ its normal command parser with input echo disabled until finish/abort. This
 prevents per-character USB flushes from overrunning the RX ring. Ordinary
 terminal behavior is restored afterward; no SDK patch is needed on the host.
 
+Firmware **1.8.1** also skips the ANSI terminal probe for native USB Serial/JTAG
+startup. The probe previously consumed ASCII discovery commands during its
+500 ms response window. **WDG 0.10.2** keeps reading during startup, retries
+missing metadata, and applies Linux native USB DTR/RTS together on reopen.
+The transport remains bound to the selected USB identity; these discovery
+retries do not reset a board or run while an updater owns its endpoint.
+
 
 ## Fast native USB path (1.7.8 / WDG 0.9.24)
 

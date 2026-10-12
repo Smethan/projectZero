@@ -166,7 +166,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.0"
+#define JANOS_VERSION "1.8.1"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"

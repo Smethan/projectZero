@@ -1,5 +1,23 @@
 # Smethan fork firmware
 
+## 1.8.1 — Preserve native USB discovery commands at startup — 2026-10-11
+
+- Skip the ESP-IDF ANSI terminal probe only for the native USB Serial/JTAG
+  console and select its dumb input mode directly. The original probe consumed
+  early ASCII host commands while waiting for an escape-sequence response,
+  which could discard WDG's first identity/capability requests.
+- Extend the pinned ESP-IDF 6.0.1 console harness to preload both metadata
+  commands before REPL initialization and verify that both reach command input.
+  Keep the existing machine-mode OTA input checks and normal terminal echo
+  restoration. UART console profiles retain their original probe behavior.
+- Pair with **WDG 0.10.2**, which fixes the separately reproduced Linux native
+  USB DTR/RTS reconnect problem and retries lost discovery requests. The
+  inspected XIAO's existing 1.8.0 image was booting successfully; successful
+  flashing alone did not prove the host console connection was healthy.
+
+See [USB_CONSOLE_RECOVERY.md](USB_CONSOLE_RECOVERY.md) for the diagnosis and
+the distinction between live XIAO evidence and outstanding dual-board RF gates.
+
 ## 1.8.0 — USB C5 job ownership and Waveshare Zero profile — 2026-10-08
 
 - Add opt-in `c5_jobs_v1` identity, boot nonce, immutable requests, token status,
