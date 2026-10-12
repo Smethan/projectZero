@@ -1,8 +1,8 @@
 # Managed C5 job recovery, 2026-10-12
 
 The host repair is **WatchDogsGo 0.10.3**. Firmware **1.8.2** repaired nonce
-admission and sniffer cleanup; the follow-up **1.8.3** candidate addresses
-first-start combined radio setup.
+admission and sniffer cleanup; the published follow-up **1.8.3** repairs
+first-start combined radio setup and immediate external-job handoff.
 The inspected uConsole had one XIAO connected over native USB. The Waveshare
 Zero was not attached. This record separates actual device behavior from
 software checks and the remaining multi-board acceptance gates.
@@ -89,7 +89,7 @@ admission waits for its last shared-state access to finish. Native tests also
 cover failed starts, Zero low-floor cleanup, and delayed retirement followed
 by a new start.
 
-The complete final candidate GUI sequence passed all seven receive-only
+The complete final candidate GUI sequence passed all seven discovery/capture
 steps, then preempted background All Wardrive with Sniffer and restored a new
 Wi-Fi/BLE background job. Restored coverage accepted 38 Wi-Fi and 36 BLE
 observations. The boot nonce stayed unchanged throughout; final stop left the
@@ -158,3 +158,36 @@ was installed through WDG's normal GUI USB-OTA path. It reported
 reservation, received a fresh nonce and capabilities, and returned to its
 normal reader while the GUI remained responsive. The saved settings hash
 was preserved.
+
+## Published 1.8.3 packages
+
+The [1.8.3 release](https://github.com/Smethan/projectZero/releases/tag/v1.8.3)
+is source commit `82e162289748b708b8925ef7df416de326a2cfc9`.
+[Firmware release CI](https://github.com/Smethan/projectZero/actions/runs/38287734773)
+and [paired host CI](https://github.com/Smethan/WatchDogsGo/actions/runs/38287934077)
+passed. All 12 checksummed assets, all three profile ZIPs and raw binaries,
+manifest source identities, partition/NVS bounds and ESP image integrity
+were verified. The final production-parser interop suite also passed all 13
+tests on the uConsole's ARM64/Python 3.13 runtime.
+
+| Published profile | Padded app bytes | Hard app limit | Headroom below limit | Static HP SRAM | Linker HP SRAM remaining | Local frame guards |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| XIAO | 2,299,184 | 4,063,232 | 1,764,048 | 233,895 | 87,033 | 42 |
+| WROOM | 2,303,040 | 4,063,232 | 1,760,192 | 233,707 | 87,221 | 42 |
+| Waveshare Zero | 1,911,776 | 3,997,696 | 2,085,920 | 183,931 | 136,997 | 36 |
+
+The exact published XIAO app SHA-256 is
+`f1424f4b1017cee4362a7c94245bde0b074229fd5aa648b72803be1f530ae233`.
+Zero's SHA-256 is
+`672d4225be4350a31aa66ea77acfa661911b5bd1ad2d81b7a941e91966c93eae`.
+The physically validated XIAO candidate has the same final source and image
+size but a different build hash; it must not be described as this CI binary.
+
+After package publication, the Pi became unreachable through both its named
+Tailscale endpoint and its previous LAN address. Its last inspected GUI was
+waiting for the published release; the SSH command to allow that update timed
+out. Installation of the exact published binary is therefore **unconfirmed**
+at this checkpoint. The final candidate installation and live GUI acceptance
+above remain confirmed, and saved settings were preserved before the loss of
+connectivity. The normal GUI update and published-byte radio checks require
+reconnection.
