@@ -184,10 +184,15 @@ The physically validated XIAO candidate has the same final source and image
 size but a different build hash; it must not be described as this CI binary.
 
 After package publication, the Pi became unreachable through both its named
-Tailscale endpoint and its previous LAN address. Its last inspected GUI was
-waiting for the published release; the SSH command to allow that update timed
-out. Installation of the exact published binary is therefore **unconfirmed**
-at this checkpoint. The final candidate installation and live GUI acceptance
-above remain confirmed, and saved settings were preserved before the loss of
-connectivity. The normal GUI update and published-byte radio checks require
-reconnection.
+Tailscale endpoint and its previous LAN address. The pre-reboot updater record
+was waiting for the published release; the SSH command to allow that update
+timed out. The Pi subsequently reconnected with a new boot and its normal WDG
+instance running; the saved updater record was historical, and the diagnostic
+updater was no longer running. The user then explicitly stopped further
+device testing to use the uConsole. No further on-device checks were performed.
+
+Installation of the exact published binary is **unconfirmed**. The final
+candidate installation and live GUI acceptance above remain confirmed, and
+the saved settings hash was preserved. The published-byte update/runtime
+check remains pending; it must not resume while the user is using the device
+without a new request authorizing that work.
