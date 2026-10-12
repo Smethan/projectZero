@@ -18,7 +18,8 @@ static char last_log[160];
 static bool wardrive_active,wardrive_promisc_active,bt_scan_active;
 static bool handshake_attack_active,antisurv_active,nimble_initialized;
 static bool wifi_only,ble_only,ensure_wifi_ok=true;
-static int fail_get_band,fail_get_filter,fail_get_mode,fail_set_mode,fail_set_band;
+static bool passive_hs,job_mode,collect_wifi=true,collect_ble=true;
+static int fail_get_band,fail_get_filter,fail_get_mode,fail_set_mode,fail_restore_mode,fail_set_band;
 static int nimble_result,scan_result;
 static unsigned get_band_calls,get_filter_calls,get_mode_calls,set_mode_calls,set_band_calls;
 static unsigned set_filter_calls,set_promisc_off_calls,set_cb_null_calls,bt_stop_calls;
@@ -26,8 +27,8 @@ static unsigned nimble_calls,scan_calls;
 static int last_set_mode,last_set_band,last_filter_mask;
 static wifi_promiscuous_filter_t original_filter={.filter_mask=0x5a};
 static bool ensure_wifi_mode(void) { return ensure_wifi_ok; }
-static bool sw_wifi_only_mode(void) { return wifi_only; }
-static bool sw_ble_only_mode(void) { return ble_only; }
+static bool sw_wifi_only_mode(void) { return wifi_only || passive_hs || (job_mode && !collect_ble); }
+static bool sw_ble_only_mode(void) { return job_mode && !collect_wifi && collect_ble; }
 static void bt_stop_scan(void) { bt_stop_calls++; }
 static esp_err_t bt_nimble_init(void) {
     nimble_calls++;
@@ -46,7 +47,7 @@ static esp_err_t esp_wifi_get_mode(wifi_mode_t *value) {
 }
 static esp_err_t esp_wifi_set_mode(wifi_mode_t value) {
     set_mode_calls++; last_set_mode=value;
-    return value==WIFI_MODE_NULL ? fail_set_mode : ESP_OK;
+    return value==WIFI_MODE_NULL ? fail_set_mode : fail_restore_mode;
 }
 static esp_err_t esp_wifi_set_band_mode(wifi_band_mode_t value) {
     set_band_calls++; last_set_band=value;
@@ -65,6 +66,7 @@ static bool sw_job_owned(void) { return false; }
 static void sw_job_emit_lifecycle(const char *kind,const char *state,const char *fields) {
     (void)kind;(void)state;(void)fields;
 }
+void sw_radio_stop(void);
 
 #include "sw_radio_start_under_test.inc"
 #include "sw_radio_stop_under_test.inc"
@@ -72,13 +74,13 @@ static void sw_job_emit_lifecycle(const char *kind,const char *state,const char 
 static void reset_fixture(void) {
     wardrive_active=wardrive_promisc_active=bt_scan_active=false;
     handshake_attack_active=antisurv_active=nimble_initialized=false;
-    wifi_only=ble_only=false; ensure_wifi_ok=true;
-    fail_get_band=fail_get_filter=fail_get_mode=fail_set_mode=fail_set_band=0;
+    wifi_only=ble_only=passive_hs=job_mode=false;collect_wifi=collect_ble=true;ensure_wifi_ok=true;
+    fail_get_band=fail_get_filter=fail_get_mode=fail_set_mode=fail_restore_mode=fail_set_band=0;
     nimble_result=scan_result=ESP_OK;
     get_band_calls=get_filter_calls=get_mode_calls=set_mode_calls=set_band_calls=0;
     set_filter_calls=set_promisc_off_calls=set_cb_null_calls=bt_stop_calls=0;
     nimble_calls=scan_calls=0;last_set_mode=last_set_band=last_filter_mask=0;
-    last_log[0]=0;sw_saved_radio=false;
+    last_log[0]=0;sw_saved_radio=false;sw_saved_mode_changed=false;
 }
 
 static void assert_restored(bool restore_mode) {
@@ -108,23 +110,25 @@ int main(void) {
     assert(!sw_radio_start() && strstr(last_log,"get_mode: 23"));
     assert(!sw_saved_radio && !set_band_calls);
 
-    reset_fixture(); wifi_only=true; fail_set_mode=31;
+    reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;fail_set_mode=31;
     assert(!sw_radio_start() && strstr(last_log,"set_null_mode: 31") && sw_saved_radio);
-    sw_radio_stop(); assert_restored(true);
+    assert(!sw_saved_mode_changed);sw_radio_stop(); assert_restored(false);
+    assert(set_mode_calls==1);
 
-    reset_fixture(); wifi_only=true; fail_set_band=32;
+    reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;fail_set_band=32;
     assert(!sw_radio_start() && strstr(last_log,"set_auto_band: 32") && sw_saved_radio);
+    assert(sw_saved_mode_changed);
     sw_radio_stop(); assert_restored(true);
 
     reset_fixture(); nimble_result=41;
     assert(!sw_radio_start() && strstr(last_log,"nimble_init: 41") && sw_saved_radio);
     assert(nimble_calls==1 && !scan_calls);
-    sw_radio_stop(); assert_restored(false);
+    assert(sw_saved_mode_changed);sw_radio_stop(); assert_restored(true);
 
-    reset_fixture(); scan_result=-7;
+    reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;scan_result=-7;
     assert(!sw_radio_start() && strstr(last_log,"ble_scan_coex: -7") && sw_saved_radio);
     assert(nimble_calls==1 && scan_calls==1 && nimble_initialized);
-    sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(false);
+    assert(sw_saved_mode_changed);sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(true);
 
     reset_fixture(); wifi_only=true; nimble_initialized=true;
     assert(sw_radio_start());
@@ -136,10 +140,21 @@ int main(void) {
     assert(nimble_calls==1 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL);
     sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(true);
 
-    reset_fixture();
+    reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;nimble_initialized=true;
     assert(sw_radio_start());
-    assert(nimble_calls==1 && scan_calls==1 && !set_mode_calls);
-    sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(false);
+    assert(nimble_calls==1 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL && bt_stop_calls==1);
+    assert(sw_saved_mode_changed);sw_radio_stop(); assert(bt_stop_calls==2); assert_restored(true);
+
+    reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start());fail_restore_mode=77;sw_radio_stop();
+    assert(sw_saved_radio && sw_saved_mode_changed && strstr(last_log,"restore failed at set_mode"));
+    fail_restore_mode=ESP_OK;
+    assert(sw_radio_start()); /* retries the pending restore before saving current state */
+    assert(sw_saved_radio && sw_saved_mode_changed);
+    sw_radio_stop();
+    assert(set_promisc_off_calls==3 && set_cb_null_calls==3 && set_filter_calls==3);
+    assert(last_filter_mask==original_filter.filter_mask && last_set_band==7 && last_set_mode==4);
+    assert(!sw_saved_radio && !sw_saved_mode_changed);
     puts("PASS: extracted radio hooks report each failure stage and restore state across Wi-Fi/BLE paths");
     return 0;
 }

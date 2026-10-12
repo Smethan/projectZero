@@ -49,6 +49,7 @@ static atomic_bool external_job_active;
 static atomic_bool external_job_ready;
 static atomic_bool external_job_starting;
 static atomic_bool external_job_stopping;
+static atomic_bool external_stop_completed;
 static atomic_bool radio_ready;
 static atomic_bool external_stop_claimed;
 static TaskHandle_t external_supervisor_task;
@@ -78,6 +79,11 @@ static void remember_terminal_job(const char *token,uint32_t hash);
 static struct { char operation[24]; sw_job_operation_handler_t handler; sw_job_operation_stop_t stop; } job_handlers[12];
 static unsigned job_handler_count;
 static void external_job_supervisor(void *arg);
+static bool wait_external_supervisor_retirement(unsigned timeout_ms) {
+    for(unsigned waited=0;external_supervisor_task && waited<timeout_ms;waited+=20)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    return external_supervisor_task==NULL;
+}
 bool sw_wifi_only_mode(void) { return wifi_only || passive_hs || (job_mode && !collect_ble); }
 bool sw_ble_only_mode(void) { return job_mode && !collect_wifi && collect_ble; }
 static bool valid_channel(unsigned channel);
@@ -103,6 +109,7 @@ static atomic_uint batch_number;
 static atomic_int batch_phase; /* 0 idle, 1 collecting, 2 reporting */
 static const char *job_current_state(void) {
     if(atomic_load(&external_job_starting))return "starting";
+    if(atomic_load(&external_stop_completed))return "stopping";
     if(atomic_load(&external_job_active))return atomic_load(&external_job_stopping)?"stopping":"running";
     if(!atomic_load(&active))return "stopped";
     if(atomic_load(&stopping))return "stopping";
@@ -939,6 +946,14 @@ ZERO_STACK_NOINLINE void sw_job_emit_lifecycle(const char *kind,const char *stat
     if(n<=0 || n>=(int)sizeof(line) || !serial_record_write(line,n,true))note_loss(&loss_output,1);
 }
 void sw_job_remember_terminal(void) { if(job_mode) remember_terminal_job(job_token,job_request_hash); }
+static void finalize_external_host_stop(void) {
+    bool expected=true;
+    if(!atomic_compare_exchange_strong(&external_stop_completed,&expected,false)) return;
+    active_job_operation[0]=0;
+    sw_job_emit_lifecycle("stopped","stopped","");
+    sw_job_remember_terminal();
+    job_mode=false;
+}
 static void remember_terminal_job(const char *token,uint32_t hash) {
     unsigned i=terminal_job_next++%4; terminal_jobs[i].used=true;
     snprintf(terminal_jobs[i].token,sizeof(terminal_jobs[i].token),"%s",token); terminal_jobs[i].hash=hash;
@@ -1044,7 +1059,13 @@ static int job_start(int argc,char **argv) {
         heap_caps_free(json); job_request_error_for(argv[1],"external_busy"); return 1;
     }
     if(external_supervisor_task) {
-        heap_caps_free(json); job_request_error_for(argv[1],"busy_cleanup"); return 1;
+        /* A completed or failed external job may have emitted its terminal
+         * record just before the supervisor drops its last shared-state use.
+         * Wait for that retirement before admitting a replacement. */
+        if(atomic_load(&external_job_active) || atomic_load(&external_job_starting) ||
+           !atomic_load(&external_job_ready) || !wait_external_supervisor_retirement(3000)) {
+            heap_caps_free(json); job_request_error_for(argv[1],"busy_cleanup"); return 1;
+        }
     }
     for(unsigned i=0;i<4;i++) if(terminal_jobs[i].used && !strcmp(terminal_jobs[i].token,argv[1])) {
         heap_caps_free(json);
@@ -1164,6 +1185,7 @@ static int job_start(int argc,char **argv) {
         atomic_store(&external_job_ready,false);
         atomic_store(&external_job_starting,true);
         atomic_store(&external_job_stopping,false);
+        atomic_store(&external_stop_completed,false);
         snprintf(active_job_operation,sizeof(active_job_operation),"%s",operation);
         /* Allocate the lease/cleanup supervisor before any operation can touch
            the radio. It waits behind external_job_ready until start succeeds. */
@@ -1280,6 +1302,12 @@ static void external_job_supervisor(void *arg) {
         }
         sw_job_emit_lifecycle("heartbeat",job_current_state(),"");
     }
+    /* The console stop path already performed radio cleanup. The supervisor
+       owns the terminal record so it is guaranteed even if the waiter times
+       out; new starts remain gated on this handle until all shared-state use
+       is complete. */
+    if(atomic_load(&external_stop_completed))
+        finalize_external_host_stop();
     external_supervisor_task=NULL;
     vTaskDelete(NULL);
 }
@@ -1307,15 +1335,26 @@ static int job_status(int argc,char **argv) {
 }
 static int job_stop(int argc,char **argv) {
     if(argc!=2 || strcmp(argv[1],job_token)) return 1;
-    if(atomic_load(&external_job_active)) {
-        atomic_store(&external_job_stopping,true);
-        bool expected=false;
-        if(!atomic_compare_exchange_strong(&external_stop_claimed,&expected,true)) return 1;
-        sw_job_operation_stop_t stop=NULL;
-        for(unsigned i=0;i<job_handler_count;i++) if(!strcmp(active_job_operation,job_handlers[i].operation)) { stop=job_handlers[i].stop;break; }
-        if(!stop || stop(argv[1])!=0) { atomic_store(&external_stop_claimed,false); sw_job_emit_lifecycle("status","stopping", "\"message\":\"stop_retry\""); return 1; }
-        atomic_store(&external_job_active,false); active_job_operation[0]=0;
-        sw_job_emit_lifecycle("stopped","stopped",""); sw_job_remember_terminal();job_mode=false;return 0;
+    if(atomic_load(&external_job_active) || atomic_load(&external_stop_completed)) {
+        if(atomic_load(&external_job_active)) {
+            atomic_store(&external_job_stopping,true);
+            bool expected=false;
+            if(!atomic_compare_exchange_strong(&external_stop_claimed,&expected,true)) return 1;
+            sw_job_operation_stop_t stop=NULL;
+            for(unsigned i=0;i<job_handler_count;i++) if(!strcmp(active_job_operation,job_handlers[i].operation)) { stop=job_handlers[i].stop;break; }
+            if(!stop || stop(argv[1])!=0) { atomic_store(&external_stop_claimed,false); sw_job_emit_lifecycle("status","stopping", "\"message\":\"stop_retry\""); return 1; }
+            atomic_store(&external_stop_completed,true);
+            atomic_store(&external_job_active,false);
+        }
+        /* The supervisor may already have finalized the stop after the
+           inactive store above. Waiting for retirement remains valid. */
+        if(!wait_external_supervisor_retirement(3000)) {
+            sw_job_emit_lifecycle("status","stopping", "\"message\":\"supervisor_retire_pending\"");
+            return 1;
+        }
+        /* The retiring supervisor emitted the terminal record before clearing
+           its handle, so it cannot race a replacement job's shared globals. */
+        return 0;
     }
     atomic_store(&stopping,true);
     if(!sw_stop()) { job_event("error","stopping","stop_timeout"); return 1; }

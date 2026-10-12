@@ -51,8 +51,13 @@ int main(void) {
            drain through their normal lease-expiry cleanup without RF. */
         if(!external_job_active && atomic_load(&active) && test_task) test_task(test_task_arg);
         char *stop_argv[]={"job_stop",wire_token};
-        if(job_stop(2,stop_argv)!=0) return 14;
-        if(external_supervisor_task && test_task) test_task(test_task_arg);
+        /* Exercise the real stop barrier: vTaskDelay schedules the old
+           supervisor so stop ACK follows its final shared-state access. */
+        test_auto_schedule=true;
+        int stop_rc=job_stop(2,stop_argv);
+        test_auto_schedule=false;
+        if(stop_rc!=0) return 14;
+        if(external_supervisor_task) return 17;
         emit_captured_records();
         if(sw_active() || heap_live) return 15;
         return 0;

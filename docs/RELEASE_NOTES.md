@@ -1,5 +1,28 @@
 # Smethan fork firmware
 
+## 1.8.3 — Repair first combined Wi-Fi/BLE receive startup — 2026-10-12
+
+- Put combined serial Wi-Fi/BLE receive jobs into `WIFI_MODE_NULL` before
+  starting BLE discovery, matching the existing Wi-Fi-only and BLE-only
+  receive paths. The first GUI All Wardrive start on the inspected XIAO
+  returned NimBLE HCI status 519 (controller Memory Capacity Exceeded);
+  combined jobs previously retained the STA mode during setup.
+- Track the successful Wi-Fi mode change and restore the saved mode after
+  normal stop or failed startup independently of job type. Retain failed
+  restoration for a checked retry before accepting another serial start.
+- Complete external-job supervisor cleanup before acknowledging a host stop,
+  and wait for supervisor retirement before admitting replacement jobs. This
+  repairs the reproduced Sniffer-to-passive-HS `busy_cleanup` rejection after
+  the preceding job had already acknowledged `stopped`.
+- Extend the production-hook native tests for combined setup, failure cleanup
+  and restoration retries, plus immediate external-job replacement. Keep
+  board layouts, update methods and NVS intact.
+
+Physical and software evidence is recorded in
+[the job recovery record](JOB_RUNTIME_RECOVERY_2026-10-12.md). This follow-up
+uses **WDG 0.10.3**, including its boot-nonce compatibility repair, source-tagged
+radio diagnostics and device health details in C5 settings.
+
 ## 1.8.2 — Restore managed jobs and sniffer cleanup — 2026-10-12
 
 - Accept uppercase or lowercase presentation of the same 16-digit hexadecimal

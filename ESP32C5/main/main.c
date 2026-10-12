@@ -166,7 +166,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.2"
+#define JANOS_VERSION "1.8.3"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -7282,6 +7282,7 @@ bool sw_prepare(void) {
 static wifi_band_mode_t sw_saved_band;
 static wifi_promiscuous_filter_t sw_saved_filter;
 static bool sw_saved_radio;
+static bool sw_saved_mode_changed;
 static wifi_mode_t sw_saved_mode;
 bool sw_radio_start(void) {
     /* Console ownership gate prevents new operations during this transition. */
@@ -7289,6 +7290,13 @@ bool sw_radio_start(void) {
         handshake_attack_active || antisurv_active) {
         MY_LOG_INFO(TAG, "Serial radio start failed at busy-operation gate");
         return false;
+    }
+    if(sw_saved_radio) {
+        sw_radio_stop();
+        if(sw_saved_radio) {
+            MY_LOG_INFO(TAG, "Serial radio start failed at pending radio restore");
+            return false;
+        }
     }
     if (!ensure_wifi_mode()) {
         MY_LOG_INFO(TAG, "Serial radio start failed at ensure_wifi_mode");
@@ -7310,16 +7318,17 @@ bool sw_radio_start(void) {
         return false;
     }
     sw_saved_radio = true;
-    if (sw_wifi_only_mode() || sw_ble_only_mode()) {
-        /* NULL mode has no STA/AP traffic: no probes, association or deauth.
-         * The serial ownership gate keeps other radio commands out. */
-        if (nimble_initialized) bt_stop_scan();
-        ret=esp_wifi_set_mode(WIFI_MODE_NULL);
-        if(ret!=ESP_OK) {
-            MY_LOG_INFO(TAG, "Serial radio start failed at set_null_mode: %d", ret);
-            return false;
-        }
+    sw_saved_mode_changed = false;
+    /* Serial capture jobs are receive-only, including combined Wi-Fi/BLE.
+     * Drop STA/AP allocations and traffic before starting the shared-radio
+     * BLE scan; sw_radio_stop restores the mode we saved above. */
+    if (nimble_initialized) bt_stop_scan();
+    ret=esp_wifi_set_mode(WIFI_MODE_NULL);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at set_null_mode: %d", ret);
+        return false;
     }
+    sw_saved_mode_changed = true;
     ret=esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     if(ret!=ESP_OK) {
         MY_LOG_INFO(TAG, "Serial radio start failed at set_auto_band: %d", ret);
@@ -7351,8 +7360,15 @@ void sw_radio_stop(void) {
     if (nimble_initialized) bt_stop_scan();
     if(esp_wifi_set_promiscuous_filter(&sw_saved_filter)!=ESP_OK)restored=false;
     if(esp_wifi_set_band_mode(sw_saved_band)!=ESP_OK)restored=false;
-    if((sw_wifi_only_mode() || sw_ble_only_mode()) && esp_wifi_set_mode(sw_saved_mode)!=ESP_OK)restored=false;
-    sw_saved_radio = false;
+    if(sw_saved_mode_changed) {
+        if(esp_wifi_set_mode(sw_saved_mode)!=ESP_OK) {
+            restored=false;
+            MY_LOG_INFO(TAG, "Serial radio restore failed at set_mode");
+        } else {
+            sw_saved_mode_changed=false;
+        }
+    }
+    if(restored) sw_saved_radio = false;
     if(!restored && sw_job_owned())sw_job_emit_lifecycle("error","stopping","\"message\":\"radio_restore_failed\"");
 }
 

@@ -38,8 +38,9 @@ static void (*test_task)(void*);
 static void *test_task_arg;
 static TaskHandle_t test_task_handle;
 static int task_ok=1;
+static bool test_auto_schedule,test_task_running;
 static int xTaskCreate(void (*f)(void*),const char *name,int stack,void *arg,int pri,TaskHandle_t *handle){test_task=f;test_task_arg=arg;if(handle){test_task_handle=(TaskHandle_t)f;*handle=test_task_handle;}return task_ok;}
-static void vTaskDelay(int ms){test_clock+=ms;}
+static void vTaskDelay(int ms){test_clock+=ms;if(test_auto_schedule&&test_task&&!test_task_running){test_task_running=true;test_task(test_task_arg);test_task_running=false;}}
 static void vTaskDelete(void *task){}
 #define WIFI_PKT_MGMT 0
 #define WIFI_PKT_DATA 1

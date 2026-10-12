@@ -1,5 +1,16 @@
 # Multi-device C5 hardware acceptance record
 
+Follow-up at 2026-10-12: one connected XIAO was inspected with WDG 0.10.3.
+Firmware 1.8.3 candidates passed fresh combined Wi-Fi/BLE GUI startup, Wi-Fi
+and BLE scans, completed Sniffer exports, and immediate Sniffer-to-passive-HS
+handoff, followed by foreground preemption and automatic Wi-Fi/BLE background
+restoration without a reset. The inspected native USB endpoint was
+`/dev/ttyACM0` (`303a:1001`),
+with reported 8 MiB flash and 8 MiB PSRAM. PCB revision was not inspected.
+Counts, firmware hashes, update evidence and remaining checks are recorded in
+[the runtime recovery record](JOB_RUNTIME_RECOVERY_2026-10-12.md).
+These are single-board checks; the dual-board gates below remain outstanding.
+
 Status at 2026-10-08: **all physical gates NOT RUN**. Source and native test
 coverage do not establish USB behavior under load, RF performance, transmit
 silence, update continuity, or sustained uConsole operation. Software checks

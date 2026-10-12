@@ -87,9 +87,17 @@ int main(void) {
     assert(submit_boot("A1B2C3D4E5F60789","nonce-upper","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
     assert(custom_starts==starts_before_nonce+1 && external_job_active);
     char *nonce_stop[]={"job_stop","nonce-upper"};
+    test_auto_schedule=true;
     assert(job_stop(2,nonce_stop)==0);
-    assert(test_task && test_task_arg==NULL);
-    test_task(test_task_arg);
+    assert(test_task && test_task_arg==NULL && !external_supervisor_task);
+    assert(strstr(output_capture,"\"kind\":\"stopped\""));
+    /* The next job starts immediately after stop ACK without manually running
+       the old supervisor task from the test. */
+    assert(submit("nonce-replacement","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    assert(external_job_active && external_supervisor_task);
+    char *nonce_replacement_stop[]={"job_stop","nonce-replacement"};
+    assert(job_stop(2,nonce_replacement_stop)==0 && !external_supervisor_task);
+    test_auto_schedule=false;
     assert(!sw_active() && !heap_live);
     const char *bad_boots[]={"a1b2c3d4e5f60788","a1b2c3d4e5f6078","a1b2c3d4e5f6078g"};
     for(unsigned i=0;i<sizeof(bad_boots)/sizeof(bad_boots[0]);i++) {
@@ -97,7 +105,7 @@ int main(void) {
         assert(submit_boot(bad_boots[i],"nonce-invalid","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
         assert(strstr(output_capture,"invalid_request") && !sw_active() && !heap_live);
     }
-    assert(custom_starts==starts_before_nonce+1 && prepare_calls==prepares_before_nonce);
+    assert(custom_starts==starts_before_nonce+2 && prepare_calls==prepares_before_nonce);
     assert(submit("rx","wardrive","wifi24","off","[6]","[]","[]",ALL)==0);
     assert(sw_active() && sw_wifi_only_mode() && prepare_calls==1);
     char *rx_status[]={"job_status","rx"};output_capture[0]=0;
@@ -130,7 +138,7 @@ int main(void) {
     output_capture[0]=0;char *status_args[]={"job_status","selected"};assert(job_status(2,status_args)==0);
     assert(strstr(output_capture,"\"session\":\"selected\"") && strstr(output_capture,"\"state\":\"running\""));
     output_capture[0]=0;test_task(test_task_arg);
-    assert(!sw_active() && !heap_live && custom_stops==2);
+    assert(!sw_active() && !heap_live && custom_stops==3);
     assert(strstr(output_capture,"\"kind\":\"heartbeat\"") && strstr(output_capture,"lease_expired") && strstr(output_capture,"\"kind\":\"stopped\""));
     assert(submit("protected","handshake","wifi24","off","[6]",TARGET,
         "[\"02:11:22:33:44:55\"]",SELECTED)==1);
@@ -142,7 +150,13 @@ int main(void) {
     output_capture[0]=0;assert(job_status(2,status_args)==0);
     assert(strstr(output_capture,"\"session\":\"selected\"") && strstr(output_capture,"\"state\":\"stopped\""));
     custom_fail=true;assert(submit("failed","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
-    assert(!sw_active()&&!heap_live);test_task(test_task_arg);custom_fail=false;
+    assert(!sw_active()&&!heap_live && external_supervisor_task);custom_fail=false;
+    test_auto_schedule=true;
+    assert(submit("after-failed-start","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    assert(external_job_active && external_supervisor_task);
+    char *after_failed_stop[]={"job_stop","after-failed-start"};
+    assert(job_stop(2,after_failed_stop)==0 && !external_supervisor_task);
+    test_auto_schedule=false;
     task_ok=0;before_custom=custom_starts;
     assert(submit("no-supervisor","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
     assert(custom_starts==before_custom && !external_supervisor_task && !sw_active() && !heap_live);
@@ -159,10 +173,28 @@ int main(void) {
     assert(strstr(output_capture,"\"v\":3") && strstr(output_capture,"\"device_id\"") && strstr(output_capture,"\"state\":\"stopped\""));
     const char *terminal_fixture=getenv("C5_TERMINAL_FIXTURE");
     if(terminal_fixture) {FILE *f=fopen(terminal_fixture,"w");assert(f);fputs(output_capture,f);fclose(f);}
+    assert(submit("retire-timeout","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    char *retire_timeout_stop[]={"job_stop","retire-timeout"};
+    output_capture[0]=0;
+    assert(job_stop(2,retire_timeout_stop)==1);
+    assert(!external_job_active && external_stop_completed && external_supervisor_task && !heap_live);
+    assert(strstr(output_capture,"supervisor_retire_pending") && !strstr(output_capture,"\"kind\":\"stopped\""));
+    test_task(test_task_arg); /* Delayed supervisor eventually owns terminal completion. */
+    assert(!external_supervisor_task && !external_stop_completed);
+    assert(strstr(output_capture,"\"kind\":\"stopped\""));
+    assert(submit("after-retire-timeout","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    test_auto_schedule=true;
+    char *after_timeout_stop[]={"job_stop","after-retire-timeout"};
+    assert(job_stop(2,after_timeout_stop)==0 && !external_supervisor_task);
+    test_auto_schedule=false;
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
     test_free_heap=1024;require_start_barrier=true;
     assert(submit("custom-low-floor","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
-    assert(!sw_active()&&!heap_live);test_task(test_task_arg);
+    assert(!sw_active()&&!heap_live&&external_supervisor_task);
+    test_auto_schedule=true;
+    assert(submit("custom-low-floor-replacement","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
+    assert(!sw_active()&&!heap_live&&external_supervisor_task);
+    test_auto_schedule=false;test_task(test_task_arg);
     assert(!external_supervisor_task);require_start_barrier=false;
     test_free_heap=1024;
     assert(submit("low-heap","wardrive","wifi24","off","[6]","[]","[]",ALL)==1);
