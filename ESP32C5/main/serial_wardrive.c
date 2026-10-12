@@ -1006,6 +1006,18 @@ static int device_info(int argc,char **argv) {
     if(n<=0 || n>1000) return 1;
     output(b); return 0;
 }
+static bool job_boot_id_matches(const char *request_boot) {
+    /* Hex nonce casing is presentation only; length and every digit remain exact. */
+    const size_t nonce_len=sizeof(boot_id)-1;
+    if(!request_boot || strlen(request_boot)!=nonce_len || strlen(boot_id)!=nonce_len) return false;
+    for(size_t i=0;i<nonce_len;i++) {
+        unsigned char request=(unsigned char)request_boot[i];
+        unsigned char current=(unsigned char)boot_id[i];
+        if(!isxdigit(request) || !isxdigit(current) ||
+           tolower(request)!=tolower(current)) return false;
+    }
+    return true;
+}
 static int job_start(int argc,char **argv) {
     if(argc!=3 || !argv[1][0] || strlen(argv[1])>32) return 1;
     for(const char *p=argv[1];*p;p++) if(!isalnum((unsigned char)*p) && *p!='-' && *p!='_') return 1;
@@ -1044,7 +1056,7 @@ static int job_start(int argc,char **argv) {
     const char *storage=NULL;
 #endif
     cJSON *root=cJSON_ParseWithLength(json,json_len);
-    if(!cJSON_IsObject(root) || !json_string(root,"boot_id",&request_boot) || strcmp(request_boot,boot_id) ||
+    if(!cJSON_IsObject(root) || !json_string(root,"boot_id",&request_boot) || !job_boot_id_matches(request_boot) ||
        !json_string(root,"op",&op) || !json_string(root,"band",&band) || !json_string(root,"ble",&ble)) goto invalid;
     bool wardrive=!strcmp(op,"wardrive"), wifi=!strcmp(op,"wifi_scan"), ble_only=!strcmp(op,"ble_scan"), hs=!strcmp(op,"hs_sniff");
     bool built_in=wardrive||wifi||ble_only||hs;

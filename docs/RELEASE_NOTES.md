@@ -1,5 +1,31 @@
 # Smethan fork firmware
 
+## 1.8.2 — Restore managed jobs and sniffer cleanup — 2026-10-12
+
+- Accept uppercase or lowercase presentation of the same 16-digit hexadecimal
+  boot nonce. WDG 0.10.2 uppercased firmware metadata before sending it back,
+  causing the previous case-sensitive parser to reject managed starts. WDG
+  0.10.3 also sends lowercase for compatibility with older job firmware.
+  Different, short and non-hex nonces remain rejected.
+- Repair the reproduced XIAO Packet Sniffer stack-protection reset in the
+  Wi-Fi event task when its discovery scan completes. Increase that task's
+  stack to 4096 bytes and the channel worker's stack to 4096 bytes; include the
+  latter in Zero's job admission budget and expand local stack guards.
+- Export managed sniffer results as source-bound JSON using the job token,
+  before resource release and terminal stop. Keep resources owned when
+  cleanup/export needs a retry. Log the exact failed radio setup stage and
+  SDK/NimBLE result through the existing managed diagnostic path.
+- Add cross-process host/production-parser interoperability coverage, exact
+  nonce rejection tests, extracted radio-hook fault/cleanup coverage and an
+  extracted sniffer-export lifecycle test. Preserve existing flash layouts,
+  update methods and NVS regions.
+
+See [the job recovery record](JOB_RUNTIME_RECOVERY_2026-10-12.md) for the
+reproduced failures and acceptance boundaries. The repair is paired with
+**WDG 0.10.3**, which also moves device health text into the C5 settings view
+and detects a changed boot after an unanswered managed stop without resuming
+the interrupted foreground job.
+
 ## 1.8.1 — Preserve native USB discovery commands at startup — 2026-10-11
 
 - Skip the ESP-IDF ANSI terminal probe only for the native USB Serial/JTAG

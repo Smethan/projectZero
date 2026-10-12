@@ -29,6 +29,9 @@ start_all = function("static int cmd_start_sniffer_all(")
 begin_session = function("static void sniffer_begin_session(void)")
 callback = function("static void sniffer_promiscuous_callback(")
 export = function("static int cmd_show_sniffer_intel(")
+stop_operations = function("static int stop_operations(bool reset_wifi)")
+sniffer_wait = function("static ZERO_STACK_NOINLINE bool sniffer_channel_wait_quiescent(void)")
+sniffer_worker = function("static void sniffer_channel_task(void *pvParameters)")
 hs_complete = function("static void hs_scan_complete(bool success)")
 verify = function("static void verify_password(")
 start_twin = function("static int cmd_start_evil_twin(")
@@ -65,6 +68,21 @@ assert "sniffer_active || sniffer_scan_phase" in export
 assert "sniffer_active||sniffer_scan_phase" in function(
     "static int cmd_hs_scan(")
 assert "hs_scan_done_event(&hs_scan_snapshot)" in hs_complete
+
+# Managed stop never kills the serial-producing worker. It retains the owner
+# on timeout, and the worker clears its handle only after its final log write.
+sniffer_stop = stop_operations[
+    stop_operations.index("// Stop sniffer cooperatively"):
+    stop_operations.index("// Stop sniffer_dog if active")
+]
+assert "sniffer_channel_wait_quiescent()" in sniffer_stop
+assert "return 1;" in sniffer_stop
+assert "vTaskDelete(sniffer_channel_task_handle)" not in sniffer_stop
+assert "waited_ms < 1500" in sniffer_wait
+assert "waited_ms += 50" in sniffer_wait
+assert sniffer_worker.index('MY_LOG_INFO(TAG, "Sniffer channel task ending")') < sniffer_worker.index(
+    "sniffer_channel_task_handle = NULL;"
+) < sniffer_worker.index("vTaskDelete(NULL);")
 
 # Verification is pinned to the selected AP and candidate secrets never reach
 # serial logs. Allocation/start failures retire portal and credential state.

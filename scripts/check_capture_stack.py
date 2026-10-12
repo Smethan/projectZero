@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject large local stack frames in capture callbacks and their workers.
+"""Reject large local stack frames in capture callbacks, workers, and radio tasks.
 
 Requires an ESP-IDF build with -DCMAKE_C_FLAGS=-fstack-usage. This checks local
 frames, not the complete runtime call chain; hardware high-water checks remain
@@ -42,6 +42,11 @@ LIMITS = {
     ("main.c", "hs_scan_complete"): 768,
     ("main.c", "cmd_handshake_scope"): 320,
     ("main.c", "zero_job_start_operation"): 2048,
+    ("main.c", "wifi_event_handler"): 256,
+    ("main.c", "projectzero_log_info"): 512,
+    ("main.c", "sniffer_channel_task"): 256,
+    ("main.c", "sniffer_channel_wait_quiescent"): 64,
+    ("serial_wardrive.c", "sw_job_radio_hop"): 128,
     ("hs_exchange.c", "hsx_ingest"): 256,
     ("hs_exchange.c", "hsx_set_ap_ssid"): 128,
     ("hs_exchange.c", "hsx_build_pcap"): 128,

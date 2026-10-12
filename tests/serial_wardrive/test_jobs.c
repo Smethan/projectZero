@@ -36,13 +36,17 @@ static void encode(const char *json,char out[5500]) {
     }
     if(bits)out[pos++]=alphabet[(value<<(6-bits))&63];out[pos]=0;
 }
-static int submit(const char *token,const char *operation,const char *band,const char *ble,
-                   const char *channels,const char *targets,const char *exclude,const char *options) {
+static int submit_boot(const char *boot,const char *token,const char *operation,const char *band,const char *ble,
+                       const char *channels,const char *targets,const char *exclude,const char *options) {
     char json[4097], payload[5500];
     snprintf(json,sizeof(json),"{\"boot_id\":\"%s\",\"op\":\"%s\",\"band\":\"%s\",\"channels\":%s,\"ble\":\"%s\",\"dwell_ms\":160,\"targets\":%s,\"exclude\":%s,\"options\":%s,\"live_ouis\":[]}",
-        boot_id,operation,band,channels,ble,targets,exclude,options);
+        boot,operation,band,channels,ble,targets,exclude,options);
     encode(json,payload);char *argv[]={"job_start",(char *)token,payload};
     return job_start(3,argv);
+}
+static int submit(const char *token,const char *operation,const char *band,const char *ble,
+                   const char *channels,const char *targets,const char *exclude,const char *options) {
+    return submit_boot(boot_id,token,operation,band,ble,channels,targets,exclude,options);
 }
 #define ALL "{\"storage\":\"serial\",\"scope\":\"all\"}"
 #define SELECTED "{\"storage\":\"serial\",\"scope\":\"selected\"}"
@@ -50,6 +54,7 @@ static int submit(const char *token,const char *operation,const char *band,const
 int main(void) {
     test_free_heap=1024*1024;fail_psram=true;
     assert(ensure_identity());sw_register();
+    snprintf(boot_id,sizeof(boot_id),"a1b2c3d4e5f60789");
     assert(sw_register_job_operation_ex("handshake",custom_start,custom_stop));
     assert(sw_register_job_operation_ex("portal",custom_start,custom_stop));
     const char *extra_ops[]={"deauth","sae","blackout","evil_twin","sniffer","bt_track","airtag_scan"};
@@ -71,6 +76,28 @@ int main(void) {
     if(info_fixture) {FILE *f=fopen(info_fixture,"w");assert(f);fputs(output_capture,f);fclose(f);}
     output_capture[0]=0;assert(capabilities(1,NULL)==0);
     assert(strstr(output_capture,"\"c5_jobs_v1\":true"));
+    assert(job_boot_id_matches("A1B2C3D4E5F60789"));
+    assert(job_boot_id_matches("A1b2C3d4E5f60789"));
+    assert(!job_boot_id_matches("a1b2c3d4e5f60788"));
+    assert(!job_boot_id_matches("a1b2c3d4e5f6078"));
+    assert(!job_boot_id_matches("a1b2c3d4e5f6078g"));
+    unsigned starts_before_nonce=custom_starts;
+    unsigned prepares_before_nonce=prepare_calls;
+    output_capture[0]=0;
+    assert(submit_boot("A1B2C3D4E5F60789","nonce-upper","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    assert(custom_starts==starts_before_nonce+1 && external_job_active);
+    char *nonce_stop[]={"job_stop","nonce-upper"};
+    assert(job_stop(2,nonce_stop)==0);
+    assert(test_task && test_task_arg==NULL);
+    test_task(test_task_arg);
+    assert(!sw_active() && !heap_live);
+    const char *bad_boots[]={"a1b2c3d4e5f60788","a1b2c3d4e5f6078","a1b2c3d4e5f6078g"};
+    for(unsigned i=0;i<sizeof(bad_boots)/sizeof(bad_boots[0]);i++) {
+        output_capture[0]=0;
+        assert(submit_boot(bad_boots[i],"nonce-invalid","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==1);
+        assert(strstr(output_capture,"invalid_request") && !sw_active() && !heap_live);
+    }
+    assert(custom_starts==starts_before_nonce+1 && prepare_calls==prepares_before_nonce);
     assert(submit("rx","wardrive","wifi24","off","[6]","[]","[]",ALL)==0);
     assert(sw_active() && sw_wifi_only_mode() && prepare_calls==1);
     char *rx_status[]={"job_status","rx"};output_capture[0]=0;
@@ -103,7 +130,7 @@ int main(void) {
     output_capture[0]=0;char *status_args[]={"job_status","selected"};assert(job_status(2,status_args)==0);
     assert(strstr(output_capture,"\"session\":\"selected\"") && strstr(output_capture,"\"state\":\"running\""));
     output_capture[0]=0;test_task(test_task_arg);
-    assert(!sw_active() && !heap_live && custom_stops==1);
+    assert(!sw_active() && !heap_live && custom_stops==2);
     assert(strstr(output_capture,"\"kind\":\"heartbeat\"") && strstr(output_capture,"lease_expired") && strstr(output_capture,"\"kind\":\"stopped\""));
     assert(submit("protected","handshake","wifi24","off","[6]",TARGET,
         "[\"02:11:22:33:44:55\"]",SELECTED)==1);

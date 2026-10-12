@@ -24,6 +24,7 @@ OPAQUE(hs_queued_frame_t,524); OPAQUE(bt_device_info_t,120); OPAQUE(wdp_network_
 #define WDP_INITIAL_CAPACITY 64
 #define ZERO_JOB_MEMORY_CAP (48u*1024u)
 #define ZERO_JOB_MEMORY_RESERVE (32u*1024u)
+#define SNIFFER_CHANNEL_TASK_STACK_SIZE 4096u
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
 static unsigned live_allocations, allocation_attempts;
@@ -60,6 +61,9 @@ enum {ZERO_RES_SNIFFER=1u<<0,ZERO_RES_TARGETS=1u<<1,ZERO_RES_BLE=1u<<2,
       ZERO_RES_HANDSHAKE=1u<<3,ZERO_RES_WARDRIVE=1u<<4,ZERO_RES_PORTAL=1u<<5};
 #include "zero_resources_under_test.inc"
 int main(void) {
+    assert(zero_job_resource_estimate(ZERO_RES_SNIFFER) ==
+        6144u + SNIFFER_CHANNEL_TASK_STACK_SIZE +
+        MAX_SNIFFER_APS*sizeof(sniffer_ap_t) + MAX_PROBE_REQUESTS*sizeof(probe_request_t));
     const unsigned masks[]={ZERO_RES_SNIFFER,ZERO_RES_TARGETS,ZERO_RES_BLE,
         ZERO_RES_HANDSHAKE|ZERO_RES_TARGETS,ZERO_RES_WARDRIVE,ZERO_RES_PORTAL,
         ZERO_RES_SNIFFER|ZERO_RES_TARGETS};

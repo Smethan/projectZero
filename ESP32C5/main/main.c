@@ -38,7 +38,7 @@ static int cmd_start_evil_twin(int argc,char **argv);
 static int cmd_start_sniffer(int argc,char **argv);
 static int cmd_start_blackout(int argc,char **argv);
 static int cmd_start_portal(int argc,char **argv);
-static int cmd_show_sniffer_results(int argc,char **argv);
+static int cmd_show_sniffer_intel(int argc,char **argv);
 static int cmd_scan_bt(int argc,char **argv);
 static int cmd_scan_airtag(int argc,char **argv);
 static int stop_operations(bool reset_wifi);
@@ -166,7 +166,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.1"
+#define JANOS_VERSION "1.8.2"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -236,6 +236,7 @@ static int stop_operations(bool reset_wifi);
 #define GPS_BUF_SIZE       1024
 #define GPS_BAUD_ATGM336H  9600
 #define GPS_BAUD_M5STACK   115200
+#define SNIFFER_CHANNEL_TASK_STACK_SIZE 4096
 
 // SD Card SPI pins (Marauder compatible)
 #define SD_MISO_PIN        2
@@ -392,6 +393,7 @@ static sniffer_ap_t *sniffer_aps = NULL;                    // ~75 KB in PSRAM
 static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
+static bool sniffer_stop_pending = false;
 static int sniff_debug = 0; // Debug flag for detailed packet logging
 static bool sniffer_selected_mode = false; // Flag for selected networks mode
 static int sniffer_selected_channels[MAX_AP_CNT]; // Unique channels from selected networks
@@ -2000,7 +2002,7 @@ static size_t zero_job_resource_estimate(uint32_t mask) {
     /* The token/lease supervisor is part of every managed Zero job's live
        internal-RAM working set and is created after this admission succeeds. */
     size_t bytes=6144;
-    if(mask&ZERO_RES_SNIFFER) bytes+=MAX_SNIFFER_APS*sizeof(sniffer_ap_t)+MAX_PROBE_REQUESTS*sizeof(probe_request_t);
+    if(mask&ZERO_RES_SNIFFER) bytes+=SNIFFER_CHANNEL_TASK_STACK_SIZE+MAX_SNIFFER_APS*sizeof(sniffer_ap_t)+MAX_PROBE_REQUESTS*sizeof(probe_request_t);
     if(mask&ZERO_RES_TARGETS) bytes+=MAX_TARGET_BSSIDS*sizeof(target_bssid_t)+MAX_SELECTED_STATIONS*sizeof(selected_station_t)+MAX_WHITELISTED_BSSIDS*sizeof(whitelisted_bssid_t);
     if(mask&ZERO_RES_BLE) bytes+=BT_INITIAL_CAPACITY*(sizeof(*bt_found_devices)+sizeof(bt_device_info_t));
     if(mask&ZERO_RES_HANDSHAKE) bytes+=MAX_AP_CNT*sizeof(wifi_ap_record_t)+HS_MAX_APS*sizeof(hs_ap_target_t)+HS_MAX_CLIENTS*sizeof(hs_client_entry_t)+dual_band_channels_count*sizeof(ducb_channel_t)+HS_FRAME_POOL_COUNT*sizeof(hs_queued_frame_t)+15360;
@@ -2300,7 +2302,12 @@ static int zero_job_stop_operation(const char *token) {
     int rc=stop_operations(false);
     if(rc==0) {
         /* Publish the completed source-bound snapshot before releasing its tables. */
-        if(!strcmp(projectzero_job_operation_name,"sniffer")) (void)cmd_show_sniffer_results(1,NULL);
+        if(!strcmp(projectzero_job_operation_name,"sniffer")) {
+            char *args[2]={(char *)"show_sniffer_intel",(char *)token};
+            rc=cmd_show_sniffer_intel(2,args);
+        }
+    }
+    if(rc==0) {
         projectzero_job_operation_name[0]=0;
         job_resources_close();
     }
@@ -2553,6 +2560,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
+static bool sniffer_channel_wait_quiescent(void);
 static bool is_multicast_mac(const uint8_t *mac);
 // Deauth detector functions
 static int cmd_deauth_detector(int argc, char **argv);
@@ -2959,7 +2967,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 
                 // Start channel hopping task for time-based hopping
                 if (sniffer_channel_task_handle == NULL) {
-                    xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+                    xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
                     MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
                 }
                 
@@ -7278,22 +7286,57 @@ static wifi_mode_t sw_saved_mode;
 bool sw_radio_start(void) {
     /* Console ownership gate prevents new operations during this transition. */
     if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
-        handshake_attack_active || antisurv_active) return false;
-    if (!ensure_wifi_mode()) return false;
-    if (esp_wifi_get_band_mode(&sw_saved_band) != ESP_OK ||
-        esp_wifi_get_promiscuous_filter(&sw_saved_filter) != ESP_OK ||
-        esp_wifi_get_mode(&sw_saved_mode) != ESP_OK) return false;
+        handshake_attack_active || antisurv_active) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at busy-operation gate");
+        return false;
+    }
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at ensure_wifi_mode");
+        return false;
+    }
+    esp_err_t ret=esp_wifi_get_band_mode(&sw_saved_band);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at get_band_mode: %d", ret);
+        return false;
+    }
+    ret=esp_wifi_get_promiscuous_filter(&sw_saved_filter);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at get_promiscuous_filter: %d", ret);
+        return false;
+    }
+    ret=esp_wifi_get_mode(&sw_saved_mode);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at get_mode: %d", ret);
+        return false;
+    }
     sw_saved_radio = true;
     if (sw_wifi_only_mode() || sw_ble_only_mode()) {
         /* NULL mode has no STA/AP traffic: no probes, association or deauth.
          * The serial ownership gate keeps other radio commands out. */
         if (nimble_initialized) bt_stop_scan();
-        if (esp_wifi_set_mode(WIFI_MODE_NULL) != ESP_OK) return false;
+        ret=esp_wifi_set_mode(WIFI_MODE_NULL);
+        if(ret!=ESP_OK) {
+            MY_LOG_INFO(TAG, "Serial radio start failed at set_null_mode: %d", ret);
+            return false;
+        }
     }
-    if (esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO) != ESP_OK) return false;
+    ret=esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at set_auto_band: %d", ret);
+        return false;
+    }
     if (sw_wifi_only_mode()) return true;
-    if (bt_nimble_init() != ESP_OK) return false;
-    return bt_start_scan_coex() == 0;
+    ret=bt_nimble_init();
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at nimble_init: %d", ret);
+        return false;
+    }
+    int scan_rc=bt_start_scan_coex();
+    if(scan_rc!=0) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at ble_scan_coex: %d", scan_rc);
+        return false;
+    }
+    return true;
 }
 void sw_radio_hop(unsigned index) {
     static const uint8_t channels[] = {1,6,11,2,3,4,5,7,8,9,10,12,13,
@@ -12581,6 +12624,15 @@ static int cmd_stop(int argc, char **argv) {
     return stop_operations(true);
 }
 
+static ZERO_STACK_NOINLINE bool sniffer_channel_wait_quiescent(void) {
+    for (unsigned waited_ms = 0;
+         waited_ms < 1500 && sniffer_channel_task_handle != NULL;
+         waited_ms += 50) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return sniffer_channel_task_handle == NULL;
+}
+
 static int stop_operations(bool reset_wifi) {
     if (!sw_stop()) { printf("Serial stop timed out; retry stop.\n"); return 1; }
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
@@ -12801,20 +12853,25 @@ static int stop_operations(bool reset_wifi) {
         MY_LOG_INFO(TAG, "Background scan stopped.");
     }
     
-    // Stop sniffer if active (keep collected data)
-    if (sniffer_active) {
-        sniffer_active = false;
-        sniffer_scan_phase = false;
-        sniffer_session_completed_us = esp_timer_get_time();
-        esp_wifi_set_promiscuous(false);
-        
-        // Stop channel hopping task
-        if (sniffer_channel_task_handle != NULL) {
-            vTaskDelete(sniffer_channel_task_handle);
-            sniffer_channel_task_handle = NULL;
+    // Stop sniffer cooperatively (keep collected data). The worker may be
+    // publishing a managed record while holding stdout's lock, so never kill it.
+    if (sniffer_active || sniffer_channel_task_handle != NULL || sniffer_stop_pending) {
+        bool was_active = sniffer_active;
+        sniffer_stop_pending = true;
+        if (was_active) {
+            sniffer_active = false;
+            sniffer_scan_phase = false;
+            sniffer_session_completed_us = esp_timer_get_time();
+            esp_wifi_set_promiscuous(false);
+        }
+        if (sniffer_channel_task_handle != NULL && !sniffer_channel_wait_quiescent()) {
+            MY_LOG_INFO(TAG, "Sniffer channel task is still draining; retry stop.");
+            return 1;
+        }
+        if (sniffer_channel_task_handle == NULL) {
             MY_LOG_INFO(TAG, "Stopped sniffer channel hopping task");
         }
-        
+
         // Reset channel state for next session
         sniffer_channel_index = 0;
         sniffer_current_channel = dual_band_channels[0];
@@ -12824,6 +12881,7 @@ static int stop_operations(bool reset_wifi) {
         sniffer_selected_mode = false;
         sniffer_selected_channels_count = 0;
         memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+        sniffer_stop_pending = false;
         
         // Note: sniffer_aps and sniffer_ap_count are preserved for show_sniffer_results
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
@@ -16042,7 +16100,7 @@ static int cmd_start_sniffer(int argc, char **argv) {
         
         // Start channel hopping task
         if (sniffer_channel_task_handle == NULL) {
-            xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+            xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
             MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
         }
         
@@ -16423,7 +16481,7 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     
     // Start channel hopping task
     if (sniffer_channel_task_handle == NULL) {
-        xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+        xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
         MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
     }
     
@@ -23800,6 +23858,7 @@ static void sniffer_channel_task(void *pvParameters) {
     }
     
     MY_LOG_INFO(TAG, "Sniffer channel task ending");
+    sniffer_channel_task_handle = NULL;
     vTaskDelete(NULL);
 }
 

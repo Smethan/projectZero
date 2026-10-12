@@ -1,5 +1,7 @@
 # Main task stack - increased from 3584 to avoid overflow during startup help printing
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# Async Wi-Fi scan completion formats managed telemetry through newlib vfprintf.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 # Console: keep stdio only on UART0. Disabling the USB-Serial-JTAG secondary
 # console prevents the vfs_console fan-out which otherwise sends every byte

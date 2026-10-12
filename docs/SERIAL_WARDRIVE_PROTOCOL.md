@@ -379,7 +379,7 @@ The request fields are:
 
 | Field | Contract |
 | --- | --- |
-| `boot_id` | Exact boot nonce from fresh device metadata. |
+| `boot_id` | The same 16 hexadecimal digits as the boot nonce from fresh device metadata. Hosts serialize lowercase for compatibility with firmware through 1.8.1; firmware 1.8.2 accepts either hex case. A different digit, length, or non-hex character is rejected. |
 | `op` | One advertised operation: `wardrive`, `wifi_scan`, `ble_scan`, `bt_track`, `airtag_scan`, `sniffer`, `hs_sniff`, `handshake`, `deauth`, `sae`, `blackout`, `evil_twin`, or `portal`. |
 | `band` | `wifi24`, `wifi5`, `both`, or `none`; must agree with the channel plan. |
 | `channels` | At most 40 unique supported channels; empty only for BLE-only work. The configured country filters the applied plan. |
