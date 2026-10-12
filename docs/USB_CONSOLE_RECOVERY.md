@@ -73,7 +73,30 @@ measurement, not a running-board free-heap result. Published builds provide
 their own logs and checksums. Zero keeps PSRAM disabled and its existing
 4 MiB, single-factory-app layout; XIAO/WROOM retain their dual OTA slots.
 
-This single-XIAO console validation does not complete the multi-board hardware
+## Published image and live WDG USB OTA
+
+After release CI passed all three builds, the exact published XIAO 1.8.1
+application was installed through **WDG 0.10.2's real GUI USB-OTA path** on
+the inspected uConsole. WDG validated the selected board profile and package
+geometry, transferred the image, checked its complete hash, rebooted the
+board, and reported `Verified v1.8.1 after reboot (valid OTA slot).`
+
+The result screen was closed through its normal cleanup path. WDG released
+the endpoint reservation, reopened the same physical USB identity, received
+fresh device-info and capability records, and returned to normal polling.
+The GUI remained responsive through the transfer and after reconnection.
+The board reported XIAO, 8 MiB flash, 8 MiB PSRAM, `c5_jobs_v1`, and zero
+reported drops while idle. GPS and SX1262 services remained active; their
+power states and the saved WDG settings hash were preserved.
+
+The physically installed published application is **2,297,664 bytes**, SHA-256
+`e03ec97df2e05a61fa29b67b25e5bf9e029a78982e447abc34f4a359d0674e58`.
+Its manifest identifies source commit
+`bc7a254b9763f7f9772d0cf77c48ad31c04841a0`, with a clean source state.
+Published WROOM and Zero package hashes, profiles, partitions, flash bounds,
+and sizes also passed host verification; they match the sizes above.
+
+This single-XIAO console/update validation does not complete the multi-board hardware
 acceptance record. The Waveshare Zero was not attached. Simultaneous RF band
 coverage, BLE coexistence, helper transmit silence, controlled target routing,
 peer collection during updates, and the one-hour dual-board soak remain open
