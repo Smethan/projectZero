@@ -33,6 +33,39 @@ static void beacon(unsigned subtype,unsigned length){
     p.payload[pos]=0;p.payload[pos+1]=3;memcpy(p.payload+pos+2,"a\"b",3);
     wifi_cb(&p,WIFI_PKT_MGMT);
 }
+static unsigned rid_pack(uint8_t *pack,unsigned messages){
+    pack[0]=0xf2;pack[1]=25;pack[2]=(uint8_t)messages;
+    for(unsigned i=0;i<messages;i++){
+        uint8_t *m=pack+3+i*25;memset(m,0,25);m[0]=0x02;m[1]=0x14;
+        memcpy(m+2,"USS-Enterprise",14);
+    }
+    return 3+messages*25;
+}
+static void rid_beacon(const uint8_t *pack,unsigned pack_len){
+    wifi_promiscuous_pkt_t p={.rx_ctrl={.channel=6,.rssi=-48}};
+    p.payload[0]=0x80;uint8_t mac_addr[]={0x12,0x34,0x56,0x21,0x43,0x65};
+    memcpy(p.payload+10,mac_addr,6);memcpy(p.payload+16,mac_addr,6);
+    unsigned pos=36;p.payload[pos++]=221;p.payload[pos++]=(uint8_t)(5+pack_len);
+    p.payload[pos++]=0xfa;p.payload[pos++]=0x0b;p.payload[pos++]=0xbc;
+    p.payload[pos++]=0x0d;p.payload[pos++]=0x55;memcpy(p.payload+pos,pack,pack_len);pos+=pack_len;
+    p.rx_ctrl.sig_len=(int)(pos+4);wifi_cb(&p,WIFI_PKT_MGMT);
+}
+static void rid_nan(const uint8_t *pack,unsigned pack_len,bool bad_service){
+    wifi_promiscuous_pkt_t p={.rx_ctrl={.channel=149,.rssi=-51}};
+    p.payload[0]=0xd0;uint8_t mac_addr[]={0x22,0x34,0x56,0x21,0x43,0x65};
+    memcpy(p.payload+10,mac_addr,6);memcpy(p.payload+16,mac_addr,6);
+    unsigned pos=24;p.payload[pos++]=4;p.payload[pos++]=9;
+    p.payload[pos++]=0x50;p.payload[pos++]=0x6f;p.payload[pos++]=0x9a;p.payload[pos++]=0x13;
+    unsigned service_info_len=1+pack_len,attr_len=10+service_info_len;
+    p.payload[pos++]=3;p.payload[pos++]=(uint8_t)attr_len;p.payload[pos++]=0;
+    uint8_t service_id[]={0x88,0x69,0x19,0x9d,0x92,0x09};
+    if(bad_service)service_id[0]^=1;
+    memcpy(p.payload+pos,service_id,6);pos+=6;
+    p.payload[pos++]=1;p.payload[pos++]=0;p.payload[pos++]=0x10;
+    p.payload[pos++]=(uint8_t)service_info_len;p.payload[pos++]=0x56;
+    memcpy(p.payload+pos,pack,pack_len);pos+=pack_len;
+    p.rx_ctrl.sig_len=(int)(pos+4);wifi_cb(&p,WIFI_PKT_MGMT);
+}
 static void rsn_beacon(const uint8_t akms[][4],unsigned count){
     wifi_promiscuous_pkt_t p={.rx_ctrl={.channel=6,.rssi=-55}};
     p.payload[0]=0x80;p.payload[34]=0x10;
@@ -261,7 +294,52 @@ int main(void){
     assert(strstr(output_capture,"\"kind\":\"batch_done\"") && strstr(output_capture,"\"state\":\"stopped\""));
     assert(!machine_mode && !heap_live);
     capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_batch_serial_v2\":true"));
-    assert(strstr(output_capture,"\"wardrive_live_oui_v1\":true") && strstr(output_capture,"\"live_oui_max\":8"));
+    assert(strstr(output_capture,"\"wardrive_live_oui_v1\":true") &&
+           strstr(output_capture,"\"remote_id_wifi_v1\":true") &&
+           strstr(output_capture,"\"remote_id_wifi_max_bytes\":228") &&
+           strstr(output_capture,"\"live_oui_max\":8"));
+
+    /* OpenDroneID's reference Beacon vector uses vendor IE dd/fa0bbc/0d,
+       a one-byte counter, and the f2/25/count message-pack prefix. */
+    uint8_t pack[3+9*25];unsigned pack_len=rid_pack(pack,1);rid_wifi_observation rid;
+    test_clock=1000;output_capture[0]=0;fresh();atomic_store(&collecting,true);
+    int tx_before=test_wifi_tx_count;
+    rid_beacon(pack,pack_len);assert(xQueueReceive(rid_wifi_queue,&rid,0));
+    assert(test_wifi_tx_count==tx_before);
+    assert(rid.transport==0 && rid.len==pack_len && !memcmp(rid.data,pack,pack_len));
+    emit_remote_id_wifi(&rid,3);
+    assert(strstr(output_capture,"\"kind\":\"remote_id_wifi\"") &&
+           strstr(output_capture,"\"transport\":\"beacon\"") &&
+           strstr(output_capture,"\"data_hex\":\"f21901"));
+    atomic_store(&stopping,true);test_task(NULL);
+
+    /* OpenDroneID NAN service descriptor uses service id 88:69:19:9d:92:09;
+       emitted data starts at the message pack, without descriptor/counter. */
+    test_clock=1000;output_capture[0]=0;fresh();atomic_store(&collecting,true);
+    rid_nan(pack,pack_len,false);assert(xQueueReceive(rid_wifi_queue,&rid,0));
+    assert(test_wifi_tx_count==tx_before);
+    assert(rid.transport==1 && rid.channel==149 && rid.len==pack_len && !memcmp(rid.data,pack,pack_len));
+    emit_remote_id_wifi(&rid,4);
+    assert(strstr(output_capture,"\"transport\":\"nan\"") && strstr(output_capture,"\"data_hex\":\"f21901"));
+    atomic_store(&stopping,true);test_task(NULL);
+
+    /* Invalid message-pack declarations and mismatched NAN service ids are
+       ignored; a full nine-message pack remains complete and line bounded. */
+    test_clock=1000;output_capture[0]=0;fresh();atomic_store(&collecting,true);
+    rid_nan(pack,pack_len,true);assert(uxQueueMessagesWaiting(rid_wifi_queue)==0);
+    uint8_t invalid_pack[28];memcpy(invalid_pack,pack,pack_len);invalid_pack[1]=24;
+    rid_beacon(invalid_pack,pack_len);assert(uxQueueMessagesWaiting(rid_wifi_queue)==0);
+    pack[pack_len]=0;
+    rid_beacon(pack,pack_len+1);assert(uxQueueMessagesWaiting(rid_wifi_queue)==0);
+    rid_nan(pack,pack_len+1,false);assert(uxQueueMessagesWaiting(rid_wifi_queue)==0);
+    pack_len=rid_pack(pack,9);rid_beacon(pack,pack_len);
+    assert(xQueueReceive(rid_wifi_queue,&rid,0) && rid.len==228 && !rid.truncated);
+    assert(!memcmp(rid.data,pack,pack_len) && atomic_load(&producers)==0);
+    memcpy(device_id,"aabbccddeeff",13);memcpy(boot_id,"0123456789abcdef",17);
+    job_mode=true;emit_remote_id_wifi(&rid,9);job_mode=false;
+    assert(strstr(output_capture,"\"v\":3") && strstr(output_capture,"\"transport\":\"beacon\"") &&
+           strstr(output_capture,"\"truncated\":false") && json_record_length()<=1020);
+    atomic_store(&stopping,true);test_task(NULL);
 
     /* Validate the optional bounded filter before preparing or touching radio state. */
     const char *invalid[]={"live_oui=", "live_oui=B41E5", "live_oui=B41E5Z", "live_oui=B41E52,",

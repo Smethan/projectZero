@@ -37,6 +37,8 @@ extern void linenoiseSetMachineMode(bool enabled);
 #define CACHE 128
 #define LIVE_OUI_MAX 8
 #define LIVE_OUI_IDENTITIES 32
+#define RID_WIFI_MAX 228
+#define RID_WIFI_QUEUE_LEN 4
 static uint8_t live_ouis[LIVE_OUI_MAX][3];
 static unsigned live_oui_count, live_identity_count;
 static struct { uint8_t kind, addr_type, addr[6]; } live_identities[LIVE_OUI_IDENTITIES];
@@ -121,6 +123,21 @@ static atomic_llong lease;
 static StaticQueue_t queue_storage;
 static uint8_t queue_bytes[QLEN * 128];
 static QueueHandle_t queue;
+typedef struct {
+    int64_t at;
+    uint16_t len;
+    uint8_t channel, transport;
+    int8_t rssi;
+    uint8_t mac[6];
+    bool truncated;
+    uint8_t data[RID_WIFI_MAX];
+} rid_wifi_observation;
+static StaticQueue_t rid_wifi_queue_storage;
+static uint8_t rid_wifi_queue_bytes[RID_WIFI_QUEUE_LEN * sizeof(rid_wifi_observation)];
+static QueueHandle_t rid_wifi_queue;
+static rid_wifi_observation rid_wifi_staging;
+static rid_wifi_observation rid_wifi_worker_scratch;
+static atomic_flag rid_wifi_staging_busy = ATOMIC_FLAG_INIT;
 static char session[33];
 static atomic_uint seq;
 static atomic_bool sequence_exhausted;
@@ -273,6 +290,53 @@ static void wifi_cb(void *buf,wifi_promiscuous_pkt_type_t type) {
     int len=pkt->rx_ctrl.sig_len-4; /* discard FCS */
     if(len<24 || (p[0]&0x0c)) return;
     int subtype=p[0]>>4;
+    if(subtype==13) {
+        /* Public action / NAN service discovery; capture remains passive. */
+        if(len>=30 && p[24]==4 && p[25]==9 && p[26]==0x50 && p[27]==0x6f &&
+           p[28]==0x9a && p[29]==0x13) {
+            int pos=30;
+            while(pos+3<=len) {
+                unsigned attr=p[pos];
+                unsigned attr_len=(unsigned)p[pos+1]|((unsigned)p[pos+2]<<8);
+                pos+=3;
+                if(attr_len>(unsigned)(len-pos)) return;
+                if(attr==3 && attr_len>=10 &&
+                   p[pos]==0x88 && p[pos+1]==0x69 && p[pos+2]==0x19 &&
+                   p[pos+3]==0x9d && p[pos+4]==0x92 && p[pos+5]==0x09) {
+                    /* Descriptor: service id, instance/requestor IDs, control,
+                     * service-info length, then counter and OpenDroneID pack. */
+                    unsigned service_info_len=p[pos+9];
+                    if(attr_len!=10u+service_info_len || service_info_len<5u) return;
+                    unsigned pack_len=service_info_len-1u;
+                    const uint8_t *pack=p+pos+11u; /* skip service-info counter */
+                    unsigned messages=pack_len>=3?pack[2]:0;
+                    if(pack_len<3 || pack[1]!=25 || messages<1 || messages>9 ||
+                       pack_len!=3u+messages*25u) return;
+                    /* Join the batch's in-flight producer barrier.  Recheck
+                     * collecting after joining so a late parser cannot put
+                     * this frame into the next batch. */
+                    atomic_fetch_add(&producers,1);
+                    if(atomic_load(&collecting) &&
+                       !atomic_flag_test_and_set(&rid_wifi_staging_busy)) {
+                        rid_wifi_observation *r=&rid_wifi_staging;
+                        memset(r,0,sizeof(*r));
+                        r->at=now_ms(); r->channel=pkt->rx_ctrl.channel;
+                        r->rssi=pkt->rx_ctrl.rssi; r->transport=1; memcpy(r->mac,p+10,6);
+                        r->len=pack_len>RID_WIFI_MAX?RID_WIFI_MAX:(uint16_t)pack_len;
+                        r->truncated=pack_len>RID_WIFI_MAX;
+                        memcpy(r->data,pack,r->len);
+                        if(!rid_wifi_queue || xQueueSend(rid_wifi_queue,r,0)!=pdTRUE)
+                            note_loss(&loss_queue,1);
+                        atomic_flag_clear(&rid_wifi_staging_busy);
+                    }
+                    atomic_fetch_sub(&producers,1);
+                    return;
+                }
+                pos+=(int)attr_len;
+            }
+        }
+        return;
+    }
     if(subtype!=8 && subtype!=4 && subtype!=5) return;
     int pos=subtype==4 ? 24:36;
     if(len<pos) return;
@@ -286,6 +350,31 @@ static void wifi_cb(void *buf,wifi_promiscuous_pkt_type_t type) {
         unsigned tag=p[pos++], n=p[pos++];
         if(pos+n>len) return;
         if(tag==0 && n<=32) { o.ssid_present=1; o.len=n; memcpy(o.data,p+pos,n); }
+        else if(subtype==8 && tag==221 && n>=8 && p[pos]==0xfa && p[pos+1]==0x0b &&
+                p[pos+2]==0xbc && p[pos+3]==0x0d) {
+            /* OpenDroneID Beacon IE: OUI/type, counter, then message pack. */
+            unsigned pack_len=n-5u;
+            const uint8_t *pack=p+pos+5u;
+            unsigned messages=pack_len>=3?pack[2]:0;
+            if(pack_len>=3 && pack[1]==25 && messages>=1 && messages<=9 &&
+               pack_len==3u+messages*25u) {
+                atomic_fetch_add(&producers,1);
+                if(atomic_load(&collecting) &&
+                   !atomic_flag_test_and_set(&rid_wifi_staging_busy)) {
+                    rid_wifi_observation *r=&rid_wifi_staging;
+                    memset(r,0,sizeof(*r));
+                    r->at=now_ms(); r->channel=pkt->rx_ctrl.channel;
+                    r->rssi=pkt->rx_ctrl.rssi; r->transport=0; memcpy(r->mac,p+10,6);
+                    r->len=pack_len>RID_WIFI_MAX?RID_WIFI_MAX:(uint16_t)pack_len;
+                    r->truncated=pack_len>RID_WIFI_MAX;
+                    memcpy(r->data,pack,r->len);
+                    if(!rid_wifi_queue || xQueueSend(rid_wifi_queue,r,0)!=pdTRUE)
+                        note_loss(&loss_queue,1);
+                    atomic_flag_clear(&rid_wifi_staging_busy);
+                }
+                atomic_fetch_sub(&producers,1);
+            }
+        }
         else if(tag==48 && subtype!=4 && o.privacy) {
             const uint8_t *rsn=p+pos; size_t left=n;
             if(left>=8 && rsn[0]==1 && rsn[1]==0) {
@@ -366,6 +455,24 @@ static ZERO_STACK_NOINLINE void emit_version(const observation *o,unsigned versi
     }
 }
 static void emit(const observation *o) { emit_version(o,1,0); }
+
+static ZERO_STACK_NOINLINE void emit_remote_id_wifi(const rid_wifi_observation *o,unsigned batch) {
+    int64_t age=now_ms()-o->at;
+    if(age<0 || age>20000) { note_loss(&loss_age,1); return; }
+    char address[18],data[RID_WIFI_MAX*2+1],fields[720],body[900];
+    mac(address,o->mac); hex(data,o->data,o->len);
+    if(job_mode) {
+        int n=snprintf(fields,sizeof(fields),"\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"channel\":%u,\"rssi\":%d,\"transport\":\"%s\",\"data_hex\":\"%s\",\"truncated\":%s",
+                       batch,(long long)o->at,(long long)age,address,o->channel,o->rssi,
+                       o->transport?"nan":"beacon",data,o->truncated?"true":"false");
+        if(n>0 && n<(int)sizeof(fields)) sw_job_emit_data("remote_id_wifi",fields);
+    } else {
+        int n=snprintf(body,sizeof(body),"{\"v\":2,\"kind\":\"remote_id_wifi\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"capture_ms\":%lld,\"age_ms\":%lld,\"mac\":\"%s\",\"channel\":%u,\"rssi\":%d,\"transport\":\"%s\",\"data_hex\":\"%s\",\"truncated\":%s}",
+                       session,next_seq(),batch,(long long)o->at,(long long)age,address,o->channel,o->rssi,
+                       o->transport?"nan":"beacon",data,o->truncated?"true":"false");
+        if(n>0 && n<(int)sizeof(body)) output(body);
+    }
+}
 
 static uint32_t observation_hash(const observation *o) {
     uint32_t hash=2166136261u;
@@ -567,6 +674,8 @@ static ZERO_STACK_NOINLINE void batch_worker_loop(void) {
             }
             observation o;
             if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) batch_observe(&o,current);
+            while(xQueueReceive(rid_wifi_queue,&rid_wifi_worker_scratch,0)==pdTRUE)
+                emit_remote_id_wifi(&rid_wifi_worker_scratch,current);
             if(now_ms()-heartbeat>=2000) {
                 batch_status("heartbeat","running",""); heartbeat=now_ms();
             }
@@ -575,6 +684,8 @@ static ZERO_STACK_NOINLINE void batch_worker_loop(void) {
         while(atomic_load(&producers) && !atomic_load(&stopping)) vTaskDelay(1);
         observation pending;
         while(xQueueReceive(queue,&pending,0)==pdTRUE) batch_observe(&pending,current);
+        while(xQueueReceive(rid_wifi_queue,&rid_wifi_worker_scratch,0)==pdTRUE)
+            emit_remote_id_wifi(&rid_wifi_worker_scratch,current);
         if(atomic_load(&stopping) || now_ms()-atomic_load(&lease)>=15000) break;
         atomic_store(&batch_phase,2);
         unsigned wifi=0,ble=0;
@@ -642,6 +753,8 @@ static ZERO_STACK_NOINLINE void worker(void *unused) {
                     observation o;
                     if(xQueueReceive(queue,&o,pdMS_TO_TICKS(10))==pdTRUE) emit(&o);
                 }
+                if(xQueueReceive(rid_wifi_queue,&rid_wifi_worker_scratch,0)==pdTRUE)
+                    emit_remote_id_wifi(&rid_wifi_worker_scratch,atomic_load(&batch_number));
                 if(now_ms()-stats>=2000) {
                     if(job_mode) sw_job_emit_lifecycle("heartbeat","running","");
                     else status("stats","");
@@ -664,6 +777,8 @@ static ZERO_STACK_NOINLINE void worker(void *unused) {
     }
     /* Radio callbacks never wait, so outstanding copies finish promptly. */
     while(atomic_load(&producers)) vTaskDelay(1);
+    while(xQueueReceive(rid_wifi_queue,&rid_wifi_worker_scratch,0)==pdTRUE)
+        emit_remote_id_wifi(&rid_wifi_worker_scratch,atomic_load(&batch_number));
     if (passive_hs) {
         int64_t deadline = now_ms() + 1500;
         hs_observation *o;
@@ -711,7 +826,9 @@ static int start(int argc,char **argv) {
     batch_mode = requested_batch;
     wifi_only = !strcmp(argv[0], "start_wardrive_wifi_serial") || !strcmp(argv[0], "start_wardrive_wifi_batch_serial");
     if(!queue) queue=xQueueCreateStatic(QLEN,sizeof(observation),queue_bytes,&queue_storage);
-    xQueueReset(queue); memset(seen,0,sizeof(seen));
+    if(!rid_wifi_queue) rid_wifi_queue=xQueueCreateStatic(RID_WIFI_QUEUE_LEN,sizeof(rid_wifi_observation),rid_wifi_queue_bytes,&rid_wifi_queue_storage);
+    if(!queue || !rid_wifi_queue) return 1;
+    xQueueReset(queue); xQueueReset(rid_wifi_queue); memset(seen,0,sizeof(seen));
     /* seq is boot-wide. Keeping it monotonic lets a cached terminal token
        receive a fresh status record even after later jobs have run. */
     strcpy(session,argv[1]); atomic_store(&batch_number,0); atomic_store(&batch_phase,0); packet_id=0;
@@ -764,7 +881,7 @@ static int capabilities(int argc,char **argv) {
         output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":false,\"max_line\":1024}");
         return 0;
     }
-    output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":true,\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"wardrive_live_oui_v1\":true,\"live_oui_max\":8,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"hs_capture_pcapng_v1\":true,\"sniffer_intel_v1\":true,\"sniffer_scope_v1\":true,\"target_intel_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
+    output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":true,\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"wardrive_live_oui_v1\":true,\"remote_id_wifi_v1\":true,\"remote_id_wifi_max_bytes\":228,\"live_oui_max\":8,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"hs_capture_pcapng_v1\":true,\"sniffer_intel_v1\":true,\"sniffer_scope_v1\":true,\"target_intel_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 static bool identity_ready;
 static bool ensure_identity(void) {
