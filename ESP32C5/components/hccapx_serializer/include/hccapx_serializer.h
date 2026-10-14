@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-#include "frame_analyzer_types.h"
+#include "frame_analyzer_parser.h"
 
 /**
  * @brief HCCAPX structure according to reference
@@ -57,9 +57,9 @@ hccapx_t *hccapx_serializer_get();
  * If frame contains handshake from another STA than the one that was already added before,
  * frame will be skipped and error message will be printed.
  * 
- * @param frame data frame with EAPoL-Key packet
+ * @param view validated bounded frame view containing an EAPOL-Key packet
  */
-void hccapx_serializer_add_frame(data_frame_t *frame);
+void hccapx_serializer_add_frame(const frame_view_t *view);
 
 #endif
 

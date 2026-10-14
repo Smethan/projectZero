@@ -31,19 +31,21 @@ int main(void) {
     assert(data[48] == 6);
 
     pcap_serializer_set_observer(observe);
-    pcap_serializer_append_frame_radio(frame, sizeof(frame), 1234567, 6, -42);
+    assert(pcap_serializer_append_frame_radio(frame, sizeof(frame), 0x10000001234567ULL, 6, -42));
     assert(observed == 1);
     data = pcap_serializer_get_buffer();
     assert(le32(data + 60) == 6);
     uint32_t block_len = le32(data + 64);
     assert(block_len == 52 && pcap_serializer_get_size() == 112);
-    assert(le32(data + 76) == 1234567);
+    assert(le32(data + 72) == 0x00100000U);
+    assert(le32(data + 76) == 0x01234567U);
     assert(le32(data + 80) == 20 && le32(data + 84) == 20);
     const uint8_t *rt = data + 88;
     assert(le16(rt + 2) == 15 && le32(rt + 4) == 0x2a);
     assert(rt[8] == 0 && le16(rt + 10) == 2437 && (int8_t)rt[14] == -42);
     assert(!memcmp(rt + 15, frame, sizeof(frame)));
     assert(le32(data + 60 + block_len - 4) == block_len);
+    assert(!pcap_serializer_append_frame_radio(NULL, sizeof(frame), 1, 6, -42));
 
     pcap_serializer_deinit();
     assert(!pcap_serializer_get_buffer() && !pcap_serializer_get_size());

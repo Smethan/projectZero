@@ -6,6 +6,7 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -87,22 +88,26 @@ uint8_t *pcap_serializer_init(void) {
     return pcapng_buffer;
 }
 
-void pcap_serializer_append_frame_radio(const uint8_t *buffer, unsigned size,
-                                        unsigned ts_usec, uint8_t channel,
+bool pcap_serializer_append_frame_radio(const uint8_t *buffer, unsigned size,
+                                        uint64_t ts_usec, uint8_t channel,
                                         int8_t rssi) {
     if (!pcapng_buffer || !buffer || !size) {
         ESP_LOGD(TAG, "Frame or PCAPNG buffer unavailable; skipping frame.");
-        return;
+        return false;
     }
     if (size > PCAPNG_SNAPLEN - PCAPNG_RADIOTAP_LEN)
         size = PCAPNG_SNAPLEN - PCAPNG_RADIOTAP_LEN;
 
     const unsigned packet_size = PCAPNG_RADIOTAP_LEN + size;
     const unsigned block_size = 32U + align4(packet_size);
+    if (block_size > UINT_MAX - pcapng_size) {
+        ESP_LOGE(TAG, "PCAPNG buffer size overflow; skipping frame.");
+        return false;
+    }
     uint8_t *grown = realloc(pcapng_buffer, pcapng_size + block_size);
     if (!grown) {
         ESP_LOGE(TAG, "Error growing PCAPNG buffer; capture may be incomplete.");
-        return;
+        return false;
     }
     pcapng_buffer = grown;
     uint8_t *block = pcapng_buffer + pcapng_size;
@@ -110,8 +115,8 @@ void pcap_serializer_append_frame_radio(const uint8_t *buffer, unsigned size,
     put_le32(block, PCAPNG_ENHANCED_PACKET_BLOCK);
     put_le32(block + 4, block_size);
     put_le32(block + 8, 0);  /* interface id */
-    put_le32(block + 12, 0); /* timestamp high */
-    put_le32(block + 16, ts_usec);
+    put_le32(block + 12, (uint32_t)(ts_usec >> 32));
+    put_le32(block + 16, (uint32_t)ts_usec);
     put_le32(block + 20, packet_size);
     put_le32(block + 24, packet_size);
 
@@ -128,11 +133,12 @@ void pcap_serializer_append_frame_radio(const uint8_t *buffer, unsigned size,
 
     pcap_frame_observer_t observer = atomic_load(&frame_observer);
     if (observer) observer(buffer, size);
+    return true;
 }
 
-void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size,
-                                  unsigned ts_usec) {
-    pcap_serializer_append_frame_radio(buffer, size, ts_usec, 0, 0);
+bool pcap_serializer_append_frame(const uint8_t *buffer, unsigned size,
+                                  uint64_t ts_usec) {
+    return pcap_serializer_append_frame_radio(buffer, size, ts_usec, 0, 0);
 }
 
 void pcap_serializer_deinit(void) {

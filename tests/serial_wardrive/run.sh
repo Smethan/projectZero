@@ -12,6 +12,18 @@ python3 extract_hs_ap.py "$test_dir"
 python3 extract_hs_fcs.py "$test_dir"
 python3 extract_zero_resources.py "$test_dir"
 python3 extract_sniffer_stop.py "$test_dir"
+python3 extract_pcap_stop.py "$test_dir"
+python3 extract_sniffer_callback.py "$test_dir"
+cc -std=c11 -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -I ../../ESP32C5/components/frame_analyzer/include test_legacy_frame_safety.c \
+    ../../ESP32C5/components/frame_analyzer/frame_analyzer_parser.c -o "$test_dir/test-legacy-frames"
+ASAN_OPTIONS=detect_leaks=0 "$test_dir/test-legacy-frames"
+python3 test_legacy_sniffer_worker.py
+cc -std=c11 -I stubs -I ../../ESP32C5/components/frame_analyzer/include \
+    -I ../../ESP32C5/components/hccapx_serializer/include test_legacy_hccapx_reset.c \
+    ../../ESP32C5/components/frame_analyzer/frame_analyzer_parser.c \
+    -o "$test_dir/test-legacy-hccapx"
+"$test_dir/test-legacy-hccapx"
 for source in test_serial.c test_hs_monitor.c test_capture_pool.c test_wifi_init.c test_country.c test_hs_targets.c test_handshake_scope.c test_hs_scan_lifecycle.c test_hs_exchange.c test_hs_artifact.c test_hs_client.c test_hs_ap.c test_hs_fcs.c test_pcapng_serializer.c; do
     cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -I "$test_dir" -I stubs -I ../../ESP32C5/main -I ../../ESP32C5/components/pcap_serializer/include "$source" -o "$test_dir/test"
     "$test_dir/test"
@@ -22,6 +34,10 @@ cc -std=c11 -I "$test_dir" test_zero_resources.c -o "$test_dir/test-zero-resourc
 "$test_dir/test-zero-resources"
 cc -std=c11 -I "$test_dir" test_sniffer_stop.c -o "$test_dir/test-sniffer-stop"
 "$test_dir/test-sniffer-stop"
+cc -std=c11 -I "$test_dir" test_sniffer_callback.c -o "$test_dir/test-sniffer-callback"
+"$test_dir/test-sniffer-callback"
+cc -std=c11 -I "$test_dir" test_pcap_stop.c -o "$test_dir/test-pcap-stop"
+"$test_dir/test-pcap-stop"
 cc -std=c11 -I "$test_dir" test_portal_cleanup.c -o "$test_dir/test-portal-cleanup"
 "$test_dir/test-portal-cleanup"
 for zero_profile in 0 1; do

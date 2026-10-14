@@ -11,6 +11,7 @@
 
 #include "esp_event.h"
 #include <stdint.h>
+#include "frame_analyzer_parser.h"
 
 ESP_EVENT_DECLARE_BASE(FRAME_ANALYZER_EVENTS);
 
@@ -18,6 +19,11 @@ enum {
     DATA_FRAME_EVENT_EAPOLKEY_FRAME,
     DATA_FRAME_EVENT_PMKID
 };
+
+typedef struct {
+    uint8_t bssid[6];
+    pmkid_list_t matches;
+} frame_analyzer_pmkid_event_t;
 
 /**
  * @brief Search types for frame analyzer.
@@ -35,7 +41,7 @@ typedef enum {
  * @param search_type type of information that are demanded
  * @param bssid target AP's BSSID
  */
-void frame_analyzer_capture_start(search_type_t search_type, const uint8_t *bssid);
+esp_err_t frame_analyzer_capture_start(search_type_t search_type, const uint8_t *bssid);
 
 /**
  * @brief stops frame analysis

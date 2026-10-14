@@ -7,6 +7,9 @@
 #include "capture_memory.h"
 #include "esp_heap_caps.h"
 #include "linenoise/linenoise.h"
+/* Supplied by the pinned-IDF patch in tools/patch_idf_linenoise_machine.cmake.
+ * Some incremental SDK include trees expose the stock header during compile. */
+extern void linenoiseSetMachineMode(bool enabled);
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -16,6 +19,7 @@
 #include "esp_random.h"
 #include "esp_flash.h"
 #include "esp_psram.h"
+#include "esp_app_desc.h"
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -47,6 +51,7 @@ bool sw_hs_mode(void) { return passive_hs; }
 static bool job_mode, in_job_dispatch, collect_wifi = true, collect_ble = true;
 static atomic_bool external_job_active;
 static atomic_bool external_job_ready;
+static atomic_bool external_operation_ready;
 static atomic_bool external_job_starting;
 static atomic_bool external_job_stopping;
 static atomic_bool external_stop_completed;
@@ -55,7 +60,21 @@ static atomic_bool external_stop_claimed;
 static TaskHandle_t external_supervisor_task;
 static sw_radio_busy_probe_t radio_busy_probe;
 static char active_job_operation[24];
+static atomic_uint sniffer_packets, sniffer_aps, sniffer_drops;
+void sw_job_set_sniffer_stats(uint32_t packets,uint32_t aps,uint32_t drops) {
+    atomic_store(&sniffer_packets,packets);
+    atomic_store(&sniffer_aps,aps);
+    atomic_store(&sniffer_drops,drops);
+}
 static char device_id[13], boot_id[17], job_token[33];
+static bool firmware_ready = true;
+static bool recovery_ota_available;
+static char firmware_boot_reason[32] = "normal";
+void sw_set_boot_state(bool ready, const char *reason, bool ota_available) {
+    firmware_ready = ready;
+    recovery_ota_available = ota_available;
+    snprintf(firmware_boot_reason, sizeof(firmware_boot_reason), "%s", reason ? reason : "unknown");
+}
 static uint32_t job_request_hash;
 static uint8_t job_channels[40];
 static unsigned job_channel_count;
@@ -512,10 +531,12 @@ done:
     atomic_fetch_sub(&producers, 1);
 }
 static ZERO_STACK_NOINLINE void hs_emit(const hs_observation *o) {
+    /* Decide queue age once, before emitting any chunks. Abandoning a frame
+     * midway through a slow USB write leaves the host with an unusable record. */
+    int64_t age = now_ms() - o->at;
+    if (age > 2000) { note_loss(&loss_age, 1); return; }
     unsigned id = ++packet_id;
     for (unsigned offset = 0; offset < o->len; offset += 240) {
-        int64_t age = now_ms() - o->at;
-        if (age > 2000) { note_loss(&loss_age, 1); return; }
         unsigned size = o->len-offset < 240 ? o->len-offset : 240;
         char data[481], body[900];
         hex(data, o->data+offset, size);
@@ -635,7 +656,12 @@ static ZERO_STACK_NOINLINE void worker(void *unused) {
         else status("error",",\"message\":\"radio_start_failed\"");
     }
     atomic_store(&collecting,false);
-    sw_radio_stop();
+    while(!sw_radio_stop()) {
+        /* Keep the token and job mode until the radio snapshot is restored.
+         * A replacement job cannot inherit partially restored Wi-Fi state. */
+        if(job_mode)sw_job_emit_lifecycle("status","stopping","\"message\":\"radio_restore_retry\"");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
     /* Radio callbacks never wait, so outstanding copies finish promptly. */
     while(atomic_load(&producers)) vTaskDelay(1);
     if (passive_hs) {
@@ -733,6 +759,11 @@ static int wardrive_status(int argc,char **argv) {
     return 0;
 }
 static int capabilities(int argc,char **argv) {
+    (void)argc; (void)argv;
+    if(!firmware_ready) {
+        output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":false,\"max_line\":1024}");
+        return 0;
+    }
     output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":true,\"wardrive_serial_v1\":true,\"wardrive_wifi_serial_v1\":true,\"wardrive_batch_serial_v2\":true,\"wardrive_wifi_batch_serial_v2\":true,\"wardrive_live_oui_v1\":true,\"live_oui_max\":8,\"batch_window_ms\":10000,\"heartbeat_ms\":2000,\"max_age_ms\":20000,\"hs_sniff_serial_v1\":true,\"hs_capture_targets_v1\":true,\"hs_capture_exclusions_v1\":true,\"hs_capture_pcapng_v1\":true,\"sniffer_intel_v1\":true,\"sniffer_scope_v1\":true,\"target_intel_v1\":true,\"bands\":[\"wifi24\",\"wifi5\",\"ble\"],\"wifi_mgmt\":true,\"ble_raw_ad\":true,\"ble_extended\":false,\"max_line\":1024}"); return 0;
 }
 static bool identity_ready;
@@ -838,6 +869,44 @@ void sw_register_radio_busy_probe(sw_radio_busy_probe_t probe) { radio_busy_prob
 const char *sw_job_token(void) { return job_token; }
 bool sw_job_owned(void) { return job_mode; }
 bool sw_job_owner_matches(const char *token) { return token && job_token[0] && !strcmp(token,job_token); }
+bool sw_job_signal_ready(const char *token) {
+    if(!sw_job_owner_matches(token) || !atomic_load(&external_job_starting) ||
+       atomic_load(&external_job_stopping))return false;
+    atomic_store(&external_operation_ready,true);
+    return true;
+}
+bool sw_job_fail_start(const char *token,const char *reason) {
+    if(!sw_job_owner_matches(token) || !atomic_load(&external_job_starting))return false;
+    char code[41];size_t used=0;
+    if(reason)for(;reason[used] && used<sizeof(code)-1;used++) {
+        unsigned char ch=(unsigned char)reason[used];
+        if(!islower(ch) && !isdigit(ch) && ch!='_')break;
+        code[used]=(char)ch;
+    }
+    code[used]=0;
+    if(!used || (reason && reason[used]))snprintf(code,sizeof(code),"unknown");
+    char fields[128];
+    snprintf(fields,sizeof(fields),"\"message\":\"operation_start_failed\",\"start_reason\":\"%s\"",code);
+    atomic_store(&external_job_stopping,true);
+    sw_job_emit_lifecycle("error","stopping",fields);
+    return true;
+}
+bool sw_job_request_cleanup(const char *token,const char *reason) {
+    if(!sw_job_owner_matches(token) || !atomic_load(&external_job_active))return false;
+    char code[41];size_t used=0;
+    if(reason)for(;reason[used] && used<sizeof(code)-1;used++) {
+        unsigned char ch=(unsigned char)reason[used];
+        if(!islower(ch) && !isdigit(ch) && ch!='_')break;
+        code[used]=(char)ch;
+    }
+    code[used]=0;
+    if(!used || (reason && reason[used]))snprintf(code,sizeof(code),"unknown");
+    char fields[128];
+    snprintf(fields,sizeof(fields),"\"message\":\"operation_failed\",\"failure_reason\":\"%s\"",code);
+    atomic_store(&external_job_stopping,true);
+    sw_job_emit_lifecycle("error","stopping",fields);
+    return true;
+}
 bool sw_job_lease_valid(void) { return job_mode && now_ms()-atomic_load(&lease)<15000; }
 bool sw_job_set_radio_plan(const uint8_t *channels,size_t count,unsigned dwell_ms) {
     if(count>40 || (count && !channels) || dwell_ms<40 || dwell_ms>2000) return false;
@@ -860,29 +929,62 @@ bool sw_job_set_filters(const uint8_t targets[][6],size_t target_count,const uin
     if(exclusion_count)memcpy(job_exclusions,exclusions,exclusion_count*6);
     job_target_count=(unsigned)target_count;job_exclusion_count=(unsigned)exclusion_count;return true;
 }
-bool sw_job_radio_hop(unsigned index,uint8_t *applied_channel) {
-    if(job_mode) {
-        if(!job_channel_count)return false;
-        uint8_t channel=job_channels[index%job_channel_count];
-        if(esp_wifi_set_channel(channel,WIFI_SECOND_CHAN_NONE)!=ESP_OK)return false;
-        if(applied_channel)*applied_channel=channel;
-        char fields[32];snprintf(fields,sizeof(fields),"\"channel\":%u",channel);
-        sw_job_emit_lifecycle("status",job_current_state(),fields);
-        return true;
+sw_channel_result_t sw_job_apply_channel_checked(uint8_t channel) {
+    sw_channel_result_t result={.status=SW_CHANNEL_DRIVER_ERROR,.requested_channel=channel,
+                                .mode=WIFI_MODE_NULL,.band=WIFI_BAND_MODE_AUTO,.sdk_error=ESP_OK};
+    (void)esp_wifi_get_mode(&result.mode);
+    (void)esp_wifi_get_band_mode(&result.band);
+    if(job_mode && !sw_job_channel_allowed(channel)) {
+        result.status=SW_CHANNEL_NOT_IN_PLAN;
+        result.sdk_error=ESP_ERR_INVALID_ARG;
+        return result;
     }
-    sw_radio_hop(index);
+    result.sdk_error=esp_wifi_set_channel(channel,WIFI_SECOND_CHAN_NONE);
+    if(result.sdk_error!=ESP_OK) return result;
+    wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
+    result.sdk_error=esp_wifi_get_channel(&result.actual_channel,&secondary);
+    if(result.sdk_error!=ESP_OK || result.actual_channel!=channel || secondary!=WIFI_SECOND_CHAN_NONE) {
+        result.status=SW_CHANNEL_READBACK_ERROR;
+        if(result.sdk_error==ESP_OK)result.sdk_error=ESP_FAIL;
+        return result;
+    }
+    result.status=SW_CHANNEL_OK;
+    if(job_mode) {
+        char fields[32];snprintf(fields,sizeof(fields),"\"channel\":%u",result.actual_channel);
+        sw_job_emit_lifecycle("status",job_current_state(),fields);
+    }
+    return result;
+}
+sw_channel_result_t sw_job_radio_hop_checked(unsigned index) {
+    if(job_mode && !job_channel_count) {
+        sw_channel_result_t result={.status=SW_CHANNEL_NOT_IN_PLAN,.sdk_error=ESP_ERR_INVALID_ARG};
+        return result;
+    }
+    static const uint8_t legacy_channels[]={1,6,11,2,3,4,5,7,8,9,10,12,13,
+        36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+    uint8_t channel=job_mode?job_channels[index%job_channel_count]:legacy_channels[index%sizeof(legacy_channels)];
+    return sw_job_apply_channel_checked(channel);
+}
+bool sw_job_radio_hop(unsigned index,uint8_t *applied_channel) {
+    sw_channel_result_t result=sw_job_radio_hop_checked(index);
+    if(result.status!=SW_CHANNEL_OK)return false;
+    if(applied_channel)*applied_channel=result.actual_channel;
     return true;
 }
 bool sw_job_apply_channel(uint8_t channel) {
-    if(job_mode) {
-        bool listed=false;
-        for(unsigned i=0;i<job_channel_count;i++) if(job_channels[i]==channel) { listed=true;break; }
-        if(!listed || esp_wifi_set_channel(channel,WIFI_SECOND_CHAN_NONE)!=ESP_OK)return false;
-        char fields[32];snprintf(fields,sizeof(fields),"\"channel\":%u",channel);
-        sw_job_emit_lifecycle("status",job_current_state(),fields);
-        return true;
-    }
-    return esp_wifi_set_channel(channel,WIFI_SECOND_CHAN_NONE)==ESP_OK;
+    return sw_job_apply_channel_checked(channel).status==SW_CHANNEL_OK;
+}
+void sw_job_emit_channel_failure(sw_channel_result_t result) {
+    const char *mode=result.mode==WIFI_MODE_STA?"sta":result.mode==WIFI_MODE_AP?"ap":
+        result.mode==WIFI_MODE_APSTA?"sta_ap":"null";
+    const char *band=result.band==WIFI_BAND_MODE_2G_ONLY?"2g":
+        result.band==WIFI_BAND_MODE_5G_ONLY?"5g":result.band==WIFI_BAND_MODE_AUTO?"auto":"unknown";
+    const char *failure=result.status==SW_CHANNEL_NOT_IN_PLAN?"not_in_plan":
+        result.status==SW_CHANNEL_READBACK_ERROR?"readback":"driver";
+    char fields[240];
+    snprintf(fields,sizeof(fields),"\"message\":\"channel_apply_failed\",\"channel_failure\":\"%s\",\"requested_channel\":%u,\"actual_channel\":%u,\"radio_mode\":\"%s\",\"band\":\"%s\",\"sdk_error\":%d",
+             failure,result.requested_channel,result.actual_channel,mode,band,result.sdk_error);
+    sw_job_emit_lifecycle("error","running",fields);
 }
 bool sw_job_channel_allowed(uint8_t channel) {
     if(!job_mode)return true;
@@ -940,18 +1042,25 @@ ZERO_STACK_NOINLINE void sw_job_emit_lifecycle(const char *kind,const char *stat
         kind="error";state="stopping";json_fields="\"message\":\"sequence_exhausted\"";
     }
     char line[1024];
-    int n=snprintf(line,sizeof(line),"\nWDG:{\"v\":3,\"device_id\":\"%s\",\"boot_id\":\"%s\",\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u,\"losses\":{\"queue\":%u,\"age\":%u,\"output\":%u,\"saturation\":%u},\"state\":\"%s\"%s%s}\n",
+    /* Three uint32 values need at most 81 bytes of JSON plus NUL.  Keep
+     * this bounded so the capture task's measured local stack stays within
+     * the release gate. */
+    char sniffer_fields[88]="";
+    if(!strcmp(active_job_operation,"sniffer"))
+        snprintf(sniffer_fields,sizeof(sniffer_fields),",\"sniffer_packets\":%u,\"sniffer_aps\":%u,\"sniffer_drops\":%u",
+                 atomic_load(&sniffer_packets),atomic_load(&sniffer_aps),atomic_load(&sniffer_drops));
+    int n=snprintf(line,sizeof(line),"\nWDG:{\"v\":3,\"device_id\":\"%s\",\"boot_id\":\"%s\",\"kind\":\"%s\",\"session\":\"%s\",\"seq\":%u,\"batch\":%u,\"wifi_count\":%u,\"ble_count\":%u,\"drops\":%u,\"losses\":{\"queue\":%u,\"age\":%u,\"output\":%u,\"saturation\":%u},\"state\":\"%s\"%s%s%s}\n",
         device_id,boot_id,kind,job_token,seqno,atomic_load(&batch_number),atomic_load(&wifi_count),atomic_load(&ble_count),atomic_load(&drops),
-        atomic_load(&loss_queue),atomic_load(&loss_age),atomic_load(&loss_output),atomic_load(&loss_saturation),state,json_fields&&*json_fields?",":"",json_fields?json_fields:"");
+        atomic_load(&loss_queue),atomic_load(&loss_age),atomic_load(&loss_output),atomic_load(&loss_saturation),state,sniffer_fields,json_fields&&*json_fields?",":"",json_fields?json_fields:"");
     if(n<=0 || n>=(int)sizeof(line) || !serial_record_write(line,n,true))note_loss(&loss_output,1);
 }
 void sw_job_remember_terminal(void) { if(job_mode) remember_terminal_job(job_token,job_request_hash); }
 static void finalize_external_host_stop(void) {
     bool expected=true;
     if(!atomic_compare_exchange_strong(&external_stop_completed,&expected,false)) return;
-    active_job_operation[0]=0;
     sw_job_emit_lifecycle("stopped","stopped","");
     sw_job_remember_terminal();
+    active_job_operation[0]=0;
     job_mode=false;
 }
 static void remember_terminal_job(const char *token,uint32_t hash) {
@@ -1017,7 +1126,19 @@ static int device_info(int argc,char **argv) {
         if(wrote<=0||(size_t)wrote>=sizeof(channels)-channel_used)return 1;
         channel_used+=(size_t)wrote;
     }
-    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":true},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits);
+    char build_id[17] = {0};
+    int build_written=esp_app_get_elf_sha256(build_id,sizeof(build_id));
+    if((build_written!=16 && build_written!=17) || build_id[16] || strlen(build_id)!=16) return 1;
+    for(unsigned i=0;i<16;i++)if(!isxdigit((unsigned char)build_id[i]))return 1;
+    if(!firmware_ready) {
+        operations[0]=0; channels[0]=0; updates=recovery_ota_available?"[\"usb-ota\",\"rom\"]":"[\"rom\"]";
+        /* Keep the v3 limit shape for hosts through WDG 0.10.3 while making
+         * every scan capacity zero in recovery mode. */
+        operation_limits="";
+        limit_json="\"targets\":0,\"exclusions\":0,\"batch\":0,\"aps\":0,\"clients\":0,\"probes\":0";
+        memory_limits="";
+    }
+    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":%s},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s,\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"boot_state\":\"%s\",\"boot_reason\":\"%s\"}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",firmware_ready?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits,esp_app_get_description()->version,build_id,firmware_ready?"ready":"degraded",firmware_boot_reason);
     if(n<=0 || n>1000) return 1;
     output(b); return 0;
 }
@@ -1179,10 +1300,12 @@ static int job_start(int argc,char **argv) {
         if(!handler) goto unsupported;
         snprintf(job_token,sizeof(job_token),"%s",argv[1]); job_request_hash=hash; job_mode=true;
         atomic_store(&drops,0); reset_losses(); atomic_store(&wifi_count,0); atomic_store(&ble_count,0);
+        sw_job_set_sniffer_stats(0,0,0);
         atomic_store(&lease,now_ms());
         atomic_store(&external_job_active,false);
         atomic_store(&external_stop_claimed,false);
         atomic_store(&external_job_ready,false);
+        atomic_store(&external_operation_ready,false);
         atomic_store(&external_job_starting,true);
         atomic_store(&external_job_stopping,false);
         atomic_store(&external_stop_completed,false);
@@ -1198,10 +1321,10 @@ static int job_start(int argc,char **argv) {
             return 1;
         }
         int rc=handler(root,argv[1]);
-        if(rc==0) {
+        if(rc==SW_JOB_START_READY || rc==SW_JOB_START_PENDING) {
             atomic_store(&external_job_active,true);
             atomic_store(&lease,now_ms());
-            atomic_store(&external_job_starting,false);
+            if(rc==SW_JOB_START_READY)atomic_store(&external_job_starting,false);
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
             if(heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)<ZERO_JOB_INTERNAL_RESERVE) {
                 /* Keep the supervisor behind its start barrier while this
@@ -1228,7 +1351,8 @@ static int job_start(int argc,char **argv) {
             }
 #endif
             atomic_store(&external_job_ready,true);
-            sw_job_emit_lifecycle("started","running","");
+            if(rc==SW_JOB_START_READY)sw_job_emit_lifecycle("started","running","");
+            else sw_job_emit_lifecycle("status","starting","");
         }
         else {
             atomic_store(&external_job_active,false); atomic_store(&external_job_ready,true);
@@ -1237,7 +1361,7 @@ static int job_start(int argc,char **argv) {
             job_event_for(argv[1],"error","error","operation_start_failed"); remember_terminal_job(argv[1],hash);
         }
         cJSON_Delete(root); heap_caps_free(json);
-        return rc;
+        return rc==SW_JOB_START_PENDING?0:rc;
     }
     char oui_arg[65]={0}; cJSON *ouis=cJSON_GetObjectItemCaseSensitive(root,"live_ouis");
     if(ouis) {
@@ -1275,6 +1399,11 @@ static void external_job_supervisor(void *arg) {
     while(atomic_load(&external_job_active)) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         if(!atomic_load(&external_job_active)) break;
+        if(atomic_load(&external_job_starting) && atomic_load(&external_operation_ready) &&
+           !atomic_load(&external_job_stopping)) {
+            atomic_store(&external_job_starting,false);
+            sw_job_emit_lifecycle("started","running","");
+        }
         if(atomic_load(&external_job_stopping) || now_ms()-atomic_load(&lease)>=15000) {
             const char *stop_fields=now_ms()-atomic_load(&lease)>=15000?
                 "\"message\":\"lease_expired\"":"\"message\":\"host_stop\"";
@@ -1285,9 +1414,10 @@ static void external_job_supervisor(void *arg) {
                 sw_job_operation_stop_t stop=NULL;
                 for(unsigned i=0;i<job_handler_count;i++) if(!strcmp(active_job_operation,job_handlers[i].operation)) { stop=job_handlers[i].stop;break; }
                 if(stop && stop(job_token)==0) {
-                    atomic_store(&external_job_active,false); active_job_operation[0]=0;
+                    atomic_store(&external_job_active,false);
                     sw_job_emit_lifecycle("stopped","stopped",stop_fields);
                     sw_job_remember_terminal();
+                    active_job_operation[0]=0;
                     job_mode=false;
                 } else {
                     /* Keep the lease owner live until radio cleanup succeeds.
@@ -1409,4 +1539,10 @@ void sw_register(void) {
         {.command="wardrive_status",.help="Repeat current batched wardrive state: <session>",.func=wardrive_status},
         {.command="get_capabilities",.help="Machine-readable serial capabilities",.func=capabilities}};
     for(unsigned i=0;i<sizeof(cmds)/sizeof(cmds[0]);i++) ESP_ERROR_CHECK(sw_register_command(&cmds[i]));
+}
+void sw_register_recovery(void) {
+    const esp_console_cmd_t info={.command="get_device_info",.help="Read firmware recovery identity",.func=job_device_info};
+    const esp_console_cmd_t caps={.command="get_capabilities",.help="Read recovery capabilities",.func=capabilities};
+    ESP_ERROR_CHECK(sw_register_command(&info));
+    ESP_ERROR_CHECK(sw_register_command(&caps));
 }

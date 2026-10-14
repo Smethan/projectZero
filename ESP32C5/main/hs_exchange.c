@@ -102,6 +102,11 @@ static bool parse_eapol(const uint8_t *frame, size_t len, hsx_parsed_t *out) {
     return true;
 }
 
+uint8_t hsx_classify_eapol(const uint8_t *frame, size_t len) {
+    hsx_parsed_t parsed;
+    return parse_eapol(frame, len, &parsed) ? parsed.message : 0;
+}
+
 static hsx_entry_t *find_entry(hsx_state_t *state, const hsx_parsed_t *p) {
     for (unsigned i = 0; i < HSX_EXCHANGE_LIMIT; i++) {
         hsx_entry_t *entry = &state->entries[i];
@@ -172,7 +177,7 @@ void hsx_reset(hsx_state_t *state) {
 }
 
 bool hsx_ingest_radio(hsx_state_t *state, const uint8_t *frame, size_t len,
-                      uint32_t timestamp_us, uint8_t channel, int8_t rssi,
+                      uint64_t timestamp_us, uint8_t channel, int8_t rssi,
                 const uint8_t *ssid, size_t ssid_len,
                 hsx_result_t *result) {
     if (!state || !result || len > HSX_FRAME_MAX || ssid_len > 32 ||
@@ -241,7 +246,7 @@ bool hsx_ingest_radio(hsx_state_t *state, const uint8_t *frame, size_t len,
 }
 
 bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
-                uint32_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
+                uint64_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
                 hsx_result_t *result) {
     return hsx_ingest_radio(state, frame, len, timestamp_us, 0, 0,
                             ssid, ssid_len, result);
@@ -318,8 +323,8 @@ static bool pcap_frame(uint8_t *out, size_t capacity, size_t *used,
     if (!frame || !frame->len) return true;
     if (frame->len > HSX_FRAME_MAX || *used + 16U + frame->len > capacity) return false;
     uint8_t *record = out + *used;
-    put32(record, frame->timestamp_us / 1000000U);
-    put32(record + 4, frame->timestamp_us % 1000000U);
+    put32(record, (uint32_t)(frame->timestamp_us / 1000000ULL));
+    put32(record + 4, (uint32_t)(frame->timestamp_us % 1000000ULL));
     put32(record + 8, frame->len);
     put32(record + 12, frame->len);
     memcpy(record + 16, frame->data, frame->len);
@@ -382,8 +387,8 @@ static bool pcapng_frame(uint8_t *out, size_t capacity, size_t *used,
     put32(block, 6U);                  /* Enhanced Packet Block */
     put32(block + 4, (uint32_t)block_len);
     put32(block + 8, 0U);             /* interface 0 */
-    put32(block + 12, 0U);            /* timestamp high */
-    put32(block + 16, frame->timestamp_us);
+    put32(block + 12, (uint32_t)(frame->timestamp_us >> 32));
+    put32(block + 16, (uint32_t)frame->timestamp_us);
     put32(block + 20, (uint32_t)packet_len);
     put32(block + 24, (uint32_t)packet_len);
     uint8_t *packet = block + 28;

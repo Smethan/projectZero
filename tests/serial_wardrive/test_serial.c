@@ -6,13 +6,19 @@ static int stopped_radios, hops, prepare_calls;
 static bool inject_live;
 bool sw_prepare(void){prepare_calls++;return prepare_ok;}
 bool sw_radio_start(void){return radio_ok;}
-void sw_radio_stop(void){stopped_radios++;}
+bool sw_radio_stop(void){stopped_radios++;return true;}
 void sw_radio_hop(unsigned i){
     hops++;
     if(inject_live && atomic_load(&collecting)) {
         uint8_t addr[]={1,0,0,0x52,0x1e,0xb4},ad[]={4,9,'a','b','c'};
         sw_ble(addr,0,-62,0,ad,sizeof(ad));inject_live=false;
     }
+}
+static size_t json_record_length(void) {
+    const char *record=strstr(output_capture,"WDG:");
+    assert(record);
+    record+=4;
+    return strcspn(record,"\r\n");
 }
 static void fresh(void){
     atomic_store(&active,false);atomic_store(&collecting,false);
@@ -50,10 +56,25 @@ int main(void){
     output_capture[0]=0;
     assert(device_info(1,NULL)==0);
     assert(strstr(output_capture,"\"kind\":\"device_info\"") &&
+           strstr(output_capture,"\"firmware_version\":\"1.8.4\"") &&
+           strstr(output_capture,"\"build_id\":\"0123456789abcdef\"") &&
+           strstr(output_capture,"\"boot_state\":\"ready\"") &&
            strstr(output_capture,"\"capabilities\":{\"c5_jobs_v1\":true}") &&
            strstr(output_capture,"\"board\":\"xiao\"") &&
            strstr(output_capture,"\"updates\":[\"usb-ota\",\"rom\"]") &&
-           strstr(output_capture,"\"operation_limits\"") && strlen(output_capture)<1024);
+           strstr(output_capture,"\"operation_limits\"") && json_record_length()<=1000);
+    sw_set_boot_state(false,"psram_buffer_failed",false);
+    output_capture[0]=0;assert(device_info(1,NULL)==0);
+    assert(json_record_length()<=1000 && strstr(output_capture,"\"boot_state\":\"degraded\"") &&
+           strstr(output_capture,"\"boot_reason\":\"psram_buffer_failed\"") &&
+           strstr(output_capture,"\"build_id\":\"0123456789abcdef\"") &&
+           strstr(output_capture,"\"capabilities\":{\"c5_jobs_v1\":false}") &&
+           strstr(output_capture,"\"operations\":[]") && strstr(output_capture,"\"channels\":[]") &&
+           strstr(output_capture,"\"limits\":{\"targets\":0,\"exclusions\":0,\"batch\":0,\"aps\":0,\"clients\":0,\"probes\":0}"));
+    output_capture[0]=0;assert(capabilities(1,NULL)==0);
+    assert(strstr(output_capture,"\"c5_jobs_v1\":false") && !strstr(output_capture,"wardrive_serial_v1"));
+    sw_set_boot_state(true,"normal",true);
+    output_capture[0]=0;assert(device_info(1,NULL)==0);
     test_country=(wifi_country_t){.cc={'U','S',0},.schan=1,.nchan=11};
     test_country_available=true;
     assert(valid_channel(11) && !valid_channel(12) && !valid_channel(14));
@@ -61,6 +82,26 @@ int main(void){
     assert(strstr(output_capture,"\"channels\":[1,2,3,4,5,6,7,8,9,10,11,36") &&
            !strstr(output_capture,"\"channels\":[1,2,3,4,5,6,7,8,9,10,11,12"));
     test_country_available=false;
+
+    /* The typed setter distinguishes policy rejection from driver and
+       readback failures, and reports the actual channel only after verify. */
+    job_mode=true;job_channel_count=1;job_channels[0]=6;
+    test_wifi_mode=WIFI_MODE_APSTA;test_wifi_band=WIFI_BAND_MODE_2G_ONLY;
+    sw_channel_result_t channel_result=sw_job_apply_channel_checked(11);
+    assert(channel_result.status==SW_CHANNEL_NOT_IN_PLAN &&
+           channel_result.requested_channel==11 && channel_result.sdk_error==ESP_ERR_INVALID_ARG);
+    test_channel_result=77;channel_result=sw_job_apply_channel_checked(6);
+    assert(channel_result.status==SW_CHANNEL_DRIVER_ERROR && channel_result.sdk_error==77 &&
+           channel_result.mode==WIFI_MODE_APSTA && channel_result.band==WIFI_BAND_MODE_2G_ONLY);
+    test_channel_result=ESP_OK;test_channel_readback_result=78;
+    channel_result=sw_job_apply_channel_checked(6);
+    assert(channel_result.status==SW_CHANNEL_READBACK_ERROR && channel_result.sdk_error==78);
+    test_channel_readback_result=ESP_OK;test_channel_actual=11;test_channel_stale_readback=true;
+    channel_result=sw_job_apply_channel_checked(6);
+    assert(channel_result.status==SW_CHANNEL_READBACK_ERROR && channel_result.actual_channel!=6);
+    test_channel_stale_readback=false;channel_result=sw_job_apply_channel_checked(6);
+    assert(channel_result.status==SW_CHANNEL_OK && channel_result.actual_channel==6);
+    job_mode=false;job_channel_count=0;test_channel_result=ESP_OK;
     output_capture[0]=0;int job_prepare_count=prepare_calls;
     char *invalid_job[]={"job_start","invalid-token","!"};
     assert(job_start(3,invalid_job)==1 && prepare_calls==job_prepare_count && !sw_active());
@@ -73,6 +114,15 @@ int main(void){
     assert(!strstr(output_capture,"job:data")&&!strstr(output_capture,"data_kind"));
     output_capture[0]=0;sw_job_emit_lifecycle("heartbeat","running","");
     assert(strstr(output_capture,"\"kind\":\"heartbeat\"")&&strstr(output_capture,"\"batch\":0")&&strstr(output_capture,"\"wifi_count\":0")&&strstr(output_capture,"\"ble_count\":0")&&strstr(output_capture,"\"drops\":0")&&strstr(output_capture,"\"losses\":{\"queue\":0,\"age\":0,\"output\":0,\"saturation\":0}"));
+    snprintf(active_job_operation,sizeof(active_job_operation),"sniffer");
+    sw_job_set_sniffer_stats(UINT32_MAX,UINT32_MAX,UINT32_MAX);
+    output_capture[0]=0;sw_job_emit_lifecycle("heartbeat","running","");
+    assert(strstr(output_capture,"\"sniffer_packets\":4294967295") &&
+           strstr(output_capture,"\"sniffer_aps\":4294967295") &&
+           strstr(output_capture,"\"sniffer_drops\":4294967295") &&
+           strlen(output_capture)<=1024);
+    active_job_operation[0]=0;
+    sw_job_set_sniffer_stats(0,0,0);
     output_capture[0]=0;sw_job_emit_legacy_line("HST:{\"kind\":\"scan_done\"}");
     assert(strstr(output_capture,"\"kind\":\"legacy\"")&&strstr(output_capture,"HST:{\\\"kind\\\":\\\"scan_done\\\"}"));
     job_mode=false;
@@ -124,6 +174,15 @@ int main(void){
     assert(raw->len==336);hs_emit(raw);capture_pool_release(&hs_pool,raw);
     assert(strstr(output_capture,"\"kind\":\"hs_packet\"") && strstr(output_capture,"\"offset\":240"));
     assert(!strstr(output_capture,"\"kind\":\"ble\""));
+    assert(test_wifi_tx_count==0); /* HS Sniff is receive-only, including setup and callback. */
+    hs_wifi_cb(&hs,WIFI_PKT_DATA);
+    assert(xQueueReceive(hs_pool.ready,&raw,0));
+    unsigned stale_age=atomic_load(&loss_age);
+    test_clock+=2001;output_capture[0]=0;
+    hs_emit(raw);capture_pool_release(&hs_pool,raw);
+    assert(atomic_load(&loss_age)==stale_age+1 &&
+           !strstr(output_capture,"\"kind\":\"hs_packet\"") &&
+           test_wifi_tx_count==0);
     hs.payload[30]=0x08;assert(!hs_capture_kind(hs.payload,336));hs.payload[30]=0x88;
     for(int i=0;i<10;i++) hs_wifi_cb(&hs,WIFI_PKT_DATA);
     assert(uxQueueMessagesWaiting(hs_pool.ready)==8 && atomic_load(&drops)>=2);

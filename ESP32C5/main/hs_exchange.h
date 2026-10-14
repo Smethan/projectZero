@@ -19,7 +19,7 @@ typedef struct {
     uint16_t len;
     uint8_t channel;
     int8_t rssi;
-    uint32_t timestamp_us;
+    uint64_t timestamp_us;
     uint8_t data[HSX_FRAME_MAX];
 } hsx_frame_t;
 
@@ -70,12 +70,14 @@ typedef struct {
 
 void hsx_reset(hsx_state_t *state);
 bool hsx_ingest(hsx_state_t *state, const uint8_t *frame, size_t len,
-                uint32_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
+                uint64_t timestamp_us, const uint8_t *ssid, size_t ssid_len,
                 hsx_result_t *result);
 bool hsx_ingest_radio(hsx_state_t *state, const uint8_t *frame, size_t len,
-                      uint32_t timestamp_us, uint8_t channel, int8_t rssi,
+                      uint64_t timestamp_us, uint8_t channel, int8_t rssi,
                       const uint8_t *ssid, size_t ssid_len,
                       hsx_result_t *result);
+/* Bounded, stateless classifier for Zero's resource-limited capture path. */
+uint8_t hsx_classify_eapol(const uint8_t *frame, size_t len);
 void hsx_set_ap_ssid(hsx_state_t *state, const uint8_t bssid[6],
                      const uint8_t *ssid, size_t ssid_len);
 void hsx_remove_ap(hsx_state_t *state, const uint8_t bssid[6]);

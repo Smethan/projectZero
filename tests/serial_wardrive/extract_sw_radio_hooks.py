@@ -6,6 +6,6 @@ source=Path('../../ESP32C5/main/main.c').read_text()
 start=source.index('static wifi_band_mode_t sw_saved_band;')
 hop=source.index('\nvoid sw_radio_hop(',start)
 Path(sys.argv[1],'sw_radio_start_under_test.inc').write_text(source[start:hop])
-stop=source.index('\nvoid sw_radio_stop(void) {',hop)+1
-end=source.index('\nstatic int cmd_start_wardrive_promisc_impl',stop)
+stop=source.index('\nbool sw_radio_stop(void) {',hop)+1
+end=source.index('\nstatic bool hs_radio_snapshot',stop)
 Path(sys.argv[1],'sw_radio_stop_under_test.inc').write_text(source[stop:end])

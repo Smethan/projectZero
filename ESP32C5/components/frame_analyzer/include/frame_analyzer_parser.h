@@ -1,62 +1,45 @@
-/**
- * @file frame_analyzer_parser.h
- * @author risinek (risinek@gmail.com)
- * @date 2021-04-05
- * @copyright Copyright (c) 2021
- * 
- * @brief Provides interface for parsing functionality
- */
 #ifndef FRAME_ANALYZER_PARSER_H
 #define FRAME_ANALYZER_PARSER_H
 
-#include <stdint.h>
 #include <stdbool.h>
-#include "esp_wifi.h"
-
-
-//#include "esp_wifi_types.h"
-
+#include <stddef.h>
+#include <stdint.h>
 #include "frame_analyzer_types.h"
 
-/**
- * @brief Determines whether BSSID inside of the given frame matches given BSSID.
- * 
- * @param frame 
- * @param bssid 
- * @return bool 
- */
-bool is_frame_bssid_matching(wifi_promiscuous_pkt_t *frame, uint8_t *bssid);
+/* A view never owns storage. Every pointer is bounded by frame_len. */
+typedef struct {
+    const uint8_t *bytes;
+    size_t frame_len;
+    const uint8_t *mac_header;
+    size_t mac_header_len;
+    const uint8_t *addr1;
+    const uint8_t *addr2;
+    const uint8_t *addr3;
+    const uint8_t *bssid;
+    const uint8_t *eapol;
+    size_t eapol_len;
+    const uint8_t *eapol_key;
+    size_t eapol_key_len;
+    const uint8_t *key_data;
+    size_t key_data_len;
+    uint16_t key_info;
+    const uint8_t *nonce;
+    const uint8_t *mic;
+} frame_view_t;
 
-/**
- * @brief Parses EAPoL packet from given frame.
- * 
- * @param frame 
- * @return eapol_packet_t* if parsing successful 
- * @return \c NULL if no EAPoL packet was found
- * @return \c NULL if frame is protected
- */
-eapol_packet_t *parse_eapol_packet(data_frame_t *frame);
+#define FRAME_VIEW_MAX_PMKIDS 8
+typedef struct {
+    uint8_t count;
+    uint8_t pmkids[FRAME_VIEW_MAX_PMKIDS][16];
+} pmkid_list_t;
 
-/**
- * @brief Parses EAPoL-Key packet from EAPoL packet
- * 
- * @note result does not include EAPoL header
- * @param eapol_packet 
- * @return eapol_key_packet_t* if parsing successful
- * @return \c NULL if no EAPoL-Key packet found
- */
-eapol_key_packet_t *parse_eapol_key_packet(eapol_packet_t *eapol_packet);
+bool frame_view_parse(const uint8_t *bytes, size_t frame_len, frame_view_t *out);
+bool frame_view_bssid_matches(const frame_view_t *view, const uint8_t bssid[6]);
+bool frame_view_extract_pmkids(const frame_view_t *view, pmkid_list_t *out);
+uint8_t frame_view_eapol_message(const frame_view_t *view);
 
-/**
- * @brief Parses PMKIDs from EAPoL-Key packet
- * 
- * @param eapol_key 
- * @return pmkid_item_t* linked list of PMKIDs if parsing successful
- * @return \c NULL if no key data present
- * @return \c NULL if key data are encrypted
- * @return \c NULL parsing fails
- */
-pmkid_item_t *parse_pmkid(eapol_key_packet_t *eapol_key);
+/* Kept for source compatibility only; bounded APIs above should be used. */
+void print_raw_frame(const void *frame);
+void print_mac_address(const uint8_t *address);
 
 #endif
-

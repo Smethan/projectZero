@@ -8,6 +8,7 @@
 #include <stdio.h>
 #define OPAQUE(name,bytes) typedef struct { uint8_t value[bytes]; } name
 OPAQUE(wifi_ap_record_t,96); OPAQUE(sniffer_ap_t,316); OPAQUE(probe_request_t,48);
+OPAQUE(sniffer_frame_t,2312);
 OPAQUE(target_bssid_t,48); OPAQUE(selected_station_t,7); OPAQUE(whitelisted_bssid_t,6);
 OPAQUE(hs_ap_target_t,112); OPAQUE(hs_client_entry_t,40); OPAQUE(ducb_channel_t,32);
 OPAQUE(hs_queued_frame_t,524); OPAQUE(bt_device_info_t,120); OPAQUE(wdp_network_t,72);
@@ -25,6 +26,7 @@ OPAQUE(hs_queued_frame_t,524); OPAQUE(bt_device_info_t,120); OPAQUE(wdp_network_
 #define ZERO_JOB_MEMORY_CAP (48u*1024u)
 #define ZERO_JOB_MEMORY_RESERVE (32u*1024u)
 #define SNIFFER_CHANNEL_TASK_STACK_SIZE 4096u
+#define SNIFFER_FRAME_SLOTS 8u
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
 static unsigned live_allocations, allocation_attempts;
@@ -39,6 +41,7 @@ static void heap_caps_free(void *p) {if(p){assert(live_allocations);live_allocat
 static size_t heap_caps_get_free_size(unsigned caps) {(void)caps;return free_heap;}
 static sniffer_ap_t *sniffer_aps;
 static probe_request_t *probe_requests;
+static sniffer_frame_t *sniffer_frames;
 static target_bssid_t *target_bssids;
 static selected_station_t *selected_stations;
 static whitelisted_bssid_t *whiteListedBssids;
@@ -55,6 +58,10 @@ static void hs_capture_close(void) {hs_frame_pool.frames=NULL;}
 static int dual_band_channels_count=39;
 static unsigned bt_found_device_capacity,bt_device_capacity,wdp_seen_capacity;
 static unsigned target_bssid_count,selected_stations_count,hs_ap_count,hs_client_count,ducb_channel_count;
+static int sniffer_ap_count,probe_request_count;
+static uint32_t sniffer_packet_counter;
+static bool sniffer_session_valid;
+static int64_t sniffer_session_completed_us;
 static unsigned zero_job_blackout_target_count;
 static bool zero_job_blackout_selected;
 enum {ZERO_RES_SNIFFER=1u<<0,ZERO_RES_TARGETS=1u<<1,ZERO_RES_BLE=1u<<2,
@@ -62,7 +69,8 @@ enum {ZERO_RES_SNIFFER=1u<<0,ZERO_RES_TARGETS=1u<<1,ZERO_RES_BLE=1u<<2,
 #include "zero_resources_under_test.inc"
 int main(void) {
     assert(zero_job_resource_estimate(ZERO_RES_SNIFFER) ==
-        6144u + SNIFFER_CHANNEL_TASK_STACK_SIZE +
+        6144u + SNIFFER_CHANNEL_TASK_STACK_SIZE + 6144u +
+        SNIFFER_FRAME_SLOTS*sizeof(sniffer_frame_t) + 512u +
         MAX_SNIFFER_APS*sizeof(sniffer_ap_t) + MAX_PROBE_REQUESTS*sizeof(probe_request_t));
     const unsigned masks[]={ZERO_RES_SNIFFER,ZERO_RES_TARGETS,ZERO_RES_BLE,
         ZERO_RES_HANDSHAKE|ZERO_RES_TARGETS,ZERO_RES_WARDRIVE,ZERO_RES_PORTAL,
@@ -79,7 +87,7 @@ int main(void) {
             allocation_attempts=0;fail_at=(int)i;
             assert(!zero_job_resources_open(mask));
             assert(!live_allocations && !zero_job_allocation_count && !zero_job_resource_mask);
-            assert(!sniffer_aps&&!target_bssids&&!bt_devices&&!hs_clients&&!ducb_channels);
+            assert(!sniffer_aps&&!sniffer_frames&&!target_bssids&&!bt_devices&&!hs_clients&&!ducb_channels);
             zero_job_resources_close();
         }
         fail_at=-1;free_heap=zero_job_resource_estimate(mask)+ZERO_JOB_MEMORY_RESERVE-1;

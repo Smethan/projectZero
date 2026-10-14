@@ -65,7 +65,8 @@ typedef enum {
 } hs_frame_kind_t;
 
 typedef struct {
-    uint32_t timestamp_us;
+    uint64_t timestamp_us;
+    uint32_t driver_timestamp_us;
     uint16_t len;
     uint8_t kind;
     uint8_t channel;
@@ -133,21 +134,22 @@ static uint8_t *pcap_serializer_init(void) {
     progress_size = 24;
     return &progress_dummy;
 }
-static void pcap_serializer_append_frame(const uint8_t *data, unsigned size,
-                                         unsigned timestamp_us) {
+static bool pcap_serializer_append_frame(const uint8_t *data, unsigned size,
+                                          uint64_t timestamp_us) {
     (void)data;
     (void)timestamp_us;
     assert(progress_count < 8);
     progress_lengths[progress_count++] = size;
     progress_size += 16 + size;
+    return true;
 }
-static void pcap_serializer_append_frame_radio(const uint8_t *data,
-                                               unsigned size,
-                                               unsigned timestamp_us,
-                                               uint8_t channel,
-                                               int8_t rssi) {
+static bool pcap_serializer_append_frame_radio(const uint8_t *data,
+                                                unsigned size,
+                                                uint64_t timestamp_us,
+                                                uint8_t channel,
+                                                int8_t rssi) {
     assert(channel == 6 && rssi == -42);
-    pcap_serializer_append_frame(data, size, timestamp_us);
+    return pcap_serializer_append_frame(data, size, timestamp_us);
 }
 static unsigned pcap_serializer_get_size(void) { return progress_size; }
 
@@ -264,8 +266,13 @@ int main(void) {
 
     uint8_t frame[HSX_FRAME_MAX];
     size_t beacon_len = make_beacon(frame);
+    test_clock=4300000; /* receipt clock is beyond 32-bit microsecond wrap */
     offer_with_fcs(frame, beacon_len, WIFI_PKT_MGMT, 100);
     assert(uxQueueMessagesWaiting(hs_frame_pool.ready) == 1);
+    hs_queued_frame_t *queued=NULL;
+    assert(xQueueReceive(hs_frame_pool.ready,&queued,0));
+    assert(queued->timestamp_us==4300000000ULL && queued->driver_timestamp_us==100);
+    assert(xQueueSend(hs_frame_pool.ready,&queued,0));
     assert(hs_capture_drain() == 1);
     assert(hs_ap_count == 1 && hs_ap_targets[0].beacon_captured);
     assert(hs_ap_targets[0].beacon.len == beacon_len);

@@ -9,6 +9,7 @@
 #include "nvs.h"
 #include "psa/crypto.h"
 #include "linenoise/linenoise.h"
+extern void linenoiseSetMachineMode(bool enabled);
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>

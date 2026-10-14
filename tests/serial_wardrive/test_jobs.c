@@ -5,20 +5,29 @@ bool uota_busy(void) { return update_busy_fixture; }
 static bool busy_probe(void) { return legacy_busy_fixture; }
 static unsigned prepare_calls, radio_stops, custom_starts, custom_stops;
 static bool custom_fail;
+static int custom_start_result=SW_JOB_START_READY;
 static unsigned custom_stop_failures;
 static bool require_start_barrier;
 static void *custom_buffer;
+static size_t json_record_length(void) {
+    const char *record=strstr(output_capture,"WDG:");
+    assert(record);
+    record+=4;
+    return strcspn(record,"\r\n");
+}
 bool sw_prepare(void) { prepare_calls++; return true; }
 bool sw_radio_start(void) { return true; }
-void sw_radio_stop(void) { radio_stops++; }
+bool sw_radio_stop(void) { radio_stops++; return true; }
 void sw_radio_hop(unsigned index) { (void)index; }
 static int custom_start(const cJSON *request,const char *token) {
     assert(request && token && sw_job_owner_matches(token));
     custom_starts++;
     custom_buffer=heap_caps_malloc(512,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
     if(!custom_buffer)return 1;
-    if(custom_fail) {heap_caps_free(custom_buffer);custom_buffer=NULL;return 1;}
-    return 0;
+    if(custom_fail || custom_start_result==SW_JOB_START_FAILED) {
+        heap_caps_free(custom_buffer);custom_buffer=NULL;return SW_JOB_START_FAILED;
+    }
+    return custom_start_result;
 }
 static int custom_stop(const char *token) {
     assert(sw_job_owner_matches(token));custom_stops++;
@@ -63,7 +72,7 @@ int main(void) {
     sw_register_radio_busy_probe(busy_probe);
     legacy_busy_fixture=true;output_capture[0]=0;
     assert(device_info(1,NULL)==0 && strstr(output_capture,"\"legacy_busy\":true"));
-    assert(strlen(output_capture)<=1024);
+    assert(json_record_length()<=1000);
     assert(submit("legacy-busy","wardrive","wifi24","off","[6]","[]","[]",ALL)==1);
     assert(!prepare_calls && !heap_live && strstr(output_capture,"external_busy"));
     legacy_busy_fixture=false;update_busy_fixture=true;output_capture[0]=0;
@@ -71,7 +80,7 @@ int main(void) {
     assert(!prepare_calls && !heap_live && strstr(output_capture,"update_busy"));
     update_busy_fixture=false;output_capture[0]=0;
     assert(device_info(1,NULL)==0 && strstr(output_capture,"\"legacy_busy\":false"));
-    assert(strlen(output_capture)<=1024);
+    assert(json_record_length()<=1000);
     const char *info_fixture=getenv("C5_INFO_FIXTURE");
     if(info_fixture) {FILE *f=fopen(info_fixture,"w");assert(f);fputs(output_capture,f);fclose(f);}
     output_capture[0]=0;assert(capabilities(1,NULL)==0);
@@ -144,6 +153,19 @@ int main(void) {
         "[\"02:11:22:33:44:55\"]",SELECTED)==1);
     assert(custom_starts==before_custom+1);
     assert(submit("outside","handshake","wifi5","off","[36]",TARGET,"[]",SELECTED)==1);
+    custom_start_result=SW_JOB_START_PENDING;
+    output_capture[0]=0;
+    assert(submit("pending","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    assert(external_job_active && external_supervisor_task && !atomic_load(&external_operation_ready));
+    assert(strstr(output_capture,"\"kind\":\"status\"") && strstr(output_capture,"\"state\":\"starting\"") &&
+           !strstr(output_capture,"\"kind\":\"started\""));
+    char *pending_status[]={"job_status","pending"};output_capture[0]=0;
+    assert(job_status(2,pending_status)==0 && strstr(output_capture,"\"state\":\"starting\""));
+    assert(sw_job_signal_ready("pending") && !sw_job_signal_ready("wrong-token"));
+    test_task(test_task_arg);
+    assert(!external_job_active && !heap_live && strstr(output_capture,"\"kind\":\"started\"") &&
+           strstr(output_capture,"\"kind\":\"stopped\""));
+    custom_start_result=SW_JOB_START_READY;
     assert(submit("portal","portal","wifi24","off","[6]","[]","[]",
         "{\"storage\":\"serial\",\"scope\":\"selected\",\"ssid_hex\":\"4142\"}")==0);
     test_task(test_task_arg);assert(!sw_active()&&!heap_live);

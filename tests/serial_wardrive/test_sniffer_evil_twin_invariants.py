@@ -28,6 +28,7 @@ def function(signature: str) -> str:
 start_all = function("static int cmd_start_sniffer_all(")
 begin_session = function("static void sniffer_begin_session(void)")
 callback = function("static void sniffer_promiscuous_callback(")
+process_frame = function("static void sniffer_process_frame(")
 export = function("static int cmd_show_sniffer_intel(")
 stop_operations = function("static int stop_operations(bool reset_wifi)")
 sniffer_wait = function("static ZERO_STACK_NOINLINE bool sniffer_channel_wait_quiescent(void)")
@@ -47,15 +48,19 @@ assert start_all.index("g_selected_count = 0") < start_all.index("cmd_start_snif
 for reset in (
     "sniffer_packet_counter = 0",
     "probe_request_count = 0",
-    "client_count = 0",
-    "packet_count = 0",
+    "sniffer_ap_count = 0",
+    "memset(sniffer_aps, 0",
 ):
     assert reset in begin_session
 assert "sniffer_session_valid = true" in begin_session
 
 # Channel dwell is timer-owned. Traffic volume cannot cause biased/racy hops.
 assert "sniffer_channel_hop()" not in callback
-assert callback.count("packet_count++") >= 3
+assert "atomic_fetch_add(&sniffer_packet_counter,1)" in callback
+assert "xQueueSend(sniffer_frame_queue,&queued_slot,0)" in callback
+assert "sniffer_process_frame(" not in callback
+assert "sniffer_process_frame(sample->payload" in sniffer_worker
+assert "packet_count++" in process_frame
 
 # The token-bound export and HST picker both carry BSSID-keyed client/packet
 # metrics. Probe counts are explicitly derived by exact requested SSID.

@@ -32,6 +32,7 @@
 static int cmd_start_sae_overflow(int argc,char **argv);
 static bool ensure_wifi_mode(void);
 static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope);
+static bool serial_job_radio_busy_probe(void);
 static bool is_bssid_whitelisted(const uint8_t *bssid);
 static int cmd_start_deauth(int argc,char **argv);
 static int cmd_start_evil_twin(int argc,char **argv);
@@ -166,7 +167,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.3"
+#define JANOS_VERSION "1.8.4"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -331,6 +332,18 @@ typedef struct {
     uint32_t last_seen;
 } sniffer_ap_t;
 
+/* Only the fixed-size frame copies cross from the Wi-Fi callback to the
+ * Sniffer worker. The single AP/client/probe catalog remains worker-owned. */
+#define SNIFFER_FRAME_SLOTS 8
+#define SNIFFER_FRAME_MAX 2304
+typedef struct {
+    uint16_t len;
+    int8_t rssi;
+    uint8_t channel;
+    wifi_promiscuous_pkt_type_t type;
+    uint8_t payload[SNIFFER_FRAME_MAX];
+} sniffer_frame_t;
+
 // GPS data structure
 typedef struct {
     float latitude;
@@ -368,6 +381,7 @@ static volatile bool operation_stop_requested = false;
 
 // wifi_connect command state: 0 = pending, 1 = success, -1 = failed
 static volatile int wifi_connect_result = 0;
+static volatile bool wifi_connect_attempt_active;
 // Last disconnect/fail reason captured while a wifi_connect is waiting (esp_wifi reason code)
 static volatile int wifi_connect_fail_reason = 0;
 
@@ -447,11 +461,23 @@ static int sniffer_current_channel = 1;
 static int sniffer_channel_index = 0;
 static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
-// Sniffer OLED shared state (callback -> task)
-static volatile uint32_t sniff_oled_packets = 0;
-static volatile bool sniff_oled_dirty = false;
+// Sniffer worker owns OLED updates; the Wi-Fi callback only counts and copies.
 static TaskHandle_t sniffer_channel_task_handle = NULL;
-static uint32_t sniffer_packet_counter = 0;
+static TaskHandle_t sniffer_setup_task_handle = NULL;
+static bool sniffer_skip_scan_once;
+static bool sniffer_setup_needs_scan;
+static bool sniffer_scan_ok;
+static bool sniffer_restore_pending;
+static wifi_band_mode_t sniffer_prev_band;
+static wifi_promiscuous_filter_t sniffer_prev_filter;
+static uint8_t sniffer_prev_channel;
+static wifi_second_chan_t sniffer_prev_second;
+static atomic_uint sniffer_drop_count;
+static atomic_uint sniffer_producers;
+static atomic_uint sniffer_packet_counter;
+static sniffer_frame_t *sniffer_frames;
+static QueueHandle_t sniffer_frame_queue;
+static atomic_bool sniffer_slot_busy[SNIFFER_FRAME_SLOTS];
 static uint32_t sniffer_last_debug_packet = 0;
 static bool sniffer_session_valid = false;
 static int64_t sniffer_session_completed_us = 0;
@@ -471,14 +497,23 @@ typedef struct {
     uint8_t data[];
 } pcap_queued_frame_t;
 
-static volatile bool pcap_capture_active = false;
+static atomic_bool pcap_capture_active;
+typedef enum {
+    PCAP_CAPTURE_IDLE, PCAP_CAPTURE_STARTING, PCAP_CAPTURE_RUNNING,
+    PCAP_CAPTURE_STOPPING, PCAP_CAPTURE_COMPLETE, PCAP_CAPTURE_FAILED
+} pcap_capture_state_t;
+static atomic_int pcap_capture_state;
+static atomic_bool pcap_writer_stop_requested, pcap_writer_finished;
+static atomic_uint pcap_producers, pcap_received_count, pcap_written_count;
+static atomic_uint pcap_queue_drop_count, pcap_write_fail_count, pcap_alloc_fail_count;
 static pcap_capture_mode_t pcap_capture_mode = PCAP_MODE_NONE;
 static FILE *pcap_capture_file = NULL;
 static TaskHandle_t pcap_writer_task_handle = NULL;
 static QueueHandle_t pcap_packet_queue = NULL;
-static uint32_t pcap_capture_frame_count = 0;
-static uint32_t pcap_capture_drop_count = 0;
 static char pcap_capture_filepath[64];
+static char pcap_capture_finalpath[64];
+static wifi_promiscuous_filter_t pcap_previous_filter;
+static bool pcap_filter_saved, pcap_rx_configured, pcap_net_hooks_installed;
 static netif_input_fn pcap_original_input = NULL;
 static netif_linkoutput_fn pcap_original_linkoutput = NULL;
 
@@ -590,6 +625,13 @@ static hs_scan_snapshot_t hs_scan_snapshot;
 static atomic_bool hs_scan_output_active;
 static atomic_bool hs_scan_start_authorized;
 static atomic_bool handshake_cleanup_active;
+static bool hs_radio_saved;
+static bool hs_created_ap_netif;
+static wifi_mode_t hs_prev_mode;
+static wifi_band_mode_t hs_prev_band;
+static wifi_promiscuous_filter_t hs_prev_filter;
+static uint8_t hs_prev_channel;
+static wifi_second_chan_t hs_prev_second;
 static void hs_scan_release_event_owner(void);
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
 static void hs_scan_complete(bool success) __attribute__((noinline));
@@ -687,7 +729,8 @@ typedef enum {
     HS_FRAME_AUTHENTICATION = 4,
 } hs_frame_kind_t;
 typedef struct {
-    uint32_t timestamp_us;
+    uint64_t timestamp_us;
+    uint32_t driver_timestamp_us;
     uint16_t len;
     uint8_t kind;
     uint8_t channel;
@@ -732,6 +775,10 @@ static volatile bool karma_mode_active = false;
 static volatile bool rogueap_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
+static TaskHandle_t portal_event_worker_handle = NULL;
+static atomic_uint portal_generation, portal_verified_generation, portal_client_generation;
+static atomic_bool portal_verified_pending, portal_client_pending;
+static atomic_bool portal_verified_cleanup_active;
 
 // DarkSword state
 static volatile bool darksword_active = false;
@@ -901,6 +948,10 @@ static volatile bool bt_scan_active = false;
 static volatile bool bt_airtag_scan_active = false;
 static TaskHandle_t bt_scan_task_handle = NULL;
 static volatile bool nimble_initialized = false;
+static atomic_bool nimble_port_initialized, nimble_host_running;
+static atomic_bool nimble_host_started, nimble_host_exited;
+static atomic_bool nimble_stop_done, nimble_stop_ok;
+static TaskHandle_t nimble_host_task_handle, nimble_stop_task_handle;
 
 // BLE device tracking for deduplication
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
@@ -1936,6 +1987,31 @@ static int whitelistedBssidsCount = 0;
 // PSRAM buffer initialization (must be after all pointer declarations)
 // ============================================================================
 
+static void free_psram_buffers(void)
+{
+#define RELEASE_PSRAM_BUFFER(p) do { heap_caps_free(p); (p) = NULL; } while (0)
+    RELEASE_PSRAM_BUFFER(sniffer_aps);
+    RELEASE_PSRAM_BUFFER(probe_requests);
+    RELEASE_PSRAM_BUFFER(bt_found_devices);
+    RELEASE_PSRAM_BUFFER(bt_devices);
+    RELEASE_PSRAM_BUFFER(wardrive_scan_results);
+    RELEASE_PSRAM_BUFFER(handshake_targets);
+    RELEASE_PSRAM_BUFFER(sd_html_files);
+    RELEASE_PSRAM_BUFFER(target_bssids);
+    RELEASE_PSRAM_BUFFER(whiteListedBssids);
+    RELEASE_PSRAM_BUFFER(selected_stations);
+    RELEASE_PSRAM_BUFFER(hs_ap_targets);
+    RELEASE_PSRAM_BUFFER(hs_clients);
+    RELEASE_PSRAM_BUFFER(hs_exchange_state);
+    RELEASE_PSRAM_BUFFER(hs_artifact_buffer);
+    RELEASE_PSRAM_BUFFER(ducb_channels);
+    RELEASE_PSRAM_BUFFER(wdp_seen_networks);
+#undef RELEASE_PSRAM_BUFFER
+    bt_found_device_capacity = 0;
+    bt_device_capacity = 0;
+    wdp_seen_capacity = 0;
+}
+
 static bool init_psram_buffers(void)
 {
     sniffer_aps = heap_caps_calloc(MAX_SNIFFER_APS, sizeof(sniffer_ap_t), MALLOC_CAP_SPIRAM);
@@ -1961,6 +2037,7 @@ static bool init_psram_buffers(void)
         !hs_ap_targets || !hs_clients || !hs_exchange_state || !hs_artifact_buffer ||
         !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
+        free_psram_buffers();
         return false;
     }
     bt_found_device_capacity = BT_INITIAL_CAPACITY;
@@ -2002,7 +2079,9 @@ static size_t zero_job_resource_estimate(uint32_t mask) {
     /* The token/lease supervisor is part of every managed Zero job's live
        internal-RAM working set and is created after this admission succeeds. */
     size_t bytes=6144;
-    if(mask&ZERO_RES_SNIFFER) bytes+=SNIFFER_CHANNEL_TASK_STACK_SIZE+MAX_SNIFFER_APS*sizeof(sniffer_ap_t)+MAX_PROBE_REQUESTS*sizeof(probe_request_t);
+    if(mask&ZERO_RES_SNIFFER) bytes+=SNIFFER_CHANNEL_TASK_STACK_SIZE+6144u+
+        SNIFFER_FRAME_SLOTS*sizeof(sniffer_frame_t)+512u+
+        MAX_SNIFFER_APS*sizeof(sniffer_ap_t)+MAX_PROBE_REQUESTS*sizeof(probe_request_t);
     if(mask&ZERO_RES_TARGETS) bytes+=MAX_TARGET_BSSIDS*sizeof(target_bssid_t)+MAX_SELECTED_STATIONS*sizeof(selected_station_t)+MAX_WHITELISTED_BSSIDS*sizeof(whitelisted_bssid_t);
     if(mask&ZERO_RES_BLE) bytes+=BT_INITIAL_CAPACITY*(sizeof(*bt_found_devices)+sizeof(bt_device_info_t));
     if(mask&ZERO_RES_HANDSHAKE) bytes+=MAX_AP_CNT*sizeof(wifi_ap_record_t)+HS_MAX_APS*sizeof(hs_ap_target_t)+HS_MAX_CLIENTS*sizeof(hs_client_entry_t)+dual_band_channels_count*sizeof(ducb_channel_t)+HS_FRAME_POOL_COUNT*sizeof(hs_queued_frame_t)+15360;
@@ -2021,7 +2100,8 @@ static bool zero_job_resources_open(uint32_t mask) {
     bool ok=true;
     if((mask&ZERO_RES_SNIFFER) &&
        (!(sniffer_aps=zero_job_calloc(MAX_SNIFFER_APS,sizeof(*sniffer_aps))) ||
-        !(probe_requests=zero_job_calloc(MAX_PROBE_REQUESTS,sizeof(*probe_requests)))) ) ok=false;
+        !(probe_requests=zero_job_calloc(MAX_PROBE_REQUESTS,sizeof(*probe_requests))) ||
+        !(sniffer_frames=zero_job_calloc(SNIFFER_FRAME_SLOTS,sizeof(*sniffer_frames))))) ok=false;
     if(ok && (mask&ZERO_RES_TARGETS) &&
        (!(target_bssids=zero_job_calloc(MAX_TARGET_BSSIDS,sizeof(*target_bssids))) ||
         !(selected_stations=zero_job_calloc(MAX_SELECTED_STATIONS,sizeof(*selected_stations))) ||
@@ -2042,7 +2122,8 @@ static bool zero_job_resources_open(uint32_t mask) {
         for(unsigned i=0;i<zero_job_allocation_count;i++) heap_caps_free(zero_job_allocations[i]);
         memset(zero_job_allocations,0,sizeof(zero_job_allocations));
         zero_job_allocation_count=0;zero_job_allocated_bytes=0;
-        sniffer_aps=NULL;probe_requests=NULL;target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
+        sniffer_aps=NULL;probe_requests=NULL;sniffer_frames=NULL;
+        target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
         bt_found_devices=NULL;bt_devices=NULL;wardrive_scan_results=NULL;handshake_targets=NULL;
         hs_ap_targets=NULL;hs_clients=NULL;hs_exchange_state=NULL;hs_artifact_buffer=NULL;ducb_channels=NULL;wdp_seen_networks=NULL;
         return false;
@@ -2058,11 +2139,14 @@ static void zero_job_resources_close(void) {
     for(unsigned i=0;i<zero_job_allocation_count;i++) heap_caps_free(zero_job_allocations[i]);
     memset(zero_job_allocations,0,sizeof(zero_job_allocations));
     zero_job_allocation_count=0;zero_job_allocated_bytes=0;zero_job_resource_mask=0;
-    sniffer_aps=NULL;probe_requests=NULL;target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
+    sniffer_aps=NULL;probe_requests=NULL;sniffer_frames=NULL;
+    target_bssids=NULL;selected_stations=NULL;whiteListedBssids=NULL;
     bt_found_devices=NULL;bt_devices=NULL;bt_found_device_capacity=0;bt_device_capacity=0;
     wardrive_scan_results=NULL;handshake_targets=NULL;wdp_seen_networks=NULL;wdp_seen_capacity=0;
     hs_ap_targets=NULL;hs_clients=NULL;hs_exchange_state=NULL;hs_artifact_buffer=NULL;ducb_channels=NULL;
     target_bssid_count=selected_stations_count=0;hs_ap_count=hs_client_count=ducb_channel_count=0;
+    sniffer_ap_count=probe_request_count=0;sniffer_packet_counter=0;
+    sniffer_session_valid=false;sniffer_session_completed_us=0;
     zero_job_blackout_target_count=0;zero_job_blackout_selected=false;
 }
 #endif
@@ -2206,7 +2290,6 @@ static void zero_job_restore_sta_after_partial_portal(void) {
 }
 
 static int zero_job_start_operation(const cJSON *request,const char *token) {
-    (void)token;
     cJSON *op_item=cJSON_GetObjectItemCaseSensitive((cJSON *)request,"op");
     if(!cJSON_IsString(op_item))return 1;
     const char *op=op_item->valuestring;
@@ -2287,9 +2370,14 @@ static int zero_job_start_operation(const cJSON *request,const char *token) {
         if(mac) { args[1]=(char *)mac;rc=cmd_scan_bt(2,args); }
     }
     else if(airtag)rc=cmd_scan_airtag(1,args);
-    if(rc!=0) {
+    if(rc!=SW_JOB_START_READY && rc!=SW_JOB_START_PENDING) {
         /* Some legacy handlers mutate Wi-Fi/AP state before they can fail. */
-        (void)stop_operations(false);
+        if(stop_operations(false)!=0) {
+            /* The supervisor must retain the token, resources and radio
+             * ownership until a later cleanup attempt succeeds. */
+            (void)sw_job_fail_start(token,"startup_cleanup_pending");
+            return SW_JOB_START_PENDING;
+        }
         if(portal||!strcmp(op,"evil_twin")) zero_job_restore_sta_after_partial_portal();
         if(resources)job_resources_close();
         projectzero_job_operation_name[0]=0;
@@ -2303,6 +2391,8 @@ static int zero_job_stop_operation(const char *token) {
     if(rc==0) {
         /* Publish the completed source-bound snapshot before releasing its tables. */
         if(!strcmp(projectzero_job_operation_name,"sniffer")) {
+            sw_job_set_sniffer_stats(sniffer_packet_counter,(uint32_t)sniffer_ap_count,
+                                     atomic_load(&sniffer_drop_count));
             char *args[2]={(char *)"show_sniffer_intel",(char *)token};
             rc=cmd_show_sniffer_intel(2,args);
         }
@@ -2535,6 +2625,8 @@ static void evil_twin_clear_credentials(bool clear_ssid);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
+static void sniffer_process_frame(const uint8_t *frame,int len,int8_t rssi,uint8_t channel,
+                                  wifi_promiscuous_pkt_type_t type);
 static void sniffer_merge_scan_results(void);
 static void sniffer_init_selected_networks(void);
 static void sniffer_begin_session(void);
@@ -2560,6 +2652,8 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
+static void sniffer_setup_task(void *pvParameters);
+static bool sniffer_restore_radio(void);
 static bool sniffer_channel_wait_quiescent(void);
 static bool is_multicast_mac(const uint8_t *mac);
 // Deauth detector functions
@@ -2589,7 +2683,7 @@ static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
 static bool sd_mkdir_recursive(const char *path);
 static esp_err_t create_sd_directories(void);
-static void sd_sync(void);
+static bool sd_sync(void);
 static void safe_restart(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
@@ -2602,6 +2696,7 @@ static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
 static void pcap_enqueue_frame(const uint8_t *data, uint16_t len,
                                uint8_t channel, int8_t rssi);
 static void pcap_writer_task(void *param);
+static bool pcap_capture_stop(void);
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
 static void pcap_arp_spoof_task(void *param);
@@ -2707,7 +2802,7 @@ static void ota_led_stop(void);
 
 static esp_err_t wifi_init_ap_sta(void);
 static esp_err_t bt_nimble_init(void);
-static void bt_nimble_deinit(void);
+static bool bt_nimble_deinit(void);
 static void bt_reset_counters(void);
 static void bt_format_addr(const uint8_t *addr, char *str);
 static int bt_start_scan(void);
@@ -2724,6 +2819,7 @@ static bool usb_ota_prepare(void) {
 }
 
 static void register_commands(void);
+static bool portal_event_worker_ensure(void);
 
 // --- Wi-Fi event handler ---
 static void wifi_event_handler(void *event_handler_arg,
@@ -2753,60 +2849,9 @@ static void wifi_event_handler(void *event_handler_arg,
             
             // If portal is active (Evil Twin attack), shut it down after successful connection
             if (portal_active) {
-                MY_LOG_INFO(TAG, "Password verified! Shutting down Evil Twin portal...");
-                oled_display_update_full("> Evil Twin", "  PASSWORD OK!", "  Saving to SD", "  >> Success!");
-                portal_active = false;
-                
-                // Stop DNS server task
-                if (dns_server_task_handle != NULL) {
-                    // Wait for DNS task to finish (it checks portal_active flag)
-                    for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                    }
-                    
-                    // Force cleanup if still running
-                    if (dns_server_task_handle != NULL) {
-                        vTaskDelete(dns_server_task_handle);
-                        dns_server_task_handle = NULL;
-                        if (dns_server_socket >= 0) {
-                            close(dns_server_socket);
-                            dns_server_socket = -1;
-                        }
-                    }
-                }
-                
-                // Stop HTTP server
-                if (portal_server != NULL) {
-                    httpd_stop(portal_server);
-                    portal_server = NULL;
-                    MY_LOG_INFO(TAG, "HTTP server stopped.");
-                }
-                
-                // Stop DHCP server
-                esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-                if (ap_netif) {
-                    esp_netif_dhcps_stop(ap_netif);
-                }
-                
-                // Change WiFi mode from APSTA to STA only (disable AP)
-                esp_err_t mode_ret = esp_wifi_set_mode(WIFI_MODE_STA);
-                if (mode_ret == ESP_OK) {
-                    MY_LOG_INFO(TAG, "WiFi mode changed to STA only - AP disabled.");
-                } else {
-                    MY_LOG_INFO(TAG, "Failed to change WiFi mode: %s", esp_err_to_name(mode_ret));
-                }
-                
-                MY_LOG_INFO(TAG, "Evil Twin portal shut down successfully!");
-                
-                // Small delay to ensure all resources are properly released
-                vTaskDelay(pdMS_TO_TICKS(500));
-                
-                // Now save verified password to SD card (after portal is fully closed)
-                if (evilTwinSSID != NULL && evilTwinPassword != NULL) {
-                    MY_LOG_INFO(TAG, "Saving verified password to SD card...");
-                    save_evil_twin_password(evilTwinSSID, evilTwinPassword);
-                }
-                evil_twin_clear_credentials(true);
+                atomic_store(&portal_verified_generation,atomic_load(&portal_generation));
+                atomic_store(&portal_verified_pending,true);
+                if(portal_event_worker_handle)xTaskNotifyGive(portal_event_worker_handle);
             }
             
             applicationState = IDLE;
@@ -2840,8 +2885,11 @@ static void wifi_event_handler(void *event_handler_arg,
                 esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
             }
             
-            // Wait a bit for DHCP to assign IP
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            // DHCP settling is timed by the application worker, never by the
+            // default Wi-Fi event loop.
+            atomic_store(&portal_client_generation,atomic_load(&portal_generation));
+            atomic_store(&portal_client_pending,true);
+            if(portal_event_worker_handle)xTaskNotifyGive(portal_event_worker_handle);
             break;
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
@@ -2947,37 +2995,10 @@ static void wifi_event_handler(void *event_handler_arg,
                 applicationState = IDLE;
             }
             
-            // Handle sniffer transition from scan to promiscuous mode
-            if (sniffer_active && sniffer_scan_phase) {
-                sniffer_process_scan_results();
-                sniffer_scan_phase = false;
-                
-                // Set promiscuous filter (like Marauder)
-                esp_wifi_set_promiscuous_filter(&sniffer_filter);
-                
-                // Enable promiscuous mode
-                esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
-                esp_wifi_set_promiscuous(true);
-                
-                // Initialize dual-band channel hopping
-                sniffer_channel_index = 0;
-                sniffer_current_channel = dual_band_channels[sniffer_channel_index];
-                sniffer_last_channel_hop = esp_timer_get_time() / 1000;
-                esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
-                
-                // Start channel hopping task for time-based hopping
-                if (sniffer_channel_task_handle == NULL) {
-                    xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
-                    MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
-                }
-                
-                // Change LED to green for active sniffing
-                esp_err_t led_err = led_set_color(0, 255, 0); // Green
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to set sniffer LED: %s", esp_err_to_name(led_err));
-                }
-                
-                MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
+            // The event task only notifies the Sniffer setup owner.
+            if (sniffer_active && sniffer_scan_phase && sniffer_setup_task_handle) {
+                sniffer_scan_ok = e->status == 0 && scan_records_ok;
+                xTaskNotifyGive(sniffer_setup_task_handle);
             } else if (!wardrive_active) {
                 // Return LED to idle when normal scan is complete
                 esp_err_t led_err = led_set_idle();
@@ -3669,6 +3690,72 @@ static void evil_twin_clear_credentials(bool clear_ssid) {
     if (clear_ssid) secure_free_string(&evilTwinSSID);
 }
 
+/* Portal credential verification and DHCP settling must never block the
+ * default Wi-Fi event loop. This task is created on the first portal attempt
+ * and reused; events only update bounded atomics and notify it. */
+static void portal_event_worker(void *arg) {
+    (void)arg;
+    uint32_t settle_generation=0;
+    int64_t settle_deadline_us=0;
+    for(;;) {
+        if(atomic_exchange(&portal_verified_pending,false)) {
+            uint32_t generation=atomic_load(&portal_verified_generation);
+            if(generation==atomic_load(&portal_generation) && portal_active &&
+               !atomic_load(&portal_verified_cleanup_active)) {
+                atomic_store(&portal_verified_cleanup_active,true);
+                portal_active=false;
+                MY_LOG_INFO(TAG,"Password verified; retiring portal outside Wi-Fi event loop.");
+                oled_display_update_full("> Evil Twin","  PASSWORD OK!","  Saving to SD","  >> Success!");
+            }
+        }
+        if(atomic_load(&portal_verified_cleanup_active)) {
+            if(dns_server_task_handle) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            if(portal_server) {
+                if(httpd_stop(portal_server)!=ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+                portal_server=NULL;
+            }
+            esp_netif_t *ap=esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if(ap)(void)esp_netif_dhcps_stop(ap);
+            if(esp_wifi_set_mode(WIFI_MODE_STA)!=ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if(evilTwinSSID && evilTwinPassword)
+                save_evil_twin_password(evilTwinSSID,evilTwinPassword);
+            evil_twin_clear_credentials(true);
+            atomic_store(&portal_verified_cleanup_active,false);
+            MY_LOG_INFO(TAG,"Verified portal cleanup complete.");
+        }
+        if(atomic_exchange(&portal_client_pending,false)) {
+            settle_generation=atomic_load(&portal_client_generation);
+            settle_deadline_us=esp_timer_get_time()+3000000;
+        }
+        if(settle_deadline_us && esp_timer_get_time()>=settle_deadline_us) {
+            if(settle_generation==atomic_load(&portal_generation) && portal_active)
+                MY_LOG_INFO(TAG,"Portal client DHCP settling interval elapsed.");
+            settle_deadline_us=0;
+        }
+        (void)ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(settle_deadline_us?100:1000));
+    }
+}
+
+static bool portal_event_worker_ensure(void) {
+    if(portal_event_worker_handle)return true;
+    if(xTaskCreate(portal_event_worker,"portal_event",6144,NULL,4,
+                   &portal_event_worker_handle)!=pdPASS) {
+        portal_event_worker_handle=NULL;
+        return false;
+    }
+    return true;
+}
+
 static void evil_twin_abort_start(esp_netif_t *ap_netif) {
     portal_active = false;
     if (dns_server_task_handle != NULL) {
@@ -4209,7 +4296,7 @@ static bool ensure_wifi_mode(void)
         case RADIO_MODE_BLE:
             // Deinitialize BLE and switch to WiFi
             MY_LOG_INFO(TAG, "Switching from BLE to WiFi mode...");
-            bt_nimble_deinit();
+            if(!bt_nimble_deinit())return false;
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize WiFi (recursive call with RADIO_MODE_NONE)
             return ensure_wifi_mode();
@@ -4350,7 +4437,7 @@ static bool ensure_ieee802154_mode(void)
 
         case RADIO_MODE_BLE:
             MY_LOG_INFO(TAG, "Switching from BLE to 802.15.4 mode...");
-            bt_nimble_deinit();
+            if(!bt_nimble_deinit())return false;
             current_radio_mode = RADIO_MODE_IEEE802154;
             return true;
     }
@@ -5761,13 +5848,13 @@ static void inspect_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) 
 
     wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *)buf;
     int total_len = (int)frame->rx_ctrl.sig_len;
-    const int hdr_len = (int)sizeof(data_frame_mac_header_t); // 24
+    const int hdr_len = 24;
     if (total_len < hdr_len + 12) return;
 
-    data_frame_mac_header_t *hdr = (data_frame_mac_header_t *)frame->payload;
+    const uint8_t *mac=frame->payload;
     // Beacon: type=Management(0), subtype=Beacon(8)
-    if (hdr->frame_control.type != 0 || hdr->frame_control.subtype != 8) return;
-    if (memcmp(hdr->addr3, g_inspect.target_bssid, 6) != 0) return;
+    if ((mac[0]&0xfcU)!=0x80U) return;
+    if (memcmp(mac+16, g_inspect.target_bssid, 6) != 0) return;
 
     const uint8_t *body = frame->payload + hdr_len;
     int body_len = total_len - hdr_len;
@@ -7284,6 +7371,9 @@ static wifi_promiscuous_filter_t sw_saved_filter;
 static bool sw_saved_radio;
 static bool sw_saved_mode_changed;
 static wifi_mode_t sw_saved_mode;
+static uint8_t sw_saved_channel;
+static wifi_second_chan_t sw_saved_second;
+static bool sw_channel_restore_pending;
 bool sw_radio_start(void) {
     /* Console ownership gate prevents new operations during this transition. */
     if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
@@ -7317,8 +7407,14 @@ bool sw_radio_start(void) {
         MY_LOG_INFO(TAG, "Serial radio start failed at get_mode: %d", ret);
         return false;
     }
+    ret=esp_wifi_get_channel(&sw_saved_channel,&sw_saved_second);
+    if(ret!=ESP_OK) {
+        MY_LOG_INFO(TAG, "Serial radio start failed at get_channel: %d", ret);
+        return false;
+    }
     sw_saved_radio = true;
     sw_saved_mode_changed = false;
+    sw_channel_restore_pending = false;
     /* Serial capture jobs are receive-only, including combined Wi-Fi/BLE.
      * Drop STA/AP allocations and traffic before starting the shared-radio
      * BLE scan; sw_radio_stop restores the mode we saved above. */
@@ -7329,6 +7425,7 @@ bool sw_radio_start(void) {
         return false;
     }
     sw_saved_mode_changed = true;
+    sw_channel_restore_pending = sw_saved_channel != 0;
     ret=esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     if(ret!=ESP_OK) {
         MY_LOG_INFO(TAG, "Serial radio start failed at set_auto_band: %d", ret);
@@ -7352,8 +7449,8 @@ void sw_radio_hop(unsigned index) {
         36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
     esp_wifi_set_channel(channels[index % sizeof(channels)], WIFI_SECOND_CHAN_NONE);
 }
-void sw_radio_stop(void) {
-    if (!sw_saved_radio) return;
+bool sw_radio_stop(void) {
+    if (!sw_saved_radio) return true;
     bool restored=true;
     if(esp_wifi_set_promiscuous(false)!=ESP_OK)restored=false;
     if(esp_wifi_set_promiscuous_rx_cb(NULL)!=ESP_OK)restored=false;
@@ -7368,8 +7465,51 @@ void sw_radio_stop(void) {
             sw_saved_mode_changed=false;
         }
     }
+    if(sw_channel_restore_pending && !sw_saved_mode_changed) {
+        uint8_t actual=0;
+        wifi_second_chan_t second=WIFI_SECOND_CHAN_NONE;
+        if(esp_wifi_set_channel(sw_saved_channel,sw_saved_second)!=ESP_OK ||
+           esp_wifi_get_channel(&actual,&second)!=ESP_OK ||
+           actual!=sw_saved_channel || second!=sw_saved_second) {
+            restored=false;
+            MY_LOG_INFO(TAG, "Serial radio restore failed at set_channel/readback");
+        } else sw_channel_restore_pending=false;
+    }
     if(restored) sw_saved_radio = false;
     if(!restored && sw_job_owned())sw_job_emit_lifecycle("error","stopping","\"message\":\"radio_restore_failed\"");
+    return restored;
+}
+
+static bool hs_radio_snapshot(void) {
+    if(hs_radio_saved || sniffer_restore_pending || (sw_active() && !sw_job_owned()))return false;
+    if(esp_wifi_get_mode(&hs_prev_mode)!=ESP_OK ||
+       esp_wifi_get_band_mode(&hs_prev_band)!=ESP_OK ||
+       esp_wifi_get_promiscuous_filter(&hs_prev_filter)!=ESP_OK ||
+       esp_wifi_get_channel(&hs_prev_channel,&hs_prev_second)!=ESP_OK)return false;
+    hs_created_ap_netif=esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")==NULL;
+    hs_radio_saved=true;
+    return true;
+}
+
+static bool hs_radio_restore(void) {
+    if(!hs_radio_saved)return true;
+    bool ok=true;
+    if(esp_wifi_set_promiscuous(false)!=ESP_OK)ok=false;
+    if(esp_wifi_set_promiscuous_rx_cb(NULL)!=ESP_OK)ok=false;
+    if(esp_wifi_set_promiscuous_filter(&hs_prev_filter)!=ESP_OK)ok=false;
+    if(esp_wifi_set_band_mode(hs_prev_band)!=ESP_OK)ok=false;
+    if(esp_wifi_set_mode(hs_prev_mode)!=ESP_OK)ok=false;
+    if(hs_prev_channel && esp_wifi_set_channel(hs_prev_channel,hs_prev_second)!=ESP_OK)ok=false;
+    if(ok) {
+        if(hs_created_ap_netif) {
+            esp_netif_t *ap=esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if(ap)esp_netif_destroy(ap);
+            ap_netif_handle=NULL;
+            hs_created_ap_netif=false;
+        }
+        hs_radio_saved=false;
+    }
+    return ok;
 }
 
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
@@ -7799,13 +7939,17 @@ static int hs_add_or_update_client(const uint8_t *client_mac, int ap_index, int 
 
 static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel) {
     // Ensure we're on the correct channel
-    uint8_t current_channel;
-    wifi_second_chan_t second_chan;
-    esp_wifi_get_channel(&current_channel, &second_chan);
-    if (current_channel != channel) {
-        if(!sw_job_apply_channel(channel)) {
+    uint8_t current_channel=0;
+    wifi_second_chan_t second_chan=WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&current_channel, &second_chan)!=ESP_OK ||
+        current_channel != channel) {
+        sw_channel_result_t result=sw_job_apply_channel_checked(channel);
+        if(result.status!=SW_CHANNEL_OK) {
             MY_LOG_INFO(TAG,"Job channel apply failed for HS target channel %u",channel);
-            sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+            if(sw_job_owned()) {
+                sw_job_emit_channel_failure(result);
+                (void)sw_job_request_cleanup(sw_job_token(),"channel_apply_failed");
+            }
             operation_stop_requested=true;
             return;
         }
@@ -8019,11 +8163,12 @@ static bool hs_context_seen_or_add(const uint8_t bssid[6], uint8_t subtype,
 }
 
 static bool hs_queue_frame(const wifi_promiscuous_pkt_t *pkt, size_t len,
-                           hs_frame_kind_t kind) {
+                           hs_frame_kind_t kind, uint64_t receipt_us) {
     if (len < 24 || len > HSX_FRAME_MAX) return false;
     hs_queued_frame_t *copy = capture_pool_acquire(&hs_frame_pool);
     if (!copy) return false;
-    copy->timestamp_us = pkt->rx_ctrl.timestamp;
+    copy->timestamp_us = receipt_us;
+    copy->driver_timestamp_us = pkt->rx_ctrl.timestamp;
     copy->len = (uint16_t)len;
     copy->kind = (uint8_t)kind;
     copy->channel = pkt->rx_ctrl.channel;
@@ -8046,6 +8191,7 @@ static void hs_queue_client(const uint8_t bssid[6], const uint8_t sta[6],
 /* The Wi-Fi driver callback owns no capture state or serializer. It only
  * validates routing and bounded-copies a small eligible subset into queues. */
 static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    const uint64_t receipt_us = (uint64_t)esp_timer_get_time();
     atomic_fetch_add(&hs_capture_producers, 1);
     if (!atomic_load(&hs_capture_accepting) || !handshake_attack_active ||
         (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) || !buf) goto done;
@@ -8073,18 +8219,18 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
         if ((subtype == 8 || subtype == 5) &&
             !memcmp(frame + 10, frame + 16, 6)) {
             if (!hs_context_seen_or_add(frame + 16, (uint8_t)subtype, false)) {
-                if (hs_queue_frame(pkt, len, HS_FRAME_AP_CONTEXT))
+                if (hs_queue_frame(pkt, len, HS_FRAME_AP_CONTEXT, receipt_us))
                     hs_context_seen_or_add(frame + 16, (uint8_t)subtype, true);
                 else atomic_fetch_add(&hs_capture_drops, 1);
             }
         } else if ((subtype == 0 || subtype == 2) &&
                    !(frame[1] & 0x40) && !memcmp(frame + 4, frame + 16, 6)) {
-            if (!hs_queue_frame(pkt, len, HS_FRAME_ASSOCIATION))
+            if (!hs_queue_frame(pkt, len, HS_FRAME_ASSOCIATION, receipt_us))
                 atomic_fetch_add(&hs_capture_drops, 1);
         } else if (subtype == 11 && len >= 30) {
             const uint8_t *bssid = frame + 16;
             if (!hs_context_seen_or_add(bssid, (uint8_t)subtype, false)) {
-                if (hs_queue_frame(pkt, len, HS_FRAME_AUTHENTICATION))
+                if (hs_queue_frame(pkt, len, HS_FRAME_AUTHENTICATION, receipt_us))
                     hs_context_seen_or_add(bssid, (uint8_t)subtype, true);
                 else atomic_fetch_add(&hs_capture_drops, 1);
             }
@@ -8099,7 +8245,7 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
         else if (ds == 2) { bssid = frame + 10; sta = frame + 4; }
         else goto done;
         if (hs_capture_kind(frame, len) == 2) {
-            if (!hs_queue_frame(pkt, len, HS_FRAME_EAPOL))
+            if (!hs_queue_frame(pkt, len, HS_FRAME_EAPOL, receipt_us))
                 atomic_fetch_add(&hs_capture_drops, 1);
         } else {
             hs_queue_client(bssid, sta, pkt->rx_ctrl.rssi);
@@ -8275,7 +8421,7 @@ static ZERO_STACK_NOINLINE void hs_process_queued_frame(const hs_queued_frame_t 
         if (ap_idx < 0 || hs_ap_targets[ap_idx].has_existing_file) return;
         hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
-        int message=hs_capture_kind(frame->data,frame->len);
+        int message=hsx_classify_eapol(frame->data,frame->len);
         if(message<1||message>4)return;
         const uint8_t *sta=ds==1?frame->data+10:frame->data+4;
         hs_add_or_update_client(sta,ap_idx,frame->rssi);
@@ -8326,7 +8472,11 @@ static unsigned hs_capture_drain(void) {
     hs_queued_frame_t *frame = NULL;
     while (hs_frame_pool.ready &&
            xQueueReceive(hs_frame_pool.ready, &frame, 0) == pdTRUE) {
-        hs_process_queued_frame(frame);
+        uint64_t now_us=(uint64_t)esp_timer_get_time();
+        if(sw_job_owned() && now_us>=frame->timestamp_us &&
+           now_us-frame->timestamp_us>2000000ULL)
+            atomic_fetch_add(&hs_capture_drops,1);
+        else hs_process_queued_frame(frame);
         capture_pool_release(&hs_frame_pool, frame);
         drained++;
     }
@@ -8486,6 +8636,11 @@ static void handshake_cleanup(void) {
     // exchange state, or output buffers can be reset.
     hs_capture_close();
     hsm_stop();
+    if(!hs_radio_restore()) {
+        MY_LOG_INFO(TAG,"Handshake radio restore pending; stop will retry.");
+        if(sw_job_owned())
+            sw_job_emit_lifecycle("error","stopping","\"message\":\"radio_restore_failed\"");
+    }
 
     if (handshake_serial_mode) {
         /* Managed jobs stream bounded raw frames to the host. Keep legacy
@@ -8728,7 +8883,34 @@ static void handshake_attack_task_sniffer(void) {
         for(int i=0;i<ducb_channel_count;i++)
             if(hst_channel(&handshake_scope,ducb_channels[i].channel))ducb_channels[count++]=ducb_channels[i];
         ducb_channel_count=count;
-        if(!count) {MY_LOG_INFO(TAG,"HS target channels unavailable; capture cancelled.");return;}
+        if(!count) {
+            MY_LOG_INFO(TAG,"HS target channels unavailable; capture cancelled.");
+            if(sw_job_owned())(void)sw_job_fail_start(sw_job_token(),"no_target_channels");
+            return;
+        }
+    }
+    if(!ducb_channel_count || operation_stop_requested) {
+        if(sw_job_owned())(void)sw_job_fail_start(sw_job_token(),"no_channels");
+        return;
+    }
+    bool has_24=false,has_5=false;
+    for(int i=0;i<ducb_channel_count;i++) {
+        if(ducb_channels[i].channel<=14)has_24=true;
+        else has_5=true;
+    }
+    wifi_band_mode_t required_band=has_24&&has_5?WIFI_BAND_MODE_AUTO:
+        has_5?WIFI_BAND_MODE_5G_ONLY:WIFI_BAND_MODE_2G_ONLY;
+    if(esp_wifi_set_band_mode(required_band)!=ESP_OK) {
+        if(sw_job_owned())(void)sw_job_fail_start(sw_job_token(),"band_mode_failed");
+        return;
+    }
+    sw_channel_result_t first_result=sw_job_apply_channel_checked((uint8_t)ducb_channels[0].channel);
+    if(first_result.status!=SW_CHANNEL_OK) {
+        if(sw_job_owned()) {
+            sw_job_emit_channel_failure(first_result);
+            (void)sw_job_fail_start(sw_job_token(),"channel_apply_failed");
+        }
+        return;
     }
     // 2. Reset sniffer state
     hs_ap_count = 0;
@@ -8741,6 +8923,7 @@ static void handshake_attack_task_sniffer(void) {
     if (!pcap_serializer_init() || !hs_capture_open()) {
         MY_LOG_INFO(TAG, "Handshake capture queue allocation failed.");
         pcap_serializer_deinit();
+        if(sw_job_owned())(void)sw_job_fail_start(sw_job_token(),"capture_pool_failed");
         return;
     }
     
@@ -8760,6 +8943,12 @@ static void handshake_attack_task_sniffer(void) {
                     esp_err_to_name(capture_err));
         hs_capture_close();
         pcap_serializer_deinit();
+        if(sw_job_owned())(void)sw_job_fail_start(sw_job_token(),"rx_setup_failed");
+        return;
+    }
+    if(operation_stop_requested || !handshake_attack_active ||
+       (sw_job_owned() && !sw_job_signal_ready(sw_job_token()))) {
+        hs_capture_close();
         return;
     }
     
@@ -8779,9 +8968,13 @@ static void handshake_attack_task_sniffer(void) {
         int channel = ducb_channels[ch_idx].channel;
         
         // Switch channel
-        if(!sw_job_apply_channel((uint8_t)channel)) {
+        sw_channel_result_t channel_result=sw_job_apply_channel_checked((uint8_t)channel);
+        if(channel_result.status!=SW_CHANNEL_OK) {
             MY_LOG_INFO(TAG,"Job D-UCB channel apply failed for channel %d",channel);
-            sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");
+            if(sw_job_owned()) {
+                sw_job_emit_channel_failure(channel_result);
+                (void)sw_job_request_cleanup(sw_job_token(),"channel_apply_failed");
+            }
             break;
         }
         
@@ -9146,7 +9339,9 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
     if (handshake_attack_active || handshake_attack_task_handle != NULL ||
         atomic_load(&handshake_cleanup_active) || hs_scan_pending ||
         atomic_load(&hs_scan_output_active) || g_scan_cancel_pending ||
-        g_scan_in_progress) {
+        g_scan_in_progress || hs_radio_saved || sw_active() ||
+        serial_job_radio_busy_probe() || portal_active || darksword_active ||
+        (current_radio_mode!=RADIO_MODE_NONE && current_radio_mode!=RADIO_MODE_WIFI)) {
         MY_LOG_INFO(TAG, "Handshake capture is busy or prior output is still draining.");
         return 1;
     }
@@ -9155,10 +9350,19 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
     if (!ensure_wifi_mode()) {
         return 1;
     }
+    bool promiscuous=false;
+    if(esp_wifi_get_promiscuous(&promiscuous)!=ESP_OK || promiscuous)
+        return 1;
+    if(!hs_radio_snapshot()) {
+        MY_LOG_INFO(TAG,"Failed to snapshot handshake radio state.");
+        return 1;
+    }
 
     // Enable AP mode for raw frame injection (deauth packets)
     if (!ensure_ap_mode()) {
         MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+        if(!hs_radio_restore() && sw_job_owned())
+            (void)sw_job_fail_start(sw_job_token(),"radio_restore_failed");
         return 1;
     }
 
@@ -9202,10 +9406,12 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
         handshake_attack_active = false;
         handshake_serial_mode = false;
         memset(&handshake_scope,0,sizeof(handshake_scope));
+        if(!hs_radio_restore() && sw_job_owned())
+            (void)sw_job_fail_start(sw_job_token(),"radio_restore_failed");
         return 1;
     }
 
-    return 0;
+    return sw_job_owned()?SW_JOB_START_PENDING:0;
 }
 
 static int cmd_start_handshake_serial(int argc,char **argv) {
@@ -12165,6 +12371,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
     if (!ensure_wifi_mode()) {
         return 1;
     }
+    if(atomic_load(&portal_verified_cleanup_active) || !portal_event_worker_ensure())return 1;
     
     // Check if attack is already running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -12393,6 +12600,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
 
             // Set portal_active flag BEFORE starting DNS task
             // (DNS task checks this flag in its loop)
+            atomic_fetch_add(&portal_generation,1);
             portal_active = true;
             
             // Start DNS server task
@@ -12660,6 +12868,9 @@ static int stop_operations(bool reset_wifi) {
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
+    for(unsigned waited=0;waited<6000 && atomic_load(&portal_verified_cleanup_active);
+        waited+=50)vTaskDelay(pdMS_TO_TICKS(50));
+    if(atomic_load(&portal_verified_cleanup_active))return 1;
 
     // Stop packet monitor if running
     packet_monitor_stop();
@@ -12677,67 +12888,9 @@ static int stop_operations(bool reset_wifi) {
     // Stop AP locator if running
     ap_locator_stop();
 
-    // Stop PCAPNG capture if running
-    if (pcap_capture_active) {
-        pcap_capture_active = false;
-
-        if (pcap_capture_mode == PCAP_MODE_RADIO) {
-            esp_wifi_set_promiscuous(false);
-        } else if (pcap_capture_mode == PCAP_MODE_NET) {
-            if (pcap_arp_active) {
-                pcap_arp_active = false;
-                for (int i = 0; i < 60 && pcap_arp_task_handle != NULL; i++) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                }
-                if (pcap_arp_task_handle != NULL) {
-                    vTaskDelete(pcap_arp_task_handle);
-                    pcap_arp_task_handle = NULL;
-                    MY_LOG_INFO(TAG, "ARP spoof task force-deleted");
-                }
-                pcap_arp_host_count = 0;
-            }
-
-            esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (sta) {
-                struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta);
-                if (lwip_nif) {
-                    if (pcap_original_input) lwip_nif->input = pcap_original_input;
-                    if (pcap_original_linkoutput) lwip_nif->linkoutput = pcap_original_linkoutput;
-                }
-            }
-            pcap_original_input = NULL;
-            pcap_original_linkoutput = NULL;
-        }
-
-        for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        if (pcap_writer_task_handle != NULL) {
-            vTaskDelete(pcap_writer_task_handle);
-            pcap_writer_task_handle = NULL;
-        }
-
-        if (pcap_packet_queue) {
-            pcap_queued_frame_t *leftover = NULL;
-            while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
-                free(leftover);
-            }
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
-        }
-
-        if (pcap_capture_file) {
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            sd_sync();
-        }
-
-        MY_LOG_INFO(TAG, "PCAPNG saved: %s (%lu frames, %lu drops)",
-                    pcap_capture_filepath,
-                    (unsigned long)pcap_capture_frame_count,
-                    (unsigned long)pcap_capture_drop_count);
-        pcap_capture_mode = PCAP_MODE_NONE;
-    }
+    // The writer owns its file and every queued frame. A timeout retains the
+    // queue, task, and radio lease for a later stop attempt.
+    if (!pcap_capture_stop()) return 1;
 
     // Stop handshake attack task if running. The task owns callback teardown,
     // serializers, artifact output, and final state reset; never force-delete
@@ -12761,6 +12914,13 @@ static int stop_operations(bool reset_wifi) {
         // Stop handshake attack if running (old non-task mode)
         attack_handshake_stop();
         hsm_stop();
+    }
+
+    /* A failed restore retains the radio lease after the task retires.  The
+     * managed supervisor (or a later console stop) retries this exact state. */
+    if(hs_radio_saved && !hs_radio_restore()) {
+        MY_LOG_INFO(TAG,"Handshake radio restore failed; retry stop.");
+        return 1;
     }
 
     // Stop channel view monitor if running
@@ -12871,14 +13031,25 @@ static int stop_operations(bool reset_wifi) {
     
     // Stop sniffer cooperatively (keep collected data). The worker may be
     // publishing a managed record while holding stdout's lock, so never kill it.
-    if (sniffer_active || sniffer_channel_task_handle != NULL || sniffer_stop_pending) {
+    if (sniffer_active || sniffer_setup_task_handle != NULL ||
+        sniffer_channel_task_handle != NULL || sniffer_frame_queue ||
+        sniffer_stop_pending || sniffer_restore_pending) {
         bool was_active = sniffer_active;
         sniffer_stop_pending = true;
         if (was_active) {
             sniffer_active = false;
             sniffer_scan_phase = false;
             sniffer_session_completed_us = esp_timer_get_time();
-            esp_wifi_set_promiscuous(false);
+            if (esp_wifi_set_promiscuous(false) != ESP_OK) {
+                MY_LOG_INFO(TAG, "Sniffer RX disable failed; retry stop.");
+                return 1;
+            }
+        }
+        for (unsigned waited_ms = 0; waited_ms < 1500 && sniffer_setup_task_handle;
+             waited_ms += 50) vTaskDelay(pdMS_TO_TICKS(50));
+        if (sniffer_setup_task_handle) {
+            MY_LOG_INFO(TAG, "Sniffer setup task is still retiring; retry stop.");
+            return 1;
         }
         if (sniffer_channel_task_handle != NULL && !sniffer_channel_wait_quiescent()) {
             MY_LOG_INFO(TAG, "Sniffer channel task is still draining; retry stop.");
@@ -12887,6 +13058,26 @@ static int stop_operations(bool reset_wifi) {
         if (sniffer_channel_task_handle == NULL) {
             MY_LOG_INFO(TAG, "Stopped sniffer channel hopping task");
         }
+        for(unsigned waited_ms=0;waited_ms<1500 && atomic_load(&sniffer_producers);
+            waited_ms+=10) vTaskDelay(pdMS_TO_TICKS(10));
+        if(atomic_load(&sniffer_producers)) return 1;
+        if (!sniffer_restore_radio()) {
+            MY_LOG_INFO(TAG, "Sniffer radio restore failed; retry stop.");
+            return 1;
+        }
+        if(sniffer_frame_queue) {
+            unsigned discarded=uxQueueMessagesWaiting(sniffer_frame_queue);
+            atomic_fetch_add(&sniffer_drop_count,discarded);
+            sw_job_note_saturation();
+            vQueueDelete(sniffer_frame_queue);
+            sniffer_frame_queue=NULL;
+        }
+        for(unsigned i=0;i<SNIFFER_FRAME_SLOTS;i++)
+            atomic_store(&sniffer_slot_busy[i],false);
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+        heap_caps_free(sniffer_frames);
+        sniffer_frames=NULL;
+#endif
 
         // Reset channel state for next session
         sniffer_channel_index = 0;
@@ -13199,24 +13390,30 @@ static int stop_operations(bool reset_wifi) {
 static bool zig_recon_radio_busy(char *reason, size_t reason_len)
 {
     const char *why = NULL;
-    if (g_scan_in_progress) why = "wifi_scan";
-    else if (sniffer_active || sniffer_channel_task_handle != NULL) why = "sniffer";
+    if (g_scan_in_progress || g_scan_cancel_pending || hs_scan_pending ||
+        atomic_load(&hs_scan_output_active)) why = "wifi_scan";
+    else if (sniffer_active || sniffer_setup_task_handle != NULL ||
+             sniffer_channel_task_handle != NULL || sniffer_stop_pending ||
+             sniffer_restore_pending || sniffer_frame_queue) why = "sniffer";
     else if (packet_monitor_active || packet_monitor_task_handle != NULL) why = "packet_monitor";
     else if (ap_locator_active || ap_locator_task_handle != NULL) why = "ap_locator";
     else if (channel_view_active || channel_view_task_handle != NULL) why = "channel_view";
-    else if (pcap_capture_active || pcap_writer_task_handle != NULL) why = "pcap";
+    else if (pcap_capture_active || pcap_writer_task_handle != NULL || pcap_packet_queue) why = "pcap";
     else if (deauth_attack_active || deauth_attack_task_handle != NULL) why = "deauth";
     else if (blackout_attack_active || blackout_attack_task_handle != NULL) why = "blackout";
     else if (sae_attack_active || sae_attack_task_handle != NULL) why = "sae_overflow";
     else if (sniffer_dog_active || sniffer_dog_task_handle != NULL) why = "sniffer_dog";
     else if (deauth_detector_active || deauth_detector_task_handle != NULL) why = "deauth_detector";
-    else if (handshake_attack_active || handshake_attack_task_handle != NULL) why = "handshake";
+    else if (handshake_attack_active || handshake_attack_task_handle != NULL ||
+             hs_radio_saved || atomic_load(&handshake_cleanup_active)) why = "handshake";
     else if (beacon_spam_active || beacon_spam_task_handle != NULL) why = "beacon_spam";
-    else if (portal_active || darksword_active) why = "portal";
+    else if (portal_active || darksword_active || atomic_load(&portal_verified_cleanup_active)) why = "portal";
     else if (wardrive_active || wardrive_task_handle != NULL) why = "wardrive";
     else if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) why = "wardrive_promisc";
     else if (antisurv_active || antisurv_task_handle != NULL) why = "antisurveillance";
     else if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) why = "ble_scan";
+    else if (wifi_connect_attempt_active) why = "wifi_connect";
+    else if (portal_connected_clients > 0) why = "ap_clients";
     else if (nrf24_jammer_is_running()) why = "nrf24";
 
     if (why && reason && reason_len) {
@@ -13228,7 +13425,16 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
 /* Read-only admission probe used by managed C5 jobs and device_info. */
 static bool serial_job_radio_busy_probe(void)
 {
-    return zig_recon_radio_busy(NULL, 0) || zig_recon_is_active();
+    wifi_ap_record_t connected;
+    return zig_recon_radio_busy(NULL, 0) || zig_recon_is_active() ||
+        g_scan_in_progress || g_scan_cancel_pending || wifi_connect_attempt_active ||
+        esp_wifi_sta_get_ap_info(&connected) == ESP_OK || portal_connected_clients > 0 ||
+        sniffer_active || sniffer_setup_task_handle || sniffer_channel_task_handle ||
+        sniffer_restore_pending || sniffer_frame_queue ||
+        handshake_attack_active || handshake_attack_task_handle ||
+        pcap_capture_active || pcap_packet_queue || pcap_writer_task_handle ||
+        atomic_load(&portal_verified_cleanup_active) ||
+        hs_radio_saved;
 }
 
 static bool zig_recon_parse_u16(const char *text, uint16_t *out)
@@ -14196,6 +14402,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Reset result flag before connecting
     wifi_connect_result = 0;
     wifi_connect_fail_reason = 0;
+    wifi_connect_attempt_active = true;
     esp_wifi_connect();
     
     MY_LOG_INFO(TAG, "Waiting for connection result...");
@@ -14204,6 +14411,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
     for (int i = 0; i < 150 && wifi_connect_result == 0; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    wifi_connect_attempt_active = false;
     
     if (wifi_connect_result == 1) {
         esp_netif_ip_info_t ip_info = { 0 };
@@ -16044,128 +16252,149 @@ static int cmd_channel_view(int argc, char **argv) {
     return 0;
 }
 
+static bool sniffer_restore_radio(void) {
+    if (!sniffer_restore_pending) return true;
+    bool ok = true;
+    if (esp_wifi_set_promiscuous(false) != ESP_OK) ok = false;
+    if (esp_wifi_set_promiscuous_rx_cb(NULL) != ESP_OK) ok = false;
+    if (esp_wifi_set_promiscuous_filter(&sniffer_prev_filter) != ESP_OK) ok = false;
+    if (esp_wifi_set_band_mode(sniffer_prev_band) != ESP_OK) ok = false;
+    if (sniffer_prev_channel &&
+        esp_wifi_set_channel(sniffer_prev_channel, sniffer_prev_second) != ESP_OK) ok = false;
+    if (ok) sniffer_restore_pending = false;
+    return ok;
+}
+
+static void sniffer_setup_task(void *pvParameters) {
+    (void)pvParameters;
+    bool ready = false;
+    sniffer_setup_task_handle = xTaskGetCurrentTaskHandle();
+    if (sniffer_setup_needs_scan) {
+        sniffer_scan_ok = false;
+        if (start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME) != ESP_OK)
+            goto done;
+        bool notified = false;
+        for (unsigned waited = 0; waited < 30000 && sniffer_active &&
+             !operation_stop_requested; waited += 100) {
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100))) { notified = true; break; }
+        }
+        if (!notified || !sniffer_scan_ok) goto done;
+    }
+    if (!sniffer_active || operation_stop_requested || !sniffer_aps || !probe_requests)
+        goto done;
+    if (sniffer_selected_mode) sniffer_init_selected_networks();
+    else sniffer_process_scan_results();
+    if (sniffer_selected_mode && !sniffer_selected_channels_count) goto done;
+
+    uint8_t channels[40];
+    size_t channel_count = sw_job_owned() ? sw_job_copy_channels(channels, sizeof(channels)) : 0;
+    if (sw_job_owned() && !channel_count) goto done;
+    bool has_24 = false, has_5 = false;
+    if (channel_count) {
+        for (size_t i = 0; i < channel_count; i++) {
+            if (channels[i] <= 14) has_24 = true; else has_5 = true;
+        }
+    } else if (sniffer_selected_mode) {
+        for (int i = 0; i < sniffer_selected_channels_count; i++) {
+            if (sniffer_selected_channels[i] <= 14) has_24 = true; else has_5 = true;
+        }
+    } else { has_24 = true; has_5 = true; }
+    wifi_band_mode_t required_band = has_24 && has_5 ? WIFI_BAND_MODE_AUTO :
+        has_5 ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY;
+    if (esp_wifi_get_band_mode(&sniffer_prev_band) != ESP_OK ||
+        esp_wifi_get_promiscuous_filter(&sniffer_prev_filter) != ESP_OK ||
+        esp_wifi_get_channel(&sniffer_prev_channel, &sniffer_prev_second) != ESP_OK)
+        goto done;
+    sniffer_restore_pending = true;
+    if (esp_wifi_set_band_mode(required_band) != ESP_OK) goto done;
+    unsigned first = channel_count ? channels[0] : sniffer_selected_mode ?
+        (unsigned)sniffer_selected_channels[0] : (unsigned)dual_band_channels[0];
+    sw_channel_result_t first_result = sw_job_apply_channel_checked((uint8_t)first);
+    if (first_result.status != SW_CHANNEL_OK) {
+        if (sw_job_owned()) sw_job_emit_channel_failure(first_result);
+        goto done;
+    }
+    sniffer_current_channel = first_result.actual_channel;
+    sniffer_channel_index = 1;
+    if (esp_wifi_set_promiscuous_filter(&sniffer_filter) != ESP_OK ||
+        esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback) != ESP_OK ||
+        esp_wifi_set_promiscuous(true) != ESP_OK) goto done;
+    if (xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE,
+                    NULL, 5, &sniffer_channel_task_handle) != pdPASS) {
+        sniffer_channel_task_handle = NULL;
+        goto done;
+    }
+    if (!sniffer_active || operation_stop_requested ||
+        (sw_job_owned() && !sw_job_signal_ready(sw_job_token()))) goto done;
+    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+    sniffer_scan_phase = false;
+    ready = true;
+    if(sw_job_owned())sw_job_set_sniffer_stats(sniffer_packet_counter,(uint32_t)sniffer_ap_count,
+                                               atomic_load(&sniffer_drop_count));
+    (void)led_set_color(0, 255, 0);
+done:
+    if (!ready) {
+        sniffer_active = false;
+        sniffer_scan_phase = false;
+        sniffer_session_valid = false;
+        sniffer_stop_pending = true;
+        (void)esp_wifi_set_promiscuous(false);
+        if (sw_job_owned() && !operation_stop_requested)
+            (void)sw_job_fail_start(sw_job_token(), "sniffer_setup_failed");
+    }
+    sniffer_setup_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 static int cmd_start_sniffer(int argc, char **argv) {
     (void)argc; (void)argv;
-    {
-        char oled_target[48];
-        if (g_selected_count > 0 && g_scan_done) {
-            oled_build_target_summary(oled_target, sizeof(oled_target));
-        } else {
-            snprintf(oled_target, sizeof(oled_target), "  All networks");
-        }
-        oled_display_update_full("> Sniffer", oled_target, "  Promiscuous", "  Capturing...");
-    }
-    log_memory_info("start_sniffer");
-    
-    // Ensure WiFi is initialized
-    if (!ensure_wifi_mode()) {
+    if (serial_job_radio_busy_probe() || (sw_active() && !sw_job_owned()) ||
+        (current_radio_mode!=RADIO_MODE_NONE && current_radio_mode!=RADIO_MODE_WIFI) ||
+        !sniffer_aps || !probe_requests) return 1;
+    if (!ensure_wifi_mode()) return 1;
+    bool promiscuous=false;
+    if (esp_wifi_get_promiscuous(&promiscuous)!=ESP_OK || promiscuous) return 1;
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    sniffer_frames=heap_caps_calloc(SNIFFER_FRAME_SLOTS,sizeof(*sniffer_frames),
+                                   MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+#endif
+    if(!sniffer_frames)return 1;
+    sniffer_frame_queue=xQueueCreate(SNIFFER_FRAME_SLOTS,sizeof(uint8_t));
+    if(!sniffer_frame_queue) {
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+        heap_caps_free(sniffer_frames);sniffer_frames=NULL;
+#endif
         return 1;
     }
-    
-    // Reset stop flag at the beginning of operation
+    for(unsigned i=0;i<SNIFFER_FRAME_SLOTS;i++)
+        atomic_store(&sniffer_slot_busy[i],false);
     operation_stop_requested = false;
-    
-    if (sniffer_active) {
-        MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
+    sniffer_begin_session();
+    atomic_store(&sniffer_drop_count, 0);
+    sniffer_selected_mode = g_selected_count > 0 && g_scan_done;
+    sniffer_setup_needs_scan = !sniffer_selected_mode && !sniffer_skip_scan_once;
+    sniffer_skip_scan_once = false;
+    sniffer_active = true;
+    sniffer_scan_phase = true;
+    if (xTaskCreate(sniffer_setup_task, "sniffer_setup", 6144, NULL, 5,
+                    &sniffer_setup_task_handle) != pdPASS) {
+        sniffer_active = false;
+        sniffer_scan_phase = false;
+        sniffer_session_valid = false;
+        sniffer_setup_task_handle = NULL;
+        vQueueDelete(sniffer_frame_queue);sniffer_frame_queue=NULL;
+#if !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+        heap_caps_free(sniffer_frames);sniffer_frames=NULL;
+#endif
         return 1;
     }
-
-    /* Results remain available after stop, but each start is a new bounded
-     * observation window for picker metrics. */
-    sniffer_begin_session();
-    
-    // Check if networks were selected
-    if (g_selected_count > 0 && g_scan_done) {
-        // Selected networks mode - skip scan, use selected networks only
-        MY_LOG_INFO(TAG, "Starting sniffer in SELECTED NETWORKS mode...");
-        MY_LOG_INFO(TAG, "Will monitor %d pre-selected network(s)", g_selected_count);
-        
-        sniffer_active = true;
-        sniffer_scan_phase = false; // Skip scan phase
-        sniffer_selected_mode = true;
-        
-        // Initialize sniffer with selected networks
-        sniffer_init_selected_networks();
-        
-        if (sniffer_ap_count == 0 || sniffer_selected_channels_count == 0) {
-            MY_LOG_INFO(TAG, "Failed to initialize selected networks for sniffer");
-            sniffer_active = false;
-            sniffer_selected_mode = false;
-            sniffer_session_valid = false;
-            return 1;
-        }
-        
-        // Set LED to green for active sniffing
-        esp_err_t led_err = led_set_color(0, 255, 0); // Green
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-        }
-        
-        // Set promiscuous filter
-        esp_wifi_set_promiscuous_filter(&sniffer_filter);
-        
-        // Enable promiscuous mode
-        esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
-        esp_wifi_set_promiscuous(true);
-        
-        // Initialize channel hopping with selected channels
-        sniffer_channel_index = 0;
-        sniffer_current_channel = sniffer_selected_channels[0];
-        sniffer_last_channel_hop = esp_timer_get_time() / 1000;
-        esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
-        
-        // Start channel hopping task
-        if (sniffer_channel_task_handle == NULL) {
-            xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
-            MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
-        }
-        
-        MY_LOG_INFO(TAG, "Sniffer: Now monitoring selected networks (no scan performed)");
-        MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
-        
-    } else {
-        // Normal mode - scan all networks
-        MY_LOG_INFO(TAG, "Starting sniffer in NORMAL mode (scanning all networks)...");
-        
-        sniffer_active = true;
-        sniffer_scan_phase = true;
-        sniffer_selected_mode = false;
-        
-        // Set LED (ignore errors if LED is in invalid state)
-        esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-        }
-        
-        esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
-        if (err != ESP_OK) {
-            sniffer_active = false;
-            sniffer_scan_phase = false;
-            sniffer_selected_mode = false;
-            sniffer_session_valid = false;
-            
-            // Return LED to idle (ignore errors if LED is in invalid state)
-            led_err = led_set_idle();
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
-            }
-            
-            MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
-            return 1;
-        }
-        
-        MY_LOG_INFO(TAG, "Sniffer started - scanning networks...");
-        MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
-    }
-    
-    return 0;
+    return sw_job_owned() ? SW_JOB_START_PENDING : 0;
 }
 
 static int cmd_start_sniffer_all(int argc, char **argv) {
-    (void)argc; (void)argv;
     g_selected_count = 0;
     memset(g_selected_indices, 0, sizeof(g_selected_indices));
-    return cmd_start_sniffer(1, argv);
+    return cmd_start_sniffer(argc, argv);
 }
 
 static void pcapng_put_le16(uint8_t *dest, uint16_t value) {
@@ -16194,9 +16423,22 @@ static int cmd_start_pcap(int argc, char **argv) {
         }
     }
 
-    if (pcap_capture_active) {
+    if (pcap_capture_active || pcap_packet_queue || pcap_writer_task_handle ||
+        atomic_load(&pcap_capture_state)==PCAP_CAPTURE_STOPPING) {
         MY_LOG_INFO(TAG, "PCAPNG capture already active. Use 'stop' first.");
         return 1;
+    }
+    /* Radio capture replaces the RX callback; net capture replaces STA
+     * hooks. Both must wait for every existing owner and cleanup barrier. */
+    if (sw_active() || zig_recon_radio_busy(NULL,0) || zig_recon_is_active() ||
+        g_scan_cancel_pending || wifi_connect_attempt_active ||
+        atomic_load(&portal_verified_cleanup_active) ||
+        (current_radio_mode!=RADIO_MODE_NONE && current_radio_mode!=RADIO_MODE_WIFI))
+        return 1;
+    if(mode==PCAP_MODE_RADIO) {
+        wifi_ap_record_t connected;
+        if(esp_wifi_sta_get_ap_info(&connected)==ESP_OK || portal_connected_clients>0)
+            return 1;
     }
 
     operation_stop_requested = false;
@@ -16208,12 +16450,25 @@ static int cmd_start_pcap(int argc, char **argv) {
             return 1;
         }
     }
+    esp_netif_t *sta_netif=NULL;
+    struct netif *lwip_nif=NULL;
+    if(mode==PCAP_MODE_NET) {
+        sta_netif=esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        lwip_nif=sta_netif?(struct netif *)esp_netif_get_netif_impl(sta_netif):NULL;
+        if(!lwip_nif || !lwip_nif->input || !lwip_nif->linkoutput) {
+            MY_LOG_INFO(TAG,"PCAPNG net capture has no usable STA netif.");
+            return 1;
+        }
+    }
 
     if (mode == PCAP_MODE_RADIO) {
         if (!ensure_wifi_mode()) {
             MY_LOG_INFO(TAG, "Failed to initialize WiFi for radio capture.");
             return 1;
         }
+        bool promiscuous=false;
+        if(esp_wifi_get_promiscuous(&promiscuous)!=ESP_OK || promiscuous)
+            return 1;
     }
 
     esp_err_t ret = init_sd_card();
@@ -16232,14 +16487,20 @@ static int cmd_start_pcap(int argc, char **argv) {
     }
 
     int file_num = find_next_pcap_file_number();
+    if(file_num<1 || file_num>9999)return 1;
     snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+             "/sdcard/lab/pcaps/sniff_%d.partial", file_num);
+    snprintf(pcap_capture_finalpath, sizeof(pcap_capture_finalpath),
              "/sdcard/lab/pcaps/sniff_%d.pcapng", file_num);
 
-    pcap_capture_file = fopen(pcap_capture_filepath, "wb");
+    int capture_fd=open(pcap_capture_filepath,O_WRONLY|O_CREAT|O_EXCL,0644);
+    pcap_capture_file=capture_fd>=0?fdopen(capture_fd,"wb"):NULL;
     if (!pcap_capture_file) {
+        if(capture_fd>=0)close(capture_fd);
         MY_LOG_INFO(TAG, "Failed to open %s for writing", pcap_capture_filepath);
         return 1;
     }
+    atomic_store(&pcap_capture_state,PCAP_CAPTURE_STARTING);
 
     uint8_t pcapng_header[60] = {0};
     pcapng_put_le32(pcapng_header, 0x0a0d0d0aU);
@@ -16264,23 +16525,39 @@ static int cmd_start_pcap(int argc, char **argv) {
         unlink(pcap_capture_filepath);
         return 1;
     }
-    fflush(pcap_capture_file);
+    if(fflush(pcap_capture_file)!=0) {
+        fclose(pcap_capture_file);pcap_capture_file=NULL;
+        atomic_store(&pcap_capture_state,PCAP_CAPTURE_FAILED);
+        return 1;
+    }
 
-    pcap_capture_frame_count = 0;
-    pcap_capture_drop_count = 0;
+    atomic_store(&pcap_received_count,0);
+    atomic_store(&pcap_written_count,0);
+    atomic_store(&pcap_queue_drop_count,0);
+    atomic_store(&pcap_write_fail_count,0);
+    atomic_store(&pcap_alloc_fail_count,0);
+    atomic_store(&pcap_producers,0);
+    atomic_store(&pcap_writer_stop_requested,false);
+    atomic_store(&pcap_writer_finished,false);
 
     pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
     if (!pcap_packet_queue) {
         MY_LOG_INFO(TAG, "Failed to create PCAPNG packet queue");
         fclose(pcap_capture_file);
         pcap_capture_file = NULL;
+        atomic_store(&pcap_capture_state,PCAP_CAPTURE_FAILED);
         return 1;
     }
 
     pcap_capture_mode = mode;
-    pcap_capture_active = true;
-
-    xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 5, &pcap_writer_task_handle);
+    if(xTaskCreate(pcap_writer_task,"pcap_writer",4096,NULL,5,&pcap_writer_task_handle)!=pdPASS) {
+        pcap_writer_task_handle=NULL;
+        vQueueDelete(pcap_packet_queue);pcap_packet_queue=NULL;
+        fclose(pcap_capture_file);pcap_capture_file=NULL;
+        pcap_capture_mode=PCAP_MODE_NONE;
+        atomic_store(&pcap_capture_state,PCAP_CAPTURE_FAILED);
+        return 1;
+    }
 
     if (mode == PCAP_MODE_RADIO) {
         wifi_promiscuous_filter_t filter = {
@@ -16288,40 +16565,33 @@ static int cmd_start_pcap(int argc, char **argv) {
                            WIFI_PROMIS_FILTER_MASK_DATA |
                            WIFI_PROMIS_FILTER_MASK_CTRL
         };
-        esp_wifi_set_promiscuous_filter(&filter);
-        esp_wifi_set_promiscuous_rx_cb(pcap_radio_promiscuous_cb);
-        esp_wifi_set_promiscuous(true);
+        if(esp_wifi_get_promiscuous_filter(&pcap_previous_filter)!=ESP_OK) {
+            (void)pcap_capture_stop();return 1;
+        }
+        pcap_filter_saved=true;
+        if(esp_wifi_set_promiscuous_filter(&filter)!=ESP_OK ||
+           esp_wifi_set_promiscuous_rx_cb(pcap_radio_promiscuous_cb)!=ESP_OK) {
+            pcap_rx_configured=true;
+            (void)pcap_capture_stop();return 1;
+        }
+        pcap_rx_configured=true;
+        pcap_capture_active=true;
+        if(esp_wifi_set_promiscuous(true)!=ESP_OK) {
+            (void)pcap_capture_stop();return 1;
+        }
 
         oled_display_update_full("> PCAPNG Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
         MY_LOG_INFO(TAG, "PCAPNG radio capture started -> %s", pcap_capture_filepath);
     } else {
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (!sta_netif) {
-            MY_LOG_INFO(TAG, "Failed to get STA netif");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
-            return 1;
-        }
-
-        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
-        if (!lwip_nif) {
-            MY_LOG_INFO(TAG, "Failed to get lwIP netif");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
-            return 1;
-        }
-
         // --- ARP spoof MITM setup ---
-        esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
+        if(esp_wifi_get_mac(WIFI_IF_STA,pcap_arp_own_mac)!=ESP_OK) {
+            (void)pcap_capture_stop();return 1;
+        }
 
         esp_netif_ip_info_t ip_info;
-        esp_netif_get_ip_info(sta_netif, &ip_info);
+        if(esp_netif_get_ip_info(sta_netif,&ip_info)!=ESP_OK) {
+            (void)pcap_capture_stop();return 1;
+        }
         pcap_arp_gateway_ip = ip_info.gw.addr;
 
         bool gw_found = false;
@@ -16400,7 +16670,12 @@ static int cmd_start_pcap(int argc, char **argv) {
 
             if (pcap_arp_host_count > 0) {
                 pcap_arp_active = true;
-                xTaskCreate(pcap_arp_spoof_task, "pcap_arp", 4096, NULL, 5, &pcap_arp_task_handle);
+                if(xTaskCreate(pcap_arp_spoof_task,"pcap_arp",4096,NULL,5,
+                               &pcap_arp_task_handle)!=pdPASS) {
+                    pcap_arp_task_handle=NULL;
+                    pcap_arp_active=false;
+                    (void)pcap_capture_stop();return 1;
+                }
                 MY_LOG_INFO(TAG, "PCAPNG net: ARP spoof MITM started (IP forwarding enabled)");
             }
         }
@@ -16408,8 +16683,10 @@ static int cmd_start_pcap(int argc, char **argv) {
 
         pcap_original_input = lwip_nif->input;
         pcap_original_linkoutput = lwip_nif->linkoutput;
+        pcap_capture_active=true;
         lwip_nif->input = pcap_netif_input_hook;
         lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
+        pcap_net_hooks_installed=true;
 
         {
             char oled_l3[32];
@@ -16419,98 +16696,17 @@ static int cmd_start_pcap(int argc, char **argv) {
         MY_LOG_INFO(TAG, "PCAPNG net capture started -> %s", pcap_capture_filepath);
     }
 
+    atomic_store(&pcap_capture_state,PCAP_CAPTURE_RUNNING);
     MY_LOG_INFO(TAG, "Use 'stop' to stop capture and save file.");
     return 0;
 }
 
 static int cmd_start_sniffer_noscan(int argc, char **argv) {
-    (void)argc; (void)argv;
-    {
-        char oled_l3[32];
-        snprintf(oled_l3, sizeof(oled_l3), "  %u networks", g_scan_count);
-        oled_display_update_full("> Sniffer", "  Prior scan data", oled_l3, "  Capturing...");
-    }
-    log_memory_info("start_sniffer_noscan");
-    
-    // Ensure WiFi is initialized
-    if (!ensure_wifi_mode()) {
-        return 1;
-    }
-    
-    // Reset stop flag
-    operation_stop_requested = false;
-    
-    if (sniffer_active) {
-        MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
-        return 1;
-    }
-    
-    // Check if scan was previously performed
-    if ((!g_scan_done || g_scan_count == 0) && !sw_job_owned()) {
-        MY_LOG_INFO(TAG, "Please scan_networks first.");
-        return 1;
-    }
-    
-    MY_LOG_INFO(TAG, "Starting sniffer using existing scan results (%u networks)...", g_scan_count);
-
-    bool had_sniffer_data = sniffer_ap_count > 0;
-    sniffer_begin_session();
-    
-    sniffer_active = true;
-    sniffer_scan_phase = false;
-    sniffer_selected_mode = false;
-    
-    // Reuse the AP catalog while keeping this session's metrics clean.
-    if (had_sniffer_data) {
-        sniffer_merge_scan_results();
-    } else {
-        sniffer_process_scan_results();
-    }
-    
-    // Set promiscuous filter
-    esp_wifi_set_promiscuous_filter(&sniffer_filter);
-    
-    // Enable promiscuous mode
-    esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
-    esp_wifi_set_promiscuous(true);
-    
-    // Initialize dual-band channel hopping
-    sniffer_channel_index = 0;
-    if(sw_job_owned()) {
-        uint8_t applied=0;
-        if(!sw_job_radio_hop(0,&applied)) {
-            MY_LOG_INFO(TAG,"Job sniffer channel apply failed");
-            sniffer_active=false;
-            return 1;
-        }
-        sniffer_current_channel=applied;
-        sniffer_channel_index=1;
-    } else {
-        sniffer_current_channel = dual_band_channels[sniffer_channel_index];
-        if(esp_wifi_set_channel(sniffer_current_channel,WIFI_SECOND_CHAN_NONE)!=ESP_OK) {
-            MY_LOG_INFO(TAG,"Sniffer initial channel apply failed");
-            sniffer_active=false;
-            return 1;
-        }
-    }
-    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
-    
-    // Start channel hopping task
-    if (sniffer_channel_task_handle == NULL) {
-        xTaskCreate(sniffer_channel_task, "sniffer_channel", SNIFFER_CHANNEL_TASK_STACK_SIZE, NULL, 5, &sniffer_channel_task_handle);
-        MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
-    }
-    
-    // Set LED to green for active sniffing
-    esp_err_t led_err = led_set_color(0, 255, 0);
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-    }
-    
-    MY_LOG_INFO(TAG, "Sniffer: Now monitoring %d networks (no scan performed)", sniffer_ap_count);
-    MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
-    
-    return 0;
+    if ((!g_scan_done || g_scan_count == 0) && !sw_job_owned()) return 1;
+    sniffer_skip_scan_once = true;
+    int rc = cmd_start_sniffer(argc, argv);
+    if (rc != 0 && rc != SW_JOB_START_PENDING) sniffer_skip_scan_once = false;
+    return rc;
 }
 
 static int cmd_show_sniffer_results(int argc, char **argv) {
@@ -20002,6 +20198,7 @@ static int cmd_start_darksword(int argc, char **argv) {
     log_memory_info("start_darksword");
 
     if (!ensure_wifi_mode()) return 1;
+    if(atomic_load(&portal_verified_cleanup_active) || !portal_event_worker_ensure())return 1;
 
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_darksword <SSID>");
@@ -20099,6 +20296,7 @@ static int cmd_start_darksword(int argc, char **argv) {
     httpd_register_uri_handler(portal_server, &api_uri);
 
     darksword_active = true;
+    atomic_fetch_add(&portal_generation,1);
     portal_active = true;
 
     // DNS server
@@ -20141,6 +20339,7 @@ static int cmd_start_portal(int argc, char **argv) {
         }
         portal_channel = channels[0];
     }
+    if(atomic_load(&portal_verified_cleanup_active) || !portal_event_worker_ensure())return 1;
     oled_display_update_full("> Captive Portal",
         argc >= 2 ? argv[1] : "  No SSID",
         "  Password trap", "  Waiting...");
@@ -20380,6 +20579,7 @@ static int cmd_start_portal(int argc, char **argv) {
     httpd_register_uri_handler(portal_server, &captive_api_options_uri);
     
     // Set portal as active (must be before starting DNS task)
+    atomic_fetch_add(&portal_generation,1);
     portal_active = true;
     MY_LOG_INFO(TAG, "Portal marked as active");
     
@@ -20420,6 +20620,7 @@ static int cmd_start_rogueap(int argc, char **argv) {
         "  WPA2 + Portal", "  Active...");
     rogueap_mode_active = true;
     log_memory_info("start_rogueap");
+    if(atomic_load(&portal_verified_cleanup_active) || !portal_event_worker_ensure())return 1;
     
     // Validate arguments
     if (argc < 3) {
@@ -20683,6 +20884,7 @@ static int cmd_start_rogueap(int argc, char **argv) {
     httpd_register_uri_handler(portal_server, &captive_api_options_uri);
     
     // Set portal as active (must be before starting DNS task)
+    atomic_fetch_add(&portal_generation,1);
     portal_active = true;
     MY_LOG_INFO(TAG, "Portal marked as active");
     
@@ -21272,9 +21474,25 @@ static void bt_on_reset(int reason)
  */
 static void nimble_host_task(void *param)
 {
+    (void)param;
+    atomic_store(&nimble_host_started,true);
+    atomic_store(&nimble_host_running,true);
     ESP_LOGI(TAG, "NimBLE host task started");
     nimble_port_run();
-    nimble_port_freertos_deinit();
+    nimble_initialized=false;
+    atomic_store(&nimble_host_running,false);
+    /* The owner retires this task before deinitializing the port. The SDK's
+     * freertos_deinit() deletes its own host task and offers no join barrier. */
+    atomic_store(&nimble_host_exited,true);
+    vTaskSuspend(NULL);
+}
+
+static void nimble_stop_task(void *param)
+{
+    (void)param;
+    atomic_store(&nimble_stop_ok,nimble_port_stop()==0);
+    atomic_store(&nimble_stop_done,true);
+    vTaskSuspend(NULL);
 }
 
 /**
@@ -21285,12 +21503,24 @@ static esp_err_t bt_nimble_init(void)
     if (nimble_initialized) {
         return ESP_OK;
     }
+    /* A reset or timeout can leave an initialized port with an unsynchronized
+     * host. Retire that instance before starting another one. */
+    if(atomic_load(&nimble_port_initialized) && !bt_nimble_deinit())
+        return ESP_ERR_INVALID_STATE;
     
     esp_err_t ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NimBLE port init failed: %d", ret);
         return ret;
     }
+    atomic_store(&nimble_port_initialized,true);
+    atomic_store(&nimble_host_running,false);
+    atomic_store(&nimble_host_started,false);
+    atomic_store(&nimble_host_exited,false);
+    atomic_store(&nimble_stop_done,false);
+    nimble_host_task_handle=NULL;
+    nimble_stop_task_handle=NULL;
+    nimble_initialized=false;
     
     // Configure BLE host callbacks
     ble_hs_cfg.sync_cb = bt_on_sync;
@@ -21301,7 +21531,15 @@ static esp_err_t bt_nimble_init(void)
     ble_svc_gatt_init();
 
     // Start NimBLE host task
-    nimble_port_freertos_init(nimble_host_task);
+    /* The IDF 6.0.1 wrapper discards the xTaskCreate result and self-deletes
+     * the host. Owning the handle lets us check creation and join retirement. */
+    if(xTaskCreatePinnedToCore(nimble_host_task,"nimble_host",NIMBLE_HS_STACK_SIZE,
+        NULL,configMAX_PRIORITIES-4,&nimble_host_task_handle,NIMBLE_CORE)!=pdPASS) {
+        nimble_host_task_handle=NULL;
+        if(nimble_port_deinit()==ESP_OK)
+            atomic_store(&nimble_port_initialized,false);
+        return ESP_ERR_NO_MEM;
+    }
     
     // Wait for sync (max 3 seconds)
     for (int i = 0; i < 30 && !nimble_initialized; i++) {
@@ -21310,6 +21548,8 @@ static esp_err_t bt_nimble_init(void)
     
     if (!nimble_initialized) {
         ESP_LOGE(TAG, "NimBLE failed to sync");
+        if(!bt_nimble_deinit())
+            ESP_LOGE(TAG,"NimBLE timeout cleanup pending; retry is blocked");
         return ESP_FAIL;
     }
     
@@ -21319,33 +21559,73 @@ static esp_err_t bt_nimble_init(void)
 /**
  * Deinitialize NimBLE stack
  */
-static void bt_nimble_deinit(void)
+static bool bt_nimble_deinit(void)
 {
-    if (!nimble_initialized) {
-        return;
-    }
+    if(!atomic_load(&nimble_port_initialized))return true;
     
     // Stop any active scanning
     bt_scan_active = false;
     bt_airtag_scan_active = false;
-    bt_stop_scan();
+    if(nimble_initialized)bt_stop_scan();
     
     // Wait for scan task to finish
     if (bt_scan_task_handle != NULL) {
         for (int i = 0; i < 20 && bt_scan_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
+        if(bt_scan_task_handle)return false;
     }
     
-    // Stop NimBLE host task
-    nimble_port_stop();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    /* nimble_port_stop() can wait forever inside the SDK. Run it separately,
+     * preserving the port and tasks as cleanup-pending on a timeout. */
+    if(nimble_host_task_handle && atomic_load(&nimble_host_started) &&
+       !atomic_load(&nimble_host_exited)) {
+        if(!nimble_stop_task_handle) {
+            atomic_store(&nimble_stop_done,false);
+            if(xTaskCreate(nimble_stop_task,"nimble_stop",3072,NULL,5,
+                &nimble_stop_task_handle)!=pdPASS) {
+                nimble_stop_task_handle=NULL;
+                return false;
+            }
+        }
+        for(unsigned waited=0;waited<3000 && !atomic_load(&nimble_stop_done);
+            waited+=50)vTaskDelay(pdMS_TO_TICKS(50));
+        if(!atomic_load(&nimble_stop_done))return false;
+        if(!atomic_load(&nimble_stop_ok)) {
+            vTaskDelete(nimble_stop_task_handle);
+            nimble_stop_task_handle=NULL;
+            return false;
+        }
+        for(unsigned waited=0;waited<3000 && !atomic_load(&nimble_host_exited);
+            waited+=50)vTaskDelay(pdMS_TO_TICKS(50));
+        if(!atomic_load(&nimble_host_exited))return false;
+    }
+    if(nimble_stop_task_handle) {
+        /* A previous stop attempt may still be executing even if the host
+         * happened to exit on its own. Never delete that worker mid-call. */
+        if(!atomic_load(&nimble_stop_done))return false;
+        vTaskDelete(nimble_stop_task_handle);
+        nimble_stop_task_handle=NULL;
+    }
+    if(nimble_host_task_handle) {
+        /* A task that never started cannot hold NimBLE state. A started task
+         * must first return from nimble_port_run(). */
+        if(atomic_load(&nimble_host_started) && !atomic_load(&nimble_host_exited))
+            return false;
+        vTaskDelete(nimble_host_task_handle);
+        nimble_host_task_handle=NULL;
+    }
     
     // Deinitialize NimBLE port and controller (required for reinit)
-    nimble_port_deinit();
+    if(nimble_port_deinit()!=ESP_OK)return false;
     
     nimble_initialized = false;
+    atomic_store(&nimble_port_initialized,false);
+    atomic_store(&nimble_host_started,false);
+    atomic_store(&nimble_host_exited,false);
+    atomic_store(&nimble_host_running,false);
     MY_LOG_INFO(TAG, "NimBLE stopped");
+    return true;
 }
 
 /**
@@ -22751,6 +23031,52 @@ static void register_commands(void)
 
 }
 
+static bool recovery_ota_partitions_available(void) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *ota0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    const esp_partition_t *ota1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    return running && next && next != running && ota0 && ota1 && next->size >= running->size;
+}
+
+static bool recovery_ota_prepare(void) { return !sw_active(); }
+static void recovery_restart(void) { esp_restart(); }
+static int recovery_reboot(int argc, char **argv) {
+    (void)argc; (void)argv;
+    recovery_restart();
+    return 0;
+}
+
+static void start_recovery_console(const char *reason, bool nvs_ready) {
+    const bool ota_ready = nvs_ready && recovery_ota_partitions_available();
+    sw_set_boot_state(false, reason, ota_ready);
+    esp_console_register_help_command();
+    sw_register_recovery();
+    const esp_console_cmd_t version_cmd = {.command="version",.help="Read firmware version",.func=cmd_version};
+    const esp_console_cmd_t reboot_cmd = {.command="reboot",.help="Restart the device",.func=recovery_reboot};
+    ESP_ERROR_CHECK(sw_register_command(&version_cmd));
+    ESP_ERROR_CHECK(sw_register_command(&reboot_cmd));
+    if(ota_ready) {
+        const esp_console_cmd_t ota_info_cmd = {.command="ota_info",.help="Read OTA partition state",.func=cmd_ota_info};
+        ESP_ERROR_CHECK(sw_register_command(&ota_info_cmd));
+        uota_register(recovery_ota_prepare, recovery_restart);
+    }
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    config.task_stack_size = 6144;
+    config.max_cmdline_length = 8192;
+    config.prompt = ">";
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    esp_console_dev_usb_serial_jtag_config_t port = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&port, &config, &repl));
+#else
+    esp_console_dev_uart_config_t port = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&port, &config, &repl));
+#endif
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    printf("RECOVERY: %s; OTA %s; NVS preserved\n", reason, ota_ready ? "available" : "unavailable");
+}
+
 void app_main(void) {
 
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
@@ -22763,7 +23089,12 @@ void app_main(void) {
     ESP_ERROR_CHECK(gpio_reset_pin(GPIO_NUM_26));
     ESP_ERROR_CHECK(gpio_set_direction(GPIO_NUM_26, GPIO_MODE_OUTPUT));
     ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_26, 0));
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t zero_nvs_status = nvs_flash_init();
+    if(zero_nvs_status != ESP_OK) {
+        start_recovery_console("nvs_init_failed", false);
+        return;
+    }
+    sw_set_boot_state(true, "normal", false);
     ota_load_channel_from_nvs();
     ota_mark_valid_if_pending();
     register_commands();
@@ -22819,19 +23150,34 @@ void app_main(void) {
         
         //printf("Step 2b: Allocate buffers in PSRAM\n");
         if (!init_psram_buffers()) {
-            printf("FATAL: PSRAM buffer allocation failed!\n");
+            esp_err_t nvs_status = nvs_flash_init();
+            start_recovery_console(nvs_status == ESP_OK ? "psram_buffer_failed" : "nvs_init_failed", nvs_status == ESP_OK);
             return;
         }
         //printf("PSRAM buffers allocated (~110 KB)\n");
     } else {
-        printf("PSRAM init failed: %s (continuing without PSRAM)\n", esp_err_to_name(ret1));
+        printf("PSRAM init failed: %s; entering recovery\n", esp_err_to_name(ret1));
+        esp_err_t nvs_status = nvs_flash_init();
+        start_recovery_console(nvs_status == ESP_OK ? "psram_init_failed" : "nvs_init_failed", nvs_status == ESP_OK);
+        return;
     }
 #else
-    printf("PSRAM support disabled in config\n");
+    {
+    printf("PSRAM support disabled in config; entering recovery\n");
+    esp_err_t nvs_status = nvs_flash_init();
+    start_recovery_console(nvs_status == ESP_OK ? "psram_unavailable" : "nvs_init_failed", nvs_status == ESP_OK);
+    return;
+    }
 #endif
 
     // NVS must be ready before loading persisted display mode.
-    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_err_t nvs_status = nvs_flash_init();
+    if(nvs_status != ESP_OK) {
+        free_psram_buffers();
+        start_recovery_console("nvs_init_failed", false);
+        return;
+    }
+    sw_set_boot_state(true, "normal", recovery_ota_partitions_available());
     display_mode_load_from_nvs();
     oled_display_set_forced_type(display_forced_mode);
 
@@ -23553,22 +23899,16 @@ static unsigned sniffer_probe_count_for_ssid(const uint8_t *ssid) {
     return count;
 }
 
-/* Keep AP identities so a stopped session can still be reported, but make
- * every new run a clean observation window.  Client and probe counts from an
- * older run must not be presented as if they were seen in the latest scan. */
+/* The single bounded catalog belongs to one admitted run. The managed final
+ * snapshot is exported before Zero releases it; a new run starts empty. */
 static void sniffer_begin_session(void) {
     sniffer_packet_counter = 0;
     sniffer_last_debug_packet = 0;
-    sniff_oled_packets = 0;
     probe_request_count = 0;
     if (probe_requests)
         memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(*probe_requests));
-    for (int i = 0; i < sniffer_ap_count; i++) {
-        if (!sniffer_aps) break;
-        sniffer_aps[i].client_count = 0;
-        sniffer_aps[i].packet_count = 0;
-        memset(sniffer_aps[i].clients, 0, sizeof(sniffer_aps[i].clients));
-    }
+    if (sniffer_aps) memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(*sniffer_aps));
+    sniffer_ap_count = 0;
     sniffer_session_valid = true;
     sniffer_session_completed_us = 0;
 }
@@ -23796,49 +24136,36 @@ static void sniffer_init_selected_networks(void) {
 }
 
 static void sniffer_channel_hop(void) {
-    if (!sniffer_active || sniffer_scan_phase) {
-        return;
-    }
-    
-    // Check if we're in selected networks mode
+    if (!sniffer_active || sniffer_scan_phase) return;
+    sw_channel_result_t result;
     if (sniffer_selected_mode && sniffer_selected_channels_count > 0) {
-        // Use selected channels only
-        sniffer_current_channel = sniffer_selected_channels[sniffer_channel_index];
-        
-        sniffer_channel_index++;
-        if (sniffer_channel_index >= sniffer_selected_channels_count) {
-            sniffer_channel_index = 0;
-        }
+        const uint8_t requested = (uint8_t)sniffer_selected_channels[
+            sniffer_channel_index % sniffer_selected_channels_count];
+        result = sw_job_apply_channel_checked(requested);
+        if (result.status == SW_CHANNEL_OK)
+            sniffer_channel_index = (sniffer_channel_index + 1) % sniffer_selected_channels_count;
     } else if (sw_job_owned()) {
-        uint8_t applied = 0;
-        if (!sw_job_radio_hop((unsigned)sniffer_channel_index, &applied)) {
-            MY_LOG_INFO(TAG, "Job radio channel application failed at hop %d", sniffer_channel_index);
-            sw_job_emit_lifecycle("error", "running", "\"message\":\"channel_apply_failed\"");
-            return;
-        }
-        sniffer_current_channel = applied;
-        sniffer_channel_index++;
+        result = sw_job_radio_hop_checked((unsigned)sniffer_channel_index);
+        if (result.status == SW_CHANNEL_OK) sniffer_channel_index++;
     } else {
-        // Use dual-band channel hopping (like Marauder)
-        sniffer_current_channel = dual_band_channels[sniffer_channel_index];
-        
-        sniffer_channel_index++;
-        if (sniffer_channel_index >= dual_band_channels_count) {
-            sniffer_channel_index = 0;
-        }
+        const uint8_t requested = dual_band_channels[sniffer_channel_index % dual_band_channels_count];
+        result = sw_job_apply_channel_checked(requested);
+        if (result.status == SW_CHANNEL_OK)
+            sniffer_channel_index = (sniffer_channel_index + 1) % dual_band_channels_count;
     }
-    
-    if (!sw_job_owned() && esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
-        MY_LOG_INFO(TAG, "Sniffer channel apply failed: %d", sniffer_current_channel);
+    if (result.status != SW_CHANNEL_OK) {
+        MY_LOG_INFO(TAG, "Sniffer channel apply failed: requested=%u actual=%u sdk=%d",
+                    result.requested_channel, result.actual_channel, result.sdk_error);
+        if (sw_job_owned()) {
+            sw_job_emit_channel_failure(result);
+            (void)sw_job_request_cleanup(sw_job_token(), "channel_apply_failed");
+        }
+        sniffer_active = false;
+        sniffer_stop_pending = true;
         return;
     }
+    sniffer_current_channel = result.actual_channel;
     sniffer_last_channel_hop = esp_timer_get_time() / 1000;
-    
-    // Optional: Log channel changes with band info (debug mode)
-    #if 0
-    const char* band = (sniffer_current_channel <= 14) ? "2.4GHz" : "5GHz";
-    MY_LOG_INFO(TAG, "Sniffer: Hopped to channel %d (%s)", sniffer_current_channel, band);
-    #endif
 }
 
 // Task that handles time-based channel hopping (independent of packet flow)
@@ -23846,7 +24173,16 @@ static void sniffer_channel_task(void *pvParameters) {
     int64_t sniff_oled_last_us = 0;
     
     while (sniffer_active) {
-        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        uint8_t slot=0;
+        if(sniffer_frame_queue &&
+           xQueueReceive(sniffer_frame_queue,&slot,pdMS_TO_TICKS(10))==pdTRUE &&
+           slot<SNIFFER_FRAME_SLOTS && sniffer_frames) {
+            sniffer_frame_t *sample=&sniffer_frames[slot];
+            if(sniffer_active && !sniffer_scan_phase)
+                sniffer_process_frame(sample->payload,sample->len,sample->rssi,
+                                      sample->channel,sample->type);
+            atomic_store(&sniffer_slot_busy[slot],false);
+        }
         
         if (!sniffer_active || sniffer_scan_phase) {
             continue;
@@ -23865,10 +24201,14 @@ static void sniffer_channel_task(void *pvParameters) {
         int64_t now_us = esp_timer_get_time();
         if (now_us - sniff_oled_last_us > 500000) {
             sniff_oled_last_us = now_us;
-            char l2[64], l3[64], l4[64];
+            if(sw_job_owned())sw_job_set_sniffer_stats(sniffer_packet_counter,(uint32_t)sniffer_ap_count,
+                                                       atomic_load(&sniffer_drop_count));
+            /* These display strings are bounded by Sniffer table counts;
+             * smaller buffers preserve the Zero worker stack budget. */
+            char l2[24], l3[32], l4[24];
             snprintf(l2, sizeof(l2), "  Ch %d hopping", sniffer_current_channel);
             snprintf(l3, sizeof(l3), "  AP:%d Probes:%d", sniffer_ap_count, probe_request_count);
-            snprintf(l4, sizeof(l4), "  Pkts: %lu", (unsigned long)sniff_oled_packets);
+            snprintf(l4, sizeof(l4), "  Pkts: %lu", (unsigned long)atomic_load(&sniffer_packet_counter));
             oled_display_update_full("> Sniffer", l2, l3, l4);
         }
     }
@@ -23884,10 +24224,16 @@ static void sniffer_channel_task(void *pvParameters) {
 
 static void pcap_enqueue_frame(const uint8_t *data, uint16_t len,
                                uint8_t channel, int8_t rssi) {
-    if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
+    if (!pcap_capture_active || !pcap_packet_queue || !data || len == 0 || len>2304) return;
+    atomic_fetch_add(&pcap_received_count,1);
 
-    pcap_queued_frame_t *frame = malloc(sizeof(pcap_queued_frame_t) + len);
-    if (!frame) return;
+#if CONFIG_SPIRAM && !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    pcap_queued_frame_t *frame=heap_caps_malloc(sizeof(pcap_queued_frame_t)+len,
+                                                MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+#else
+    pcap_queued_frame_t *frame=malloc(sizeof(pcap_queued_frame_t)+len);
+#endif
+    if (!frame) {atomic_fetch_add(&pcap_alloc_fail_count,1);return;}
 
     frame->len = len;
     frame->channel = channel;
@@ -23897,20 +24243,24 @@ static void pcap_enqueue_frame(const uint8_t *data, uint16_t len,
 
     if (xQueueSend(pcap_packet_queue, &frame, 0) != pdTRUE) {
         free(frame);
-        pcap_capture_drop_count++;
+        atomic_fetch_add(&pcap_queue_drop_count,1);
     }
 }
 
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!pcap_capture_active) return;
+    (void)type;
+    atomic_fetch_add(&pcap_producers,1);
+    if (!pcap_capture_active || !buf)goto done;
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     uint16_t len = pkt->rx_ctrl.sig_len;
-    if (len <= 4) return;
-    pcap_enqueue_frame(pkt->payload, len - 4U, pkt->rx_ctrl.channel,
-                       pkt->rx_ctrl.rssi);
+    if (len > 4 && len<=2308)
+        pcap_enqueue_frame(pkt->payload,len-4U,pkt->rx_ctrl.channel,pkt->rx_ctrl.rssi);
+done:
+    atomic_fetch_sub(&pcap_producers,1);
 }
 
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+    atomic_fetch_add(&pcap_producers,1);
     if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
@@ -23918,10 +24268,14 @@ static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
             pcap_enqueue_frame(tmp, copied, 0, 0);
         }
     }
-    return pcap_original_input(p, inp);
+    netif_input_fn original=pcap_original_input;
+    err_t result=original?original(p,inp):ERR_IF;
+    atomic_fetch_sub(&pcap_producers,1);
+    return result;
 }
 
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
+    atomic_fetch_add(&pcap_producers,1);
     if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
@@ -23929,7 +24283,10 @@ static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
             pcap_enqueue_frame(tmp, copied, 0, 0);
         }
     }
-    return pcap_original_linkoutput(netif, p);
+    netif_linkoutput_fn original=pcap_original_linkoutput;
+    err_t result=original?original(netif,p):ERR_IF;
+    atomic_fetch_sub(&pcap_producers,1);
+    return result;
 }
 
 static bool pcapng_write_queued_frame(const pcap_queued_frame_t *frame) {
@@ -23973,40 +24330,95 @@ static void pcap_writer_task(void *param) {
     (void)param;
     uint32_t flush_counter = 0;
     pcap_queued_frame_t *frame = NULL;
+    bool file_ok=true;
 
     MY_LOG_INFO(TAG, "PCAPNG writer task started");
 
-    while (pcap_capture_active) {
+    while (!atomic_load(&pcap_writer_stop_requested)) {
         if (xQueueReceive(pcap_packet_queue, &frame, pdMS_TO_TICKS(200)) == pdTRUE) {
-            if (!pcapng_write_queued_frame(frame)) pcap_capture_drop_count++;
+            if (file_ok && pcapng_write_queued_frame(frame))
+                atomic_fetch_add(&pcap_written_count,1);
+            else {file_ok=false;atomic_fetch_add(&pcap_write_fail_count,1);}
             free(frame);
-            pcap_capture_frame_count++;
             flush_counter++;
             if (flush_counter >= 50) {
-                fflush(pcap_capture_file);
+                if(fflush(pcap_capture_file)!=0)file_ok=false;
                 flush_counter = 0;
             }
         }
     }
 
     while (xQueueReceive(pcap_packet_queue, &frame, 0) == pdTRUE) {
-        if (!pcapng_write_queued_frame(frame)) pcap_capture_drop_count++;
+        if (file_ok && pcapng_write_queued_frame(frame))
+            atomic_fetch_add(&pcap_written_count,1);
+        else {file_ok=false;atomic_fetch_add(&pcap_write_fail_count,1);}
         free(frame);
-        pcap_capture_frame_count++;
     }
 
-    fflush(pcap_capture_file);
-    fclose(pcap_capture_file);
+    if(fflush(pcap_capture_file)!=0)file_ok=false;
+    if(fsync(fileno(pcap_capture_file))!=0)file_ok=false;
+    if(fclose(pcap_capture_file)!=0)file_ok=false;
     pcap_capture_file = NULL;
-    sd_sync();
+    if(!sd_sync())file_ok=false;
+    if(file_ok) {
+        if(rename(pcap_capture_filepath,pcap_capture_finalpath)!=0 || !sd_sync())
+            file_ok=false;
+    }
+    atomic_store(&pcap_capture_state,file_ok?PCAP_CAPTURE_COMPLETE:PCAP_CAPTURE_FAILED);
 
-    MY_LOG_INFO(TAG, "PCAPNG writer done: %s (%lu frames, %lu drops)",
-                pcap_capture_filepath,
-                (unsigned long)pcap_capture_frame_count,
-                (unsigned long)pcap_capture_drop_count);
+    MY_LOG_INFO(TAG, "PCAPNG writer %s: %s (%lu received, %lu written, %lu queue drops, %lu alloc failures, %lu write failures)",
+                file_ok?"complete":"failed",file_ok?pcap_capture_finalpath:pcap_capture_filepath,
+                (unsigned long)atomic_load(&pcap_received_count),
+                (unsigned long)atomic_load(&pcap_written_count),
+                (unsigned long)atomic_load(&pcap_queue_drop_count),
+                (unsigned long)atomic_load(&pcap_alloc_fail_count),
+                (unsigned long)atomic_load(&pcap_write_fail_count));
 
+    atomic_store(&pcap_writer_finished,true);
     pcap_writer_task_handle = NULL;
     vTaskDelete(NULL);
+}
+
+static bool pcap_capture_stop(void) {
+    if(!pcap_packet_queue && !pcap_writer_task_handle && !pcap_capture_active)
+        return true;
+    int state=atomic_load(&pcap_capture_state);
+    if(state!=PCAP_CAPTURE_COMPLETE && state!=PCAP_CAPTURE_FAILED)
+        atomic_store(&pcap_capture_state,PCAP_CAPTURE_STOPPING);
+    pcap_capture_active=false;
+    if(pcap_rx_configured) {
+        if(esp_wifi_set_promiscuous(false)!=ESP_OK ||
+           esp_wifi_set_promiscuous_rx_cb(NULL)!=ESP_OK ||
+           (pcap_filter_saved && esp_wifi_set_promiscuous_filter(&pcap_previous_filter)!=ESP_OK))
+            return false;
+        pcap_rx_configured=false;
+        pcap_filter_saved=false;
+    }
+    if(pcap_net_hooks_installed) {
+        esp_netif_t *sta=esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        struct netif *nif=sta?(struct netif *)esp_netif_get_netif_impl(sta):NULL;
+        if(!nif || !pcap_original_input || !pcap_original_linkoutput)return false;
+        nif->input=pcap_original_input;
+        nif->linkoutput=pcap_original_linkoutput;
+        pcap_net_hooks_installed=false;
+    }
+    pcap_arp_active=false;
+    for(unsigned waited=0;waited<6000 && pcap_arp_task_handle;waited+=50)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    if(pcap_arp_task_handle)return false;
+    for(unsigned waited=0;waited<2000 && atomic_load(&pcap_producers);waited+=10)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    if(atomic_load(&pcap_producers))return false;
+    pcap_original_input=NULL;
+    pcap_original_linkoutput=NULL;
+    atomic_store(&pcap_writer_stop_requested,true);
+    for(unsigned waited=0;waited<5000 && !atomic_load(&pcap_writer_finished);waited+=50)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    if(!atomic_load(&pcap_writer_finished))return false;
+    if(pcap_packet_queue) {vQueueDelete(pcap_packet_queue);pcap_packet_queue=NULL;}
+    pcap_capture_mode=PCAP_MODE_NONE;
+    pcap_arp_host_count=0;
+    return true;
 }
 
 static void pcap_arp_spoof_task(void *param) {
@@ -24056,8 +24468,10 @@ static void pcap_arp_spoof_task(void *param) {
         if (round % 5 == 0) {
             MY_LOG_INFO(TAG, "ARP spoof: round %lu, %d hosts, captured %lu, dropped %lu",
                         (unsigned long)round, pcap_arp_host_count,
-                        (unsigned long)pcap_capture_frame_count,
-                        (unsigned long)pcap_capture_drop_count);
+                        (unsigned long)atomic_load(&pcap_written_count),
+                        (unsigned long)(atomic_load(&pcap_queue_drop_count)+
+                                        atomic_load(&pcap_alloc_fail_count)+
+                                        atomic_load(&pcap_write_fail_count)));
         }
 
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -24090,47 +24504,14 @@ static void pcap_arp_spoof_task(void *param) {
     vTaskDelete(NULL);
 }
 
-static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    sniffer_packet_counter++;
-    sniff_oled_packets = sniffer_packet_counter;
-    sniff_oled_dirty = true;
-    
+static void sniffer_process_frame(const uint8_t *frame,int len,int8_t rssi,uint8_t channel,
+                                  wifi_promiscuous_pkt_type_t type) {
     if (!sniffer_active || sniffer_scan_phase) {
         return; // No debug logging here - too frequent
     }
     
-    // Show packet count every 20 packets when debug is OFF
-    if (!sniff_debug && (sniffer_packet_counter % 20) == 0) {
-        printf("Sniffer packet count: %lu\n", sniffer_packet_counter);
-    }
-    
     // Throttle debug logging - only every 100th packet when debug is on
-    bool should_debug = sniff_debug && ((sniffer_packet_counter - sniffer_last_debug_packet) >= 100);
-    if (should_debug) {
-        sniffer_last_debug_packet = sniffer_packet_counter;
-        printf("DEBUG_CHECKPOINT: Processing packet %lu\n", sniffer_packet_counter);
-    }
     
-    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    const uint8_t *frame = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
-    
-    if (should_debug) {
-        const char* type_str = (type == WIFI_PKT_MGMT) ? "MGMT" : 
-                              (type == WIFI_PKT_DATA) ? "DATA" : 
-                              (type == WIFI_PKT_CTRL) ? "CTRL" : "UNKNOWN";
-        
-        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Type=%s, Len=%d, Ch=%d, RSSI=%d", 
-                   sniffer_packet_counter, type_str, len, sniffer_current_channel, pkt->rx_ctrl.rssi);
-        
-        if (len >= 24) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Addr1=%02X:%02X:%02X:%02X:%02X:%02X, Addr2=%02X:%02X:%02X:%02X:%02X:%02X, Addr3=%02X:%02X:%02X:%02X:%02X:%02X",
-                       sniffer_packet_counter,
-                       frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
-                       frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
-                       frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
-        }
-    }
     
     // Filter only MGMT and DATA packets (like Marauder)
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) {
@@ -24161,15 +24542,10 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2  
     uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
     
-    if (sniff_debug) {
-        // Minimal debug logging to avoid blocking
-        printf("PKT_%lu: %s T=%d F=%d\n", sniffer_packet_counter, 
-               (type == WIFI_PKT_MGMT) ? "MGMT" : "DATA", to_ds, from_ds);
-    }
     
     // Process MGMT packets for client detection (like Marauder)
     if (type == WIFI_PKT_MGMT) {
-        if (should_debug) printf("DEBUG: Processing MGMT packet %lu\n", sniffer_packet_counter);
+
         
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
@@ -24178,15 +24554,11 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         switch (frame_type) {
             case 0x80: // Beacon - update AP info only
                 ap_mac = addr2; // Source is AP
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Beacon from AP: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
                 // Update AP info if exists
                 for (int i = 0; i < sniffer_ap_count; i++) {
                     if (memcmp(sniffer_aps[i].bssid, ap_mac, 6) == 0) {
                         sniffer_aps[i].last_seen = esp_timer_get_time() / 1000;
-                        sniffer_aps[i].rssi = pkt->rx_ctrl.rssi;
+                        sniffer_aps[i].rssi = rssi;
                         sniffer_aps[i].packet_count++;
                         break;
                     }
@@ -24196,38 +24568,21 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             case 0x40: // Probe Request - client looking for networks
                 client_mac = addr2; // Source is client
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Probe Request from client: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-                }
                 break;
                 
             case 0x00: // Association Request - client trying to connect to AP
                 client_mac = addr2; // Source is client
                 ap_mac = addr1;     // Destination is AP
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Association Request from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
                 break;
                 
             case 0xB0: // Authentication - client authenticating with AP
                 client_mac = addr2; // Source is client
                 ap_mac = addr1;     // Destination is AP
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Authentication from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
                 break;
                 
             default:
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - Other MGMT frame type 0x%02X", sniffer_packet_counter, frame_type);
-                }
                 return;
         }
         
@@ -24235,9 +24590,6 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         if (is_client_frame && client_mac) {
             // Skip multicast/broadcast client MAC
             if (is_multicast_mac(client_mac) || is_own_device_mac(client_mac)) {
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - multicast or own device MAC", sniffer_packet_counter);
-                }
                 return;
             }
             
@@ -24249,7 +24601,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 // SSID is usually the first tagged parameter (Tag Number = 0)
                 
                 if (len > 24 && probe_request_count >= MAX_PROBE_REQUESTS)
-                    sw_job_note_saturation();
+                    { atomic_fetch_add(&sniffer_drop_count, 1); sw_job_note_saturation(); }
                 if (len > 24 && probe_request_count < MAX_PROBE_REQUESTS) {
                     const uint8_t *body = frame + 24; // Skip MAC header
                     int body_len = len - 24;
@@ -24293,7 +24645,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                                 strcmp(probe_requests[i].ssid, ssid) == 0) {
                                 // Update existing entry
                                 probe_requests[i].last_seen = esp_timer_get_time() / 1000;
-                                probe_requests[i].rssi = pkt->rx_ctrl.rssi;
+                                probe_requests[i].rssi = rssi;
                                 already_exists = true;
                                 break;
                             }
@@ -24303,15 +24655,10 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                         if (!already_exists) {
                             memcpy(probe_requests[probe_request_count].mac, client_mac, 6);
                             strncpy(probe_requests[probe_request_count].ssid, ssid, sizeof(probe_requests[probe_request_count].ssid) - 1);
-                            probe_requests[probe_request_count].rssi = pkt->rx_ctrl.rssi;
+                            probe_requests[probe_request_count].rssi = rssi;
                             probe_requests[probe_request_count].last_seen = esp_timer_get_time() / 1000;
                             probe_request_count++;
                             
-                            if (sniff_debug) {
-                                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Stored probe request for SSID '%s' from %02X:%02X:%02X:%02X:%02X:%02X", 
-                                           sniffer_packet_counter, ssid,
-                                           client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-                            }
                         }
                     }
                 }
@@ -24335,32 +24682,20 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                     memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
                     snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
                             "MGMT_%02X%02X", ap_mac[4], ap_mac[5]);
-                    sniffer_aps[ap_index].channel = sniffer_current_channel;
+                    sniffer_aps[ap_index].channel = channel;
                     sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN;
-                    sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
+                    sniffer_aps[ap_index].rssi = rssi;
                     sniffer_aps[ap_index].client_count = 0;
                     sniffer_aps[ap_index].last_seen = esp_timer_get_time() / 1000;
                     
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s from MGMT frame", 
-                                   sniffer_packet_counter, sniffer_aps[ap_index].ssid);
-                    }
                 }
                 if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count >= MAX_SNIFFER_APS)
-                    sw_job_note_saturation();
+                    { atomic_fetch_add(&sniffer_drop_count, 1); sw_job_note_saturation(); }
                 
                 if (ap_index >= 0) {
                     sniffer_aps[ap_index].packet_count++;
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                                   sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                                   sniffer_aps[ap_index].ssid);
-                    }
-                    add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
+                    add_client_to_ap(ap_index, client_mac, rssi);
                 } else {
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full, cannot create new AP", sniffer_packet_counter);
-                    }
                 }
             }
         }
@@ -24369,77 +24704,49 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     
     // Process DATA packets using 802.11 ToDS/FromDS logic (like Marauder)
     if (type == WIFI_PKT_DATA) {
-        if (should_debug) printf("DEBUG: Processing DATA packet %lu\n", sniffer_packet_counter);
+
         
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
         
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Processing DATA packet, ToDS=%d, FromDS=%d", 
-                       sniffer_packet_counter, to_ds, from_ds);
-        }
         
         // Determine AP and client MAC based on ToDS/FromDS bits (802.11 standard)
         if (to_ds && !from_ds) {
             // STA -> AP: addr1=AP, addr2=STA, addr3=DA
             ap_mac = addr1;      // Destination is AP
             client_mac = addr2;  // Source is client
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: STA->AP direction", sniffer_packet_counter);
-            }
         } else if (!to_ds && from_ds) {
             // AP -> STA: addr1=STA, addr2=AP, addr3=SA  
             ap_mac = addr2;      // Source is AP
             client_mac = addr1;  // Destination is client
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP->STA direction", sniffer_packet_counter);
-            }
         } else if (!to_ds && !from_ds) {
             // IBSS (ad-hoc): addr1=DA, addr2=SA, addr3=BSSID
             ap_mac = addr3;      // BSSID
             client_mac = addr2;  // Source
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: IBSS direction", sniffer_packet_counter);
-            }
         } else {
             // WDS (to_ds && from_ds) - skip for now
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - WDS frame (ToDS=1, FromDS=1)", sniffer_packet_counter);
-            }
             return;
         }
         
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP MAC: %02X:%02X:%02X:%02X:%02X:%02X, Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-                       sniffer_packet_counter, 
-                       ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
-                       client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-        }
         
         // Skip multicast/broadcast client MAC
         if (is_multicast_mac(client_mac)) {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is multicast/broadcast", sniffer_packet_counter);
-            }
             return;
         }
         
         // Skip our own device as client
         if (is_own_device_mac(client_mac)) {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is our own device", sniffer_packet_counter);
-            }
             return;
         }
         
         // Find the AP in our known list
         int ap_index = -1;
-        if (should_debug) printf("DEBUG: Searching %d APs for match\n", sniffer_ap_count);
+
         
         for (int i = 0; i < sniffer_ap_count; i++) {
             if (memcmp(sniffer_aps[i].bssid, ap_mac, 6) == 0) {
                 ap_index = i;
-                if (should_debug) printf("DEBUG: Found AP match at index %d\n", i);
+
                 break;
             }
         }
@@ -24451,35 +24758,20 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
             snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
                     "Unknown_%02X%02X", ap_mac[4], ap_mac[5]); // Use last 2 bytes for unique name
-            sniffer_aps[ap_index].channel = sniffer_current_channel;
+            sniffer_aps[ap_index].channel = channel;
             sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN; // Unknown
-            sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
+            sniffer_aps[ap_index].rssi = rssi;
             sniffer_aps[ap_index].client_count = 0;
             sniffer_aps[ap_index].last_seen = esp_timer_get_time() / 1000;
             
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s for BSSID %02X:%02X:%02X:%02X:%02X:%02X", 
-                           sniffer_packet_counter, sniffer_aps[ap_index].ssid,
-                           ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-            }
         }
         if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count >= MAX_SNIFFER_APS)
-            sw_job_note_saturation();
+            { atomic_fetch_add(&sniffer_drop_count, 1); sw_job_note_saturation(); }
         
         if (ap_index >= 0) {
             sniffer_aps[ap_index].packet_count++;
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                           sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], 
-                           client_mac[3], client_mac[4], client_mac[5], sniffer_aps[ap_index].ssid);
-            }
-            add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
+            add_client_to_ap(ap_index, client_mac, rssi);
         } else {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full (%d/%d), cannot add new AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                           sniffer_packet_counter, sniffer_ap_count, MAX_SNIFFER_APS,
-                           ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-            }
         }
     }
 }
@@ -24487,6 +24779,47 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
 // === SNIFFER DOG HELPER FUNCTIONS ===
 
 // Channel hopping for sniffer_dog
+static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    atomic_fetch_add(&sniffer_producers, 1);
+    if (!sniffer_active || sniffer_scan_phase || !buf ||
+        !sniffer_frames || !sniffer_frame_queue) goto done;
+    if(type!=WIFI_PKT_MGMT && type!=WIFI_PKT_DATA)goto done;
+    const wifi_promiscuous_pkt_t *packet=(const wifi_promiscuous_pkt_t *)buf;
+    unsigned length=packet->rx_ctrl.sig_len;
+    if(length<24 || length>SNIFFER_FRAME_MAX) {
+        atomic_fetch_add(&sniffer_drop_count,1);
+        sw_job_note_saturation();
+        goto done;
+    }
+    atomic_fetch_add(&sniffer_packet_counter,1);
+    unsigned slot=SNIFFER_FRAME_SLOTS;
+    for(unsigned i=0;i<SNIFFER_FRAME_SLOTS;i++) {
+        bool expected=false;
+        if(atomic_compare_exchange_strong(&sniffer_slot_busy[i],&expected,true)) {
+            slot=i;break;
+        }
+    }
+    if(slot==SNIFFER_FRAME_SLOTS) {
+        atomic_fetch_add(&sniffer_drop_count,1);
+        sw_job_note_saturation();
+        goto done;
+    }
+    sniffer_frame_t *sample=&sniffer_frames[slot];
+    sample->len=(uint16_t)length;
+    sample->rssi=packet->rx_ctrl.rssi;
+    sample->channel=packet->rx_ctrl.channel;
+    sample->type=type;
+    memcpy(sample->payload,packet->payload,length);
+    uint8_t queued_slot=(uint8_t)slot;
+    if(xQueueSend(sniffer_frame_queue,&queued_slot,0)!=pdTRUE) {
+        atomic_store(&sniffer_slot_busy[slot],false);
+        atomic_fetch_add(&sniffer_drop_count,1);
+        sw_job_note_saturation();
+    }
+done:
+    atomic_fetch_sub(&sniffer_producers, 1);
+}
+
 static void sniffer_dog_channel_hop(void) {
     if (!sniffer_dog_active) {
         return;
@@ -24976,13 +25309,15 @@ static void gps_load_state_from_nvs(void) {
 // ESP-IDF newlib does not implement POSIX sync(), so we force a flush by
 // opening a temporary file, calling fsync() on its descriptor (which
 // triggers FatFs f_sync and flushes the FAT table), then removing it.
-static void sd_sync(void) {
+static bool sd_sync(void) {
     int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        fsync(fd);
-        close(fd);
-        unlink("/sdcard/.sync");
+        bool ok=fsync(fd)==0;
+        if(close(fd)!=0)ok=false;
+        if(unlink("/sdcard/.sync")!=0)ok=false;
+        return ok;
     }
+    return false;
 }
 
 // Safely unmount SD card and restart to prevent FAT filesystem corruption
@@ -25377,18 +25712,15 @@ static int find_next_wardrive_file_number(void) {
 }
 
 static int find_next_pcap_file_number(void) {
-    int max_number = 0;
     char filename[64];
     for (int i = 1; i <= 9999; i++) {
         snprintf(filename, sizeof(filename), "/sdcard/lab/pcaps/sniff_%d.pcapng", i);
         struct stat file_stat;
-        if (stat(filename, &file_stat) == 0) {
-            max_number = i;
-        } else {
-            break;
-        }
+        if(stat(filename,&file_stat)==0)continue;
+        snprintf(filename,sizeof(filename),"/sdcard/lab/pcaps/sniff_%d.partial",i);
+        if(stat(filename,&file_stat)!=0)return i;
     }
-    return max_number + 1;
+    return -1;
 }
 
 // Save evil twin password to SD card

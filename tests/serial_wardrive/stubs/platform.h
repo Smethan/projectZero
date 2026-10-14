@@ -9,6 +9,8 @@
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_NO_MEM 1
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_FAIL 0x103
 #define ESP_ERROR_CHECK(x) assert((x)==0)
 typedef int (*esp_console_cmd_func_t)(int,char**);
 typedef struct {const char *command,*help,*hint;esp_console_cmd_func_t func;void *argtable;} esp_console_cmd_t;
@@ -49,6 +51,16 @@ static void vTaskDelete(void *task){}
 #define WIFI_SECOND_CHAN_NONE 0
 typedef int wifi_promiscuous_pkt_type_t;
 typedef struct {int filter_mask;} wifi_promiscuous_filter_t;
+typedef int wifi_mode_t;
+typedef int wifi_band_mode_t;
+typedef int wifi_second_chan_t;
+#define WIFI_MODE_NULL 0
+#define WIFI_MODE_STA 1
+#define WIFI_MODE_AP 2
+#define WIFI_MODE_APSTA 3
+#define WIFI_BAND_MODE_2G_ONLY 0
+#define WIFI_BAND_MODE_5G_ONLY 1
+#define WIFI_BAND_MODE_AUTO 2
 #define WIFI_COUNTRY_POLICY_AUTO 0
 #define WIFI_COUNTRY_POLICY_MANUAL 1
 #define CHANNEL_TO_BIT(channel) (1u << ((channel)<=14?(channel):(channel)<=64?((channel)-36)/4+1:(channel)<=144?((channel)-100)/4+9:((channel)-149)/4+21))
@@ -60,8 +72,31 @@ typedef struct {struct {int sig_len;uint8_t channel;int8_t rssi;uint32_t timesta
 static int esp_wifi_set_promiscuous_filter(const wifi_promiscuous_filter_t *f){return 0;}
 static int esp_wifi_set_promiscuous_rx_cb(void (*f)(void*,wifi_promiscuous_pkt_type_t)){return 0;}
 static int esp_wifi_set_promiscuous(bool on){return 0;}
+static int test_wifi_tx_count;
+static int esp_wifi_80211_tx(int interface, const void *frame, int length, bool system_seq){
+    (void)interface;(void)frame;(void)length;(void)system_seq;
+    test_wifi_tx_count++;
+    return ESP_OK;
+}
 static int test_channel_result;
-static int esp_wifi_set_channel(uint8_t primary,int second){return test_channel_result;}
+static int test_channel_readback_result;
+static uint8_t test_channel_actual;
+static bool test_channel_stale_readback;
+static wifi_mode_t test_wifi_mode=WIFI_MODE_NULL;
+static wifi_band_mode_t test_wifi_band=WIFI_BAND_MODE_AUTO;
+static int esp_wifi_set_channel(uint8_t primary,int second){
+    (void)second;
+    if(test_channel_result==ESP_OK && !test_channel_stale_readback)test_channel_actual=primary;
+    return test_channel_result;
+}
+static int esp_wifi_get_channel(uint8_t *primary,wifi_second_chan_t *second){
+    if(test_channel_readback_result!=ESP_OK)return test_channel_readback_result;
+    *primary=test_channel_actual;
+    if(second)*second=WIFI_SECOND_CHAN_NONE;
+    return ESP_OK;
+}
+static int esp_wifi_get_mode(wifi_mode_t *mode){*mode=test_wifi_mode;return ESP_OK;}
+static int esp_wifi_get_band_mode(wifi_band_mode_t *band){*band=test_wifi_band;return ESP_OK;}
 static char output_capture[65536];
 static int transport_limit=1024;
 static int usb_serial_jtag_write_bytes(const char *buf,int n,int ticks){int count=n>256?0:(n<transport_limit?n:transport_limit);strncat(output_capture,buf,count);return count;}

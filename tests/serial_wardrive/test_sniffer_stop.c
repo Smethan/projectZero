@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -11,6 +13,11 @@ static bool owner_matches = true;
 static int stop_result;
 static int export_result;
 static unsigned stop_calls, export_calls, close_calls;
+static uint32_t sniffer_packet_counter;
+static int sniffer_ap_count;
+static atomic_uint sniffer_drop_count;
+static uint32_t stats_packets,stats_aps,stats_drops;
+static unsigned stats_calls;
 static bool resource_owned;
 static unsigned delay_calls, exit_on_delay_call;
 static bool sniffer_channel_wait_quiescent(void);
@@ -27,6 +34,9 @@ static void vTaskDelay(unsigned ticks) {
 static bool sw_job_owner_matches(const char *token) {
     assert(token && strcmp(token, "job-token") == 0);
     return owner_matches;
+}
+static void sw_job_set_sniffer_stats(uint32_t packets,uint32_t aps,uint32_t drops) {
+    stats_packets=packets;stats_aps=aps;stats_drops=drops;stats_calls++;
 }
 
 static int stop_operations(bool from_command) {
@@ -69,6 +79,8 @@ static void reset_case(const char *operation) {
     resource_owned = true;
     sniffer_channel_task_handle = NULL;
     sniffer_active = false;
+    sniffer_packet_counter=17;sniffer_ap_count=3;atomic_store(&sniffer_drop_count,2);
+    stats_packets=stats_aps=stats_drops=stats_calls=0;
     delay_calls = exit_on_delay_call = 0;
 }
 
@@ -90,6 +102,7 @@ int main(void) {
     exit_on_delay_call = delay_calls + 2;
     assert(zero_job_stop_operation("job-token") == 0);
     assert(stop_calls == 2 && export_calls == 1 && close_calls == 1);
+    assert(stats_calls==1 && stats_packets==17 && stats_aps==3 && stats_drops==2);
     assert(sniffer_channel_task_handle == NULL && !resource_owned);
 
     reset_case("sniffer");
