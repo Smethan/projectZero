@@ -1,5 +1,23 @@
 # Smethan fork firmware
 
+## 1.8.5 — Native USB boot and capability recovery — 2026-10-15
+
+- Avoid initializing PSRAM twice when ESP-IDF already initialized it during
+  boot. Let a XIAO with absent PSRAM reach the restricted recovery console,
+  and reject a packaged XIAO build that lacks the required boot profile.
+- Start the normal console after PSRAM and NVS, before display and SD setup.
+  Advertise `degraded/initializing` with no scan capacity during that short
+  phase, reject operational commands until board setup is complete, then
+  advertise normal readiness. Preserve the Zero's existing no-PSRAM path.
+- Return a typed error if device metadata would exceed the protocol line.
+  Exercise the shipped XIAO and Zero operation catalogs and startup transition
+  in the native protocol harness.
+
+Pair this source with WatchDogsGo 0.10.5. At source preparation on 2026-10-15,
+the current XIAO had not replied to a USB console or ROM probe, and a Waveshare
+Zero was not attached. The physical reconnect, exact-image, and WDG runtime
+checks must be recorded before claiming the repair is verified on hardware.
+
 ## 1.8.4 — Startup recovery, truthful radio jobs and capture cleanup — 2026-10-14 (source candidate; hardware gate pending)
 
 - Make XIAO/WROOM PSRAM setup transactional and report degraded startup when

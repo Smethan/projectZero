@@ -89,7 +89,7 @@ int main(void){
     output_capture[0]=0;
     assert(device_info(1,NULL)==0);
     assert(strstr(output_capture,"\"kind\":\"device_info\"") &&
-           strstr(output_capture,"\"firmware_version\":\"1.8.4\"") &&
+           strstr(output_capture,"\"firmware_version\":\"1.8.5\"") &&
            strstr(output_capture,"\"build_id\":\"0123456789abcdef\"") &&
            strstr(output_capture,"\"boot_state\":\"ready\"") &&
            strstr(output_capture,"\"capabilities\":{\"c5_jobs_v1\":true}") &&
