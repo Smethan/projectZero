@@ -23,6 +23,7 @@ endif()
 
 include(${CMAKE_SOURCE_DIR}/tools/patch_idf_linenoise_machine.cmake)
 include(${CMAKE_SOURCE_DIR}/tools/patch_idf_usb_ota_buffer.cmake)
+include(${CMAKE_SOURCE_DIR}/tools/patch_idf_c5_usb_clock.cmake)
 
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

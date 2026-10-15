@@ -12,11 +12,31 @@
 - Return a typed error if device metadata would exceed the protocol line.
   Exercise the shipped XIAO and Zero operation catalogs and startup transition
   in the native protocol harness.
+- Build the 16-digit device `build_id` from the full image descriptor digest.
+  The pinned config formats only nine digits through ESP-IDF's convenience
+  API; the previous command silently returned before sending device info.
+  Report typed errors for the remaining early metadata failure paths, and
+  model the nine-digit SDK setting in native tests.
+- Keep UART0's source clock enabled on ESP32-C5 revision 1.0 when native USB
+  Serial/JTAG is the primary console. The pinned ESP-IDF 6.0.1 build disabled
+  it, leaving the XIAO able to print `BOARD READY` while host command writes
+  stalled. A fail-closed CMake patch checks the exact SDK hook on every board
+  build; see [the recovery record](USB_CONSOLE_RECOVERY.md).
+- Reserve GPIO13/14 for USB D-/D+ on native-USB builds. XIAO GPS UART1 now
+  uses D6/TX GPIO11 and D7/RX GPIO12, so any external GPS wiring must use
+  those pins. WROOM retains its legacy GPS pins. The no-GPS Waveshare Zero
+  rejects GPS UART initialization instead of claiming pins later.
 
-Pair this source with WatchDogsGo 0.10.5. At source preparation on 2026-10-15,
-the current XIAO had not replied to a USB console or ROM probe, and a Waveshare
-Zero was not attached. The physical reconnect, exact-image, and WDG runtime
-checks must be recorded before claiming the repair is verified on hardware.
+Pair this source with WatchDogsGo 0.10.5. One earlier 1.8.5 candidate booted
+but its USB input stalled; the next clock-guarded image returned version and
+capabilities but exposed the separate build-ID defect. Neither diagnostic
+candidate should be distributed. Verify the published image and installed WDG
+separately before calling the installation complete. The
+locally rebuilt final source passed physical-reset identity/capability checks
+and ten consecutive WDG serial reopen cycles on the rev1.0 XIAO. Esptool's
+post-write hard-reset message did not exit this board's ROM stub; physical
+RESET with BOOT released was required before those checks. A Waveshare Zero
+was not attached for physical validation.
 
 ## 1.8.4 — Startup recovery, truthful radio jobs and capture cleanup — 2026-10-14 (source candidate; hardware gate pending)
 

@@ -60,6 +60,7 @@ cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -Wno-deprecated-decla
     -I stubs -I ../../ESP32C5/main test_usb_ota.c -lcrypto -o "$test_dir/test-usb"
 "$test_dir/test-usb"
 python3 test_usb_buffer_patch.py
+python3 test_c5_usb_clock_patch.py
 python3 test_scan_cancel_barrier.py
 python3 test_hs_capture_invariants.py
 python3 test_sniffer_evil_twin_invariants.py

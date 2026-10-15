@@ -55,6 +55,7 @@ int main(void) {
     output_capture[0] = 0;
     assert(device_info(1, NULL) == 0);
     assert(strstr(output_capture, "\"kind\":\"device_info\""));
+    assert(strstr(output_capture, "\"build_id\":\"0123456789abcdef\""));
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
     assert(strstr(output_capture, "\"board\":\"waveshare-zero\""));
     assert(strstr(output_capture, "\"psram_bytes\":0"));

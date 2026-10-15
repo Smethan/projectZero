@@ -230,10 +230,20 @@ static int stop_operations(bool reset_wifi);
 #define BOOT_BUTTON_POLL_DELAY_MS      20
 #define BOOT_BUTTON_LONG_PRESS_MS      1000
 
-// GPS UART pins (Marauder compatible)
+// GPIO13/14 are native USB D-/D+ on ESP32-C5. Keep the XIAO's GPS UART
+// on its exposed D6/D7 pins while preserving the legacy WROOM wiring.
 #define GPS_UART_NUM       UART_NUM_1
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#define GPS_TX_PIN         11
+#define GPS_RX_PIN         12
+#else
 #define GPS_TX_PIN         13
 #define GPS_RX_PIN         14
+#endif
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG && \
+    (GPS_TX_PIN == 13 || GPS_TX_PIN == 14 || GPS_RX_PIN == 13 || GPS_RX_PIN == 14)
+#error "Native USB GPS UART must not use GPIO13/14 (USB D-/D+)"
+#endif
 #define GPS_BUF_SIZE       1024
 #define GPS_BAUD_ATGM336H  9600
 #define GPS_BAUD_M5STACK   115200
@@ -25228,6 +25238,11 @@ static int gps_get_baud_for_module(gps_module_t module) {
 }
 
 static esp_err_t init_gps_uart(int baud_rate) {
+#if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
+    // The Zero has no GPS UART connector; never claim its USB or other pins.
+    (void)baud_rate;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     int effective_baud = (baud_rate > 0) ? baud_rate : GPS_BAUD_ATGM336H;
     uart_config_t uart_config = {
         .baud_rate = effective_baud,
@@ -25267,6 +25282,7 @@ static esp_err_t init_gps_uart(int baud_rate) {
 
     uart_flush_input(GPS_UART_NUM);
     return ESP_OK;
+#endif
 }
 
 static void gps_save_state_to_nvs(void) {

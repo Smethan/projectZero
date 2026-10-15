@@ -1222,7 +1222,12 @@ static void remember_terminal_job(const char *token,uint32_t hash) {
     snprintf(terminal_jobs[i].token,sizeof(terminal_jobs[i].token),"%s",token); terminal_jobs[i].hash=hash;
 }
 static int device_info(int argc,char **argv) {
-    (void)argv; if(argc!=1 || !ensure_identity()) return 1;
+    (void)argv;
+    if(argc!=1) return 1;
+    if(!ensure_identity()) {
+        output("{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_identity_unavailable\"}");
+        return 1;
+    }
     sw_boot_snapshot_t boot = sw_get_boot_snapshot();
     bool firmware_ready = boot.state == BOOT_READY;
     bool legacy_busy=!sw_active() && radio_busy_probe && radio_busy_probe();
@@ -1279,13 +1284,22 @@ static int device_info(int argc,char **argv) {
     for(unsigned i=0;i<sizeof(all_channels);i++) {
         if(!valid_channel(all_channels[i]))continue;
         int wrote=snprintf(channels+channel_used,sizeof(channels)-channel_used,"%s%u",channel_used?",":"",all_channels[i]);
-        if(wrote<=0||(size_t)wrote>=sizeof(channels)-channel_used)return 1;
+        if(wrote<=0||(size_t)wrote>=sizeof(channels)-channel_used) {
+            output("{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_channels_failed\"}");
+            return 1;
+        }
         channel_used+=(size_t)wrote;
     }
+    const esp_app_desc_t *app_desc=esp_app_get_description();
+    if(!app_desc) {
+        output("{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_app_description_unavailable\"}");
+        return 1;
+    }
     char build_id[17] = {0};
-    int build_written=esp_app_get_elf_sha256(build_id,sizeof(build_id));
-    if((build_written!=16 && build_written!=17) || build_id[16] || strlen(build_id)!=16) return 1;
-    for(unsigned i=0;i<16;i++)if(!isxdigit((unsigned char)build_id[i]))return 1;
+    /* CONFIG_APP_RETRIEVE_LEN_ELF_SHA may format only nine hex digits. The
+     * app descriptor always retains the complete raw digest, so take its
+     * first eight bytes for the protocol's stable 16-character build ID. */
+    hex(build_id,app_desc->app_elf_sha256,8);
     if(!firmware_ready) {
         operations[0]=0; channels[0]=0; updates=boot.ota_available?"[\"usb-ota\",\"rom\"]":"[\"rom\"]";
         /* Keep the v3 limit shape for hosts through WDG 0.10.3 while making
@@ -1294,7 +1308,7 @@ static int device_info(int argc,char **argv) {
         limit_json="\"targets\":0,\"exclusions\":0,\"batch\":0,\"aps\":0,\"clients\":0,\"probes\":0";
         memory_limits="";
     }
-    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":%s},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s,\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"boot_state\":\"%s\",\"boot_reason\":\"%s\"}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",firmware_ready?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits,esp_app_get_description()->version,build_id,firmware_ready?"ready":"degraded",sw_boot_reason_name(boot.reason));
+    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":%s},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s,\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"boot_state\":\"%s\",\"boot_reason\":\"%s\"}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",firmware_ready?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits,app_desc->version,build_id,firmware_ready?"ready":"degraded",sw_boot_reason_name(boot.reason));
     if(n<=0 || n>1000) {
         output(n>1000 ? "{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_too_large\",\"max_line\":1000}"
                       : "{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_serialization_failed\",\"max_line\":1000}");
