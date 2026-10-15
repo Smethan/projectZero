@@ -14,6 +14,7 @@ python3 extract_zero_resources.py "$test_dir"
 python3 extract_sniffer_stop.py "$test_dir"
 python3 extract_pcap_stop.py "$test_dir"
 python3 extract_sniffer_callback.py "$test_dir"
+python3 test_device_info_catalog.py
 cc -std=c11 -fsanitize=address,undefined -fno-omit-frame-pointer \
     -I ../../ESP32C5/components/frame_analyzer/include test_legacy_frame_safety.c \
     ../../ESP32C5/components/frame_analyzer/frame_analyzer_parser.c -o "$test_dir/test-legacy-frames"
@@ -45,6 +46,11 @@ for zero_profile in 0 1; do
         -Wno-unused-function -I ../vendor/cjson -I stubs -I ../../ESP32C5/main \
         test_jobs.c ../vendor/cjson/cJSON.c -lm -o "$test_dir/test-jobs"
     "$test_dir/test-jobs"
+    cc -std=c11 -D_POSIX_C_SOURCE=200809L -DCONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO=$zero_profile \
+        -DCONFIG_SPIRAM=$((1-zero_profile)) \
+        -Wno-unused-function -I ../vendor/cjson -I stubs -I ../../ESP32C5/main \
+        test_device_info.c ../vendor/cjson/cJSON.c -lm -o "$test_dir/test-device-info"
+    "$test_dir/test-device-info"
 done
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -DCONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO=0 \
     -DCONFIG_SPIRAM=1 -Wno-unused-function -I ../vendor/cjson -I stubs \

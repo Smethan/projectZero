@@ -62,6 +62,10 @@ def validate_build(board, source):
         raise ValueError('Build flash geometry does not match board')
     if zero and ('CONFIG_SPIRAM=y' in config or 'CONFIG_COMPILER_OPTIMIZATION_SIZE=y' not in config):
         raise ValueError('Zero requires no PSRAM and size optimization')
+    if board == 'xiao' and ('CONFIG_SPIRAM=y' not in config
+                            or 'CONFIG_SPIRAM_BOOT_INIT=y' not in config
+                            or 'CONFIG_SPIRAM_IGNORE_NOTFOUND=y' not in config):
+        raise ValueError('XIAO requires boot PSRAM init and tolerance for an absent PSRAM chip')
     if zero and ('CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y' not in config
                  or any(option+'=y' in config for option in (
                      'CONFIG_ESP_WIFI_IRAM_OPT', 'CONFIG_ESP_WIFI_EXTRA_IRAM_OPT',

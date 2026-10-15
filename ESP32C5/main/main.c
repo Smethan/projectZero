@@ -23082,7 +23082,7 @@ void app_main(void) {
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
     /* This board has neither PSRAM nor the legacy OLED/SD/GPS peripherals.
      * Start only NVS, command registration and native USB console. The normal
-     * WROOM/XIAO initialization path below remains byte-for-byte in effect. */
+     * WROOM/XIAO initialization path below retains its board setup sequence. */
     printf("\n\n=== APP_MAIN START (Waveshare C5 Zero, v" JANOS_VERSION ") ===\n");
     esp_log_level_set("wifi", ESP_LOG_ERROR);
     /* Waveshare C5 Zero RF switch: LOW selects its onboard antenna. */
@@ -23130,10 +23130,10 @@ void app_main(void) {
     esp_log_level_set("spi_common", ESP_LOG_NONE);
 
  #ifdef CONFIG_SPIRAM
-//     printf("Step 1: Manual PSRAM init\n");
-    
-    // Manual PSRAM initialization (CONFIG_SPIRAM_BOOT_INIT=n)
-    esp_err_t ret1 = esp_psram_init();
+    // ESP-IDF may initialize PSRAM in the bootloader. Do not initialize it a
+    // second time from app_main; a missing XIAO module is handled below.
+    esp_err_t ret1 = ESP_OK;
+    if (!esp_psram_is_initialized()) ret1 = esp_psram_init();
     if (ret1 == ESP_OK) {
         size_t psram_size = esp_psram_get_size();
         (void)psram_size;
@@ -23177,7 +23177,27 @@ void app_main(void) {
         start_recovery_console("nvs_init_failed", false);
         return;
     }
-    sw_set_boot_state(true, "normal", recovery_ota_partitions_available());
+    // Make the native USB console available before display, LED, settings,
+    // SD and whitelist work. The dispatcher allows only metadata/version
+    // commands until all boot prerequisites below have completed.
+    sw_set_boot_state(false, "initializing", false);
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.task_stack_size = 8192;
+    repl_config.prompt = ">";
+    repl_config.max_cmdline_length = 8192;
+    esp_console_register_help_command();
+    register_commands();
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+#else
+    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+#endif
+    linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
     display_mode_load_from_nvs();
     oled_display_set_forced_type(display_forced_mode);
 
@@ -23291,29 +23311,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
 
 
-    esp_console_repl_t *repl = NULL;
-    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    // Keep REPL stable for heavier TLS-based commands triggered directly from CLI.
-    repl_config.task_stack_size = 8192;
     MY_LOG_INFO(TAG,"Type 'help' to list all commands.");
-
-    repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 8192;  // native USB OTA: 4KiB base64 plus identity/CRC
-
-    esp_console_register_help_command();
-    register_commands();
-
-#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
-    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
-#else
-    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
-#endif
-
-    linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
-
-    ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
 
     gpio_config_t boot_button_config = {
@@ -23386,6 +23384,7 @@ void app_main(void) {
         whitelistedBssidsCount = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(500));
+    sw_set_boot_state(true, "normal", recovery_ota_partitions_available());
     MY_LOG_INFO(TAG,"BOARD READY");
     oled_display_update_full("> JanOS v" JANOS_VERSION,
                             sd_init_ret == ESP_OK ? "  SD: OK" : "  SD: MISSING!",

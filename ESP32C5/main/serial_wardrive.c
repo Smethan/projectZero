@@ -69,13 +69,49 @@ void sw_job_set_sniffer_stats(uint32_t packets,uint32_t aps,uint32_t drops) {
     atomic_store(&sniffer_drops,drops);
 }
 static char device_id[13], boot_id[17], job_token[33];
-static bool firmware_ready = true;
-static bool recovery_ota_available;
-static char firmware_boot_reason[32] = "normal";
+enum { BOOT_READY, BOOT_INITIALIZING, BOOT_RECOVERY };
+enum { REASON_NORMAL, REASON_INITIALIZING, REASON_PSRAM_BUFFER_FAILED,
+       REASON_NVS_INIT_FAILED, REASON_PSRAM_INIT_FAILED,
+       REASON_PSRAM_UNAVAILABLE, REASON_UNKNOWN };
+#define BOOT_STATE_BITS 2u
+#define BOOT_OTA_BIT (1u << BOOT_STATE_BITS)
+#define BOOT_REASON_SHIFT (BOOT_STATE_BITS + 1u)
+static atomic_uint boot_state_snapshot = ATOMIC_VAR_INIT(BOOT_READY | (REASON_NORMAL << BOOT_REASON_SHIFT));
+typedef struct {
+    unsigned state;
+    unsigned reason;
+    bool ota_available;
+} sw_boot_snapshot_t;
+static sw_boot_snapshot_t sw_get_boot_snapshot(void) {
+    unsigned packed = atomic_load(&boot_state_snapshot);
+    return (sw_boot_snapshot_t){
+        .state = packed & ((1u << BOOT_STATE_BITS) - 1u),
+        .reason = packed >> BOOT_REASON_SHIFT,
+        .ota_available = (packed & BOOT_OTA_BIT) != 0,
+    };
+}
+static const char *sw_boot_reason_name(unsigned reason) {
+    switch(reason) {
+        case REASON_NORMAL: return "normal";
+        case REASON_INITIALIZING: return "initializing";
+        case REASON_PSRAM_BUFFER_FAILED: return "psram_buffer_failed";
+        case REASON_NVS_INIT_FAILED: return "nvs_init_failed";
+        case REASON_PSRAM_INIT_FAILED: return "psram_init_failed";
+        case REASON_PSRAM_UNAVAILABLE: return "psram_unavailable";
+        default: return "unknown";
+    }
+}
 void sw_set_boot_state(bool ready, const char *reason, bool ota_available) {
-    firmware_ready = ready;
-    recovery_ota_available = ota_available;
-    snprintf(firmware_boot_reason, sizeof(firmware_boot_reason), "%s", reason ? reason : "unknown");
+    unsigned reason_code = REASON_UNKNOWN;
+    if(reason && !strcmp(reason,"normal")) reason_code=REASON_NORMAL;
+    else if(reason && !strcmp(reason,"initializing")) reason_code=REASON_INITIALIZING;
+    else if(reason && !strcmp(reason,"psram_buffer_failed")) reason_code=REASON_PSRAM_BUFFER_FAILED;
+    else if(reason && !strcmp(reason,"nvs_init_failed")) reason_code=REASON_NVS_INIT_FAILED;
+    else if(reason && !strcmp(reason,"psram_init_failed")) reason_code=REASON_PSRAM_INIT_FAILED;
+    else if(reason && !strcmp(reason,"psram_unavailable")) reason_code=REASON_PSRAM_UNAVAILABLE;
+    unsigned state = ready ? BOOT_READY : (reason_code==REASON_INITIALIZING ? BOOT_INITIALIZING : BOOT_RECOVERY);
+    unsigned packed = state | (reason_code << BOOT_REASON_SHIFT) | (ota_available ? BOOT_OTA_BIT : 0u);
+    atomic_store(&boot_state_snapshot, packed);
 }
 static uint32_t job_request_hash;
 static uint8_t job_channels[40];
@@ -877,7 +913,8 @@ static int wardrive_status(int argc,char **argv) {
 }
 static int capabilities(int argc,char **argv) {
     (void)argc; (void)argv;
-    if(!firmware_ready) {
+    sw_boot_snapshot_t boot = sw_get_boot_snapshot();
+    if(boot.state != BOOT_READY) {
         output("{\"v\":1,\"kind\":\"capabilities\",\"c5_jobs_v1\":false,\"max_line\":1024}");
         return 0;
     }
@@ -1186,6 +1223,8 @@ static void remember_terminal_job(const char *token,uint32_t hash) {
 }
 static int device_info(int argc,char **argv) {
     (void)argv; if(argc!=1 || !ensure_identity()) return 1;
+    sw_boot_snapshot_t boot = sw_get_boot_snapshot();
+    bool firmware_ready = boot.state == BOOT_READY;
     bool legacy_busy=!sw_active() && radio_busy_probe && radio_busy_probe();
     uint32_t flash=0; esp_flash_get_size(NULL,&flash);
 #if CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO
@@ -1248,15 +1287,19 @@ static int device_info(int argc,char **argv) {
     if((build_written!=16 && build_written!=17) || build_id[16] || strlen(build_id)!=16) return 1;
     for(unsigned i=0;i<16;i++)if(!isxdigit((unsigned char)build_id[i]))return 1;
     if(!firmware_ready) {
-        operations[0]=0; channels[0]=0; updates=recovery_ota_available?"[\"usb-ota\",\"rom\"]":"[\"rom\"]";
+        operations[0]=0; channels[0]=0; updates=boot.ota_available?"[\"usb-ota\",\"rom\"]":"[\"rom\"]";
         /* Keep the v3 limit shape for hosts through WDG 0.10.3 while making
          * every scan capacity zero in recovery mode. */
         operation_limits="";
         limit_json="\"targets\":0,\"exclusions\":0,\"batch\":0,\"aps\":0,\"clients\":0,\"probes\":0";
         memory_limits="";
     }
-    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":%s},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s,\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"boot_state\":\"%s\",\"boot_reason\":\"%s\"}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",firmware_ready?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits,esp_app_get_description()->version,build_id,firmware_ready?"ready":"degraded",firmware_boot_reason);
-    if(n<=0 || n>1000) return 1;
+    char b[1100]; int n=snprintf(b,sizeof(b),"{\"v\":3,\"kind\":\"device_info\",\"device_id\":\"%s\",\"boot_id\":\"%s\",\"board\":\"%s\",\"flash_bytes\":%u,\"psram_bytes\":%u,\"legacy_busy\":%s,\"capabilities\":{\"c5_jobs_v1\":%s},\"operations\":[%s],\"channels\":[%s],\"limits\":{%s},\"operation_limits\":{%s},\"updates\":%s%s,\"firmware_version\":\"%s\",\"build_id\":\"%s\",\"boot_state\":\"%s\",\"boot_reason\":\"%s\"}",device_id,boot_id,board,(unsigned)flash,(unsigned)psram,legacy_busy?"true":"false",firmware_ready?"true":"false",operations,channels,limit_json,operation_limits,updates,memory_limits,esp_app_get_description()->version,build_id,firmware_ready?"ready":"degraded",sw_boot_reason_name(boot.reason));
+    if(n<=0 || n>1000) {
+        output(n>1000 ? "{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_too_large\",\"max_line\":1000}"
+                      : "{\"v\":3,\"kind\":\"error\",\"error\":\"device_info_serialization_failed\",\"max_line\":1000}");
+        return 1;
+    }
     output(b); return 0;
 }
 static bool job_boot_id_matches(const char *request_boot) {
@@ -1613,10 +1656,16 @@ static int job_device_info(int argc,char **argv) { return device_info(argc,argv)
 static struct { const char *name; esp_console_cmd_func_t func; } commands[256];
 static unsigned command_count;
 static int dispatch(int argc,char **argv) {
+    if(argc<1 || !argv || !argv[0]) return 1;
+    sw_boot_snapshot_t boot = sw_get_boot_snapshot();
+    if(boot.state==BOOT_INITIALIZING && strcmp(argv[0],"version") &&
+       strcmp(argv[0],"get_capabilities") && strcmp(argv[0],"get_device_info")) {
+        printf("Boot initialization is in progress; command rejected.\n");
+        return 1;
+    }
     if(uota_busy() && strncmp(argv[0],"uota_",5) && strcmp(argv[0],"version") && strcmp(argv[0],"ota_info") && strcmp(argv[0],"get_capabilities")) {
         printf("USB OTA is active; finish or abort it first.\n");return 1;
     }
-    if(argc<1) return 1;
     if(sw_active() && strcmp(argv[0],"stop") && strcmp(argv[0],"get_capabilities") && strcmp(argv[0],"get_device_info") && strcmp(argv[0],"wardrive_keepalive") && strcmp(argv[0],"wardrive_status") &&
        strcmp(argv[0],"job_start") && strcmp(argv[0],"job_keepalive") && strcmp(argv[0],"job_status") && strcmp(argv[0],"job_stop")) {
         printf("Serial wardrive busy; stop first.\n"); return 1;

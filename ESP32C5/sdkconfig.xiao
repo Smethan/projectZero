@@ -10,3 +10,9 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # No secondary console needed
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
+
+# Keep boot-time PSRAM probing enabled while allowing XIAO variants without
+# a populated PSRAM chip to continue into the firmware recovery console.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

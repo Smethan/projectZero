@@ -1,5 +1,46 @@
 # Native USB capability recovery, 2026-10-11
 
+## Recurrence triage, 2026-10-15
+
+The same uConsole again showed a XIAO (`303a:1001`) enumerated as
+`/dev/ttyACM0` while WDG 0.10.4 received no capability or identity reply.
+With WDG closed and no serial owner, a bounded console query and a read-only
+esptool ROM probe both timed out writing to the USB endpoint. Enumeration alone
+therefore did not establish a working firmware console or ROM link. The actual
+firmware version and the trigger of this particular stall remain unknown.
+The standalone WDG diagnostic had still used raw pySerial line changes and
+`flush()`; it could recreate the previously verified stall path even though
+normal WDG connections already used the atomic native USB line handling.
+
+Use one serial owner at a time. **Do not run the 0.10.4 standalone diagnostic**;
+it still uses raw pySerial and `flush()`. After installing the companion WDG
+host fix, close WDG and other monitors, then run the corrected diagnostic
+through its `SerialManager` from the installed checkout:
+
+```sh
+cd /home/pi/python/WatchDogsGo
+.venv/bin/python -m watchdogs.diagnose_firmware --port /dev/ttyACM0
+```
+
+Substitute the actual endpoint after checking USB identity. A `Write timeout`
+is a transport failure, not a negative capability report. The companion WDG
+change bounds metadata writes, avoids `flush()` on console commands, reports
+transport and typed firmware metadata errors separately, and retries missing
+metadata with backoff. If writes still time out, reconnect only the affected
+XIAO USB link;
+if that does not restore replies, use physical BOOT/download mode and a known
+good cable/host before considering a profile-checked firmware recovery.
+Neither a host reboot nor a USB rail cycle recovered the earlier silent-board
+incident, so do not treat them as proof of repair. Preserve NVS and unrelated
+peripheral state during recovery.
+
+Before calling a repair complete, obtain `version`, `get_capabilities`, and
+`get_device_info` replies from the actual board, then verify WDG's reopen and
+post-update handshake on that board. The XIAO is the only attached C5 in this
+investigation; Waveshare Zero requires its own hardware check.
+
+## 2026-10-11 repair record
+
 The matching repair versions are **WatchDogsGo 0.10.2** and **projectZero 1.8.1**.
 This repair addresses console startup and reconnection. It does not change
 radio operations, board flash geometry, partitions, or update methods.

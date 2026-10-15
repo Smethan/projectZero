@@ -69,6 +69,26 @@ int main(void) {
     const char *extra_ops[]={"deauth","sae","blackout","evil_twin","sniffer","bt_track","airtag_scan"};
     for(unsigned i=0;i<sizeof(extra_ops)/sizeof(extra_ops[0]);i++)
         assert(sw_register_job_operation_ex(extra_ops[i],custom_start,custom_stop));
+    sw_set_boot_state(false,"initializing",false);
+    output_capture[0]=0;
+    assert(device_info(1,NULL)==0 && strstr(output_capture,"\"boot_state\":\"degraded\"") &&
+           strstr(output_capture,"\"boot_reason\":\"initializing\"") &&
+           strstr(output_capture,"\"operations\":[]") && strstr(output_capture,"\"channels\":[]") &&
+           strstr(output_capture,"\"limits\":{\"targets\":0,\"exclusions\":0,\"batch\":0,\"aps\":0,\"clients\":0,\"probes\":0}"));
+    output_capture[0]=0;
+    assert(capabilities(1,NULL)==0 && strstr(output_capture,"\"c5_jobs_v1\":false") &&
+           !strstr(output_capture,"wardrive_serial_v1"));
+    unsigned initializing_prepares=prepare_calls;
+    char *initializing_job[]={"job_start","boot-gate","invalid"};
+    output_capture[0]=0;
+    assert(dispatch(3,initializing_job)==1 && prepare_calls==initializing_prepares && !sw_job_owned());
+    assert(dispatch(0,NULL)==1); /* argc is checked before argv[0]. */
+    sw_set_boot_state(true,"normal",true);
+    output_capture[0]=0;
+    assert(device_info(1,NULL)==0 && strstr(output_capture,"\"boot_state\":\"ready\"") &&
+           strstr(output_capture,"\"boot_reason\":\"normal\""));
+    output_capture[0]=0;
+    assert(capabilities(1,NULL)==0 && strstr(output_capture,"\"c5_jobs_v1\":true"));
     sw_register_radio_busy_probe(busy_probe);
     legacy_busy_fixture=true;output_capture[0]=0;
     assert(device_info(1,NULL)==0 && strstr(output_capture,"\"legacy_busy\":true"));

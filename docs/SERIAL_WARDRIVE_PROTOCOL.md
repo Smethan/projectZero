@@ -366,6 +366,25 @@ operations, channels, resource limits, and update methods. It advertises
 each serial endpoint to the reported identity and boot; records from another
 identity, a prior boot, a duplicate sequence, or a stale job are discarded.
 
+On XIAO, the console starts after PSRAM and NVS initialization, while board
+setup continues. During that interval, `get_capabilities` and `get_device_info`
+report no operations and zero capacity, with `boot_state:"degraded"` and
+`boot_reason:"initializing"`. Only version and metadata queries are accepted
+until SD, whitelist, and boot-button setup completes; then metadata changes
+atomically to `boot_state:"ready"`, `boot_reason:"normal"`. Other degraded
+recovery reasons retain the recovery console's reboot and available OTA
+commands.
+
+The complete `device_info` JSON is limited to 1000 bytes so the framed line
+stays within the 1024-byte protocol bound. Firmware tests compare their
+operation list to production registrations and serialize the full catalog for
+both XIAO and Waveshare Zero. If a future change
+cannot serialize the record within that limit, `get_device_info` emits a
+bounded `v:3`, `kind:"error"` record with `error:"device_info_too_large"`
+instead of failing silently; a formatting failure reports
+`device_info_serialization_failed`. These pre-identity errors are diagnostic
+only and must never authorize a job or stand in for a valid `device_info`.
+
 Start a job with `job_start TOKEN BASE64URLJSON`. The token is 1–32 URL-safe
 characters (`A-Z`, `a-z`, `0-9`, `_`, `-`). Decode the unpadded Base64 URL-safe
 argument as a JSON object no larger than 4096 bytes. The request contains the
