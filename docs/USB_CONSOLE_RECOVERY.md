@@ -46,8 +46,8 @@ The locally rebuilt XIAO image with both repairs returned `version`, ready
 `SerialManager` open/query/close cycles returned all three records with one
 stable boot nonce. The corrected standalone WDG diagnostic also reported All
 Wardrive supported. These checks used the staged 1.8.5/0.10.5 source and a
-locally built image; the published CI image and installed WDG checkout must
-still be checked separately.
+locally built image. The separate published-image and installed-WDG results
+are recorded below.
 
 Esptool's reported `Hard resetting via RTS pin` after this board's ROM write
 left the revision 1.0 XIAO in its flasher stub. A no-reset ROM query confirmed
@@ -97,8 +97,46 @@ reopen and post-update handshake on that board. Repeat the query after a
 physical reset and after a fresh serial open. A responsive boot log alone does
 not satisfy this gate. The XIAO is the only attached C5 in this investigation;
 Waveshare Zero requires its own hardware check. On the tested XIAO, the local
-candidate passed this gate after physical reset; repeat it for the published
-artifact and installed WDG before calling the release install verified.
+candidate passed this gate after physical reset; the published artifact and
+installed WDG passed their separate checks below.
+
+## Published 1.8.5 and installed 0.10.5 verification
+
+The [firmware v1.8.5 release](https://github.com/Smethan/projectZero/releases/tag/v1.8.5)
+and [release CI run](https://github.com/Smethan/projectZero/actions/runs/38790884324)
+completed successfully for WROOM, XIAO, and Waveshare Zero. Downloaded ZIPs
+and raw app images matched `SHA256SUMS`. Each ZIP passed WDG's component,
+board-profile, partition-geometry, and NVS-preservation checks. All three
+manifests identify clean source commit
+`29b0fa581df4ea6ef1799f969427068d38135c19`; esptool validated their
+ESP32-C5 image headers and 8/8/4 MiB flash geometry. The published XIAO ZIP
+has SHA-256 `34f98119178cd7d0dd49237bebcd82b2605986e4d29c52cbe5fe489ef5cdcd3f`;
+its 2,308,272-byte app image has SHA-256
+`a2af367161ea13ff3183240745cb9cf0bf33a359e96c27d8a95268a4a0c04ecc`
+and ELF build ID prefix `36971d204edee3b4`. Its image header labels the
+patched ESP-IDF tree `v6.0.1-dirty`; the package manifest separately confirms
+the project source was clean at the tagged commit.
+
+The Pi's installed WDG checkout fast-forwarded to
+`cd7113a393e6b427c4efc92cd1d8b351dcaad89a` (v0.10.5), retaining its
+untracked `wardrive_settings.json` with the same SHA-256. Its corrected
+standalone diagnostic returned three valid capability replies and
+`All Wardrive SUPPORTED`. With the XIAO bound by USB serial identity
+`10:BD:A3:CF:2B:0C`, WDG's application-mode `UsbOtaRunner` downloaded the
+published checksummed XIAO bundle, transferred the app to the alternate slot,
+verified the complete image, and reported
+`Verified v1.8.5 after reboot (valid OTA slot)`. Readback confirmed boot and
+running slot `ota_1`, state 2 (valid), and no pending transfer. The device then
+reported ready XIAO identity, 8 MiB flash and PSRAM, `c5_jobs_v1=true`, and
+build ID `36971d204edee3b4`, matching the published image. Ten further
+open/query/close cycles returned version, identity, and capabilities under
+one boot nonce. The installed WDG `DeviceSession` negotiated both records with
+`protocol_ready=true`, `firmware_health=ready`, and no transport or metadata
+error.
+
+The OTA runner and normal session code were exercised from the installed WDG
+checkout; the full-screen GUI was not launched for this final install check.
+No Waveshare Zero was attached, so its physical USB/RF behavior remains open.
 
 ## 2026-10-11 repair record
 
