@@ -1097,7 +1097,11 @@ sw_channel_result_t sw_job_apply_channel_checked(uint8_t channel) {
     if(result.sdk_error!=ESP_OK) return result;
     wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
     result.sdk_error=esp_wifi_get_channel(&result.actual_channel,&secondary);
-    if(result.sdk_error!=ESP_OK || result.actual_channel!=channel || secondary!=WIFI_SECOND_CHAN_NONE) {
+    /* ESP-IDF chooses the secondary channel automatically on 5 GHz even when
+     * the caller passes NONE. The primary is the requested RF channel; only
+     * require NONE on 2.4 GHz, where the caller's HT20 request is meaningful. */
+    if(result.sdk_error!=ESP_OK || result.actual_channel!=channel ||
+       (channel<=14 && secondary!=WIFI_SECOND_CHAN_NONE)) {
         result.status=SW_CHANNEL_READBACK_ERROR;
         if(result.sdk_error==ESP_OK)result.sdk_error=ESP_FAIL;
         return result;

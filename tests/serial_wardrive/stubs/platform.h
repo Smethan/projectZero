@@ -49,6 +49,7 @@ static void vTaskDelete(void *task){}
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
 #define WIFI_PROMIS_FILTER_MASK_DATA 2
 #define WIFI_SECOND_CHAN_NONE 0
+#define WIFI_SECOND_CHAN_ABOVE 1
 typedef int wifi_promiscuous_pkt_type_t;
 typedef struct {int filter_mask;} wifi_promiscuous_filter_t;
 typedef int wifi_mode_t;
@@ -81,6 +82,7 @@ static int esp_wifi_80211_tx(int interface, const void *frame, int length, bool 
 static int test_channel_result;
 static int test_channel_readback_result;
 static uint8_t test_channel_actual;
+static wifi_second_chan_t test_channel_secondary;
 static bool test_channel_stale_readback;
 static wifi_mode_t test_wifi_mode=WIFI_MODE_NULL;
 static wifi_band_mode_t test_wifi_band=WIFI_BAND_MODE_AUTO;
@@ -92,7 +94,7 @@ static int esp_wifi_set_channel(uint8_t primary,int second){
 static int esp_wifi_get_channel(uint8_t *primary,wifi_second_chan_t *second){
     if(test_channel_readback_result!=ESP_OK)return test_channel_readback_result;
     *primary=test_channel_actual;
-    if(second)*second=WIFI_SECOND_CHAN_NONE;
+    if(second)*second=test_channel_secondary;
     return ESP_OK;
 }
 static int esp_wifi_get_mode(wifi_mode_t *mode){*mode=test_wifi_mode;return ESP_OK;}

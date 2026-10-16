@@ -134,6 +134,16 @@ int main(void){
     assert(channel_result.status==SW_CHANNEL_READBACK_ERROR && channel_result.actual_channel!=6);
     test_channel_stale_readback=false;channel_result=sw_job_apply_channel_checked(6);
     assert(channel_result.status==SW_CHANNEL_OK && channel_result.actual_channel==6);
+    test_channel_secondary=WIFI_SECOND_CHAN_ABOVE;
+    channel_result=sw_job_apply_channel_checked(6);
+    assert(channel_result.status==SW_CHANNEL_READBACK_ERROR);
+    job_channels[0]=36;test_wifi_band=WIFI_BAND_MODE_AUTO;
+    channel_result=sw_job_apply_channel_checked(36);
+    assert(channel_result.status==SW_CHANNEL_OK && channel_result.actual_channel==36);
+    test_channel_actual=40;test_channel_stale_readback=true;
+    channel_result=sw_job_apply_channel_checked(36);
+    assert(channel_result.status==SW_CHANNEL_READBACK_ERROR && channel_result.actual_channel==40);
+    test_channel_stale_readback=false;test_channel_secondary=WIFI_SECOND_CHAN_NONE;
     job_mode=false;job_channel_count=0;test_channel_result=ESP_OK;
     output_capture[0]=0;int job_prepare_count=prepare_calls;
     char *invalid_job[]={"job_start","invalid-token","!"};
