@@ -705,7 +705,11 @@ static ZERO_STACK_NOINLINE void batch_worker_loop(void) {
             if(now_ms()-hop>=(job_mode?job_dwell_ms:160)) {
                 if(job_mode) {
                     if(job_channel_count) { uint8_t applied=0;if(!sw_job_radio_hop(hop_index++,&applied)){sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");atomic_store(&stopping,true);break;} }
-                } else sw_radio_hop(hop_index++);
+                } else if(!sw_radio_hop(hop_index++)) {
+                    batch_status("error","error",",\"message\":\"channel_apply_failed\"");
+                    atomic_store(&stopping,true);
+                    break;
+                }
                 hop=now_ms();
             }
             observation o;
@@ -777,7 +781,11 @@ static ZERO_STACK_NOINLINE void worker(void *unused) {
                 if(now_ms()-hop>=(job_mode?job_dwell_ms:160)) {
                     if(job_mode) {
                         if(job_channel_count) { uint8_t applied=0;if(!sw_job_radio_hop(index++,&applied)){sw_job_emit_lifecycle("error","running","\"message\":\"channel_apply_failed\"");atomic_store(&stopping,true);break;} }
-                    } else sw_radio_hop(index++);
+                    } else if(!sw_radio_hop(index++)) {
+                        status("error",",\"message\":\"channel_apply_failed\"");
+                        atomic_store(&stopping,true);
+                        break;
+                    }
                     hop=now_ms();
                 }
                 if (passive_hs) {
@@ -989,7 +997,7 @@ static bool valid_channel(unsigned channel) {
     /* ESP-IDF 6.0.1 on the supported XIAO C5 returns ESP_ERR_INVALID_ARG
      * when applying channel 144. Keep it out of managed advertisements/plans,
      * while retaining the neighboring supported channels. */
-    static const uint8_t allowed[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
+    static const uint8_t allowed[]={1,2,3,4,5,6,7,8,9,10,11,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     bool listed=false;
     for(unsigned i=0;i<sizeof(allowed);i++) if(allowed[i]==channel) { listed=true;break; }
     if(!listed)return false;
@@ -1121,7 +1129,7 @@ sw_channel_result_t sw_job_radio_hop_checked(unsigned index) {
         sw_channel_result_t result={.status=SW_CHANNEL_NOT_IN_PLAN,.sdk_error=ESP_ERR_INVALID_ARG};
         return result;
     }
-    static const uint8_t legacy_channels[]={1,6,11,2,3,4,5,7,8,9,10,12,13,
+    static const uint8_t legacy_channels[]={1,6,11,2,3,4,5,7,8,9,10,
         36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     uint8_t channel=job_mode?job_channels[index%job_channel_count]:legacy_channels[index%sizeof(legacy_channels)];
     return sw_job_apply_channel_checked(channel);
@@ -1286,7 +1294,7 @@ static int device_info(int argc,char **argv) {
     const char *operation_limits="\"sae\":{\"targets\":1},\"sniffer\":{\"aps\":100,\"clients\":50,\"probes\":200},\"handshake\":{\"aps\":64,\"clients\":128,\"exchanges\":32}";
     const char *memory_limits="";
 #endif
-    static const uint8_t all_channels[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
+    static const uint8_t all_channels[]={1,2,3,4,5,6,7,8,9,10,11,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     char channels[192];size_t channel_used=0;
     for(unsigned i=0;i<sizeof(all_channels);i++) {
         if(!valid_channel(all_channels[i]))continue;

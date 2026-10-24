@@ -22,7 +22,7 @@ esp_err_t sw_register_command(const esp_console_cmd_t *cmd);
 /* Implemented by main.c; invoked only by the serial session owner. */
 bool sw_radio_start(void);
 bool sw_radio_stop(void);
-void sw_radio_hop(unsigned index);
+bool sw_radio_hop(unsigned index);
 
 bool sw_prepare(void);
 /* Extension seam for operation-specific wrappers that share the v3 owner. */

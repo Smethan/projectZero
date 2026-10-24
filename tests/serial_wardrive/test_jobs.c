@@ -18,7 +18,7 @@ static size_t json_record_length(void) {
 bool sw_prepare(void) { prepare_calls++; return true; }
 bool sw_radio_start(void) { return true; }
 bool sw_radio_stop(void) { radio_stops++; return true; }
-void sw_radio_hop(unsigned index) { (void)index; }
+bool sw_radio_hop(unsigned index) { (void)index; return true; }
 static int custom_start(const cJSON *request,const char *token) {
     assert(request && token && sw_job_owner_matches(token));
     custom_starts++;
@@ -317,8 +317,22 @@ int main(void) {
     assert(submit("mask-rejected","wardrive","wifi5","off","[40]","[]","[]",ALL)==1);
     assert(!sw_active()&&!heap_live);
     test_country.policy=WIFI_COUNTRY_POLICY_AUTO;assert(valid_channel(40));
-    test_country_available=false;assert(!valid_channel(13));
+    test_country_available=false;
+    assert(!valid_channel(12) && !valid_channel(13) && !valid_channel(14));
     assert(!valid_channel(144) && valid_channel(140) && valid_channel(149));
+    bool legacy_140=false, legacy_149=false;
+    for (unsigned hop_index=0;hop_index<64;hop_index++) {
+        sw_channel_result_t hop=sw_job_radio_hop_checked(hop_index);
+        assert(hop.status==SW_CHANNEL_OK && hop.requested_channel!=144 &&
+               hop.requested_channel!=12 && hop.requested_channel!=13 &&
+               hop.requested_channel!=14);
+        legacy_140|=hop.requested_channel==140;
+        legacy_149|=hop.requested_channel==149;
+    }
+    assert(legacy_140 && legacy_149);
+    test_channel_result=42;
+    assert(sw_job_radio_hop_checked(0).status==SW_CHANNEL_DRIVER_ERROR);
+    test_channel_result=ESP_OK;
     unsigned prepares_before_unsupported_channel=prepare_calls;
     output_capture[0]=0;
     assert(submit("unsupported-144","wardrive","wifi5","off","[144]","[]","[]",ALL)==1);

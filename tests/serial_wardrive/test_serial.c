@@ -3,16 +3,17 @@
 bool uota_busy(void){return false;}
 static bool radio_ok=true, prepare_ok=true;
 static int stopped_radios, hops, prepare_calls;
-static bool inject_live;
+static bool inject_live, fail_hop;
 bool sw_prepare(void){prepare_calls++;return prepare_ok;}
 bool sw_radio_start(void){return radio_ok;}
 bool sw_radio_stop(void){stopped_radios++;return true;}
-void sw_radio_hop(unsigned i){
+bool sw_radio_hop(unsigned i){
     hops++;
     if(inject_live && atomic_load(&collecting)) {
         uint8_t addr[]={1,0,0,0x52,0x1e,0xb4},ad[]={4,9,'a','b','c'};
         sw_ble(addr,0,-62,0,ad,sizeof(ad));inject_live=false;
     }
+    return !fail_hop;
 }
 static size_t json_record_length(void) {
     const char *record=strstr(output_capture,"WDG:");
@@ -199,6 +200,8 @@ int main(void){
     transport_limit=0;old=atomic_load(&drops);unsigned old_output=atomic_load(&loss_output);status("stats","");assert(atomic_load(&drops)==old+1 && atomic_load(&loss_output)==old_output+1);
     fresh();test_task(NULL);assert(!sw_active());assert(hops>0 && stopped_radios>0);
     assert(strstr(output_capture,"started") && strstr(output_capture,"stats") && strstr(output_capture,"stopped"));
+    fresh();fail_hop=true;test_task(NULL);fail_hop=false;
+    assert(!sw_active() && strstr(output_capture,"channel_apply_failed") && strstr(output_capture,"stopped"));
     fresh();radio_ok=false;test_task(NULL);assert(!strstr(output_capture,"started"));assert(strstr(output_capture,"error") && strstr(output_capture,"stopped"));
     fresh();char *bad[]={"wardrive_keepalive","other"};assert(keepalive(2,bad)==1);
     test_clock+=500;char *good[]={"wardrive_keepalive","fixture"};assert(keepalive(2,good)==0);assert(atomic_load(&lease)==test_clock);
@@ -303,6 +306,10 @@ int main(void){
     assert(strstr(output_capture,"\"kind\":\"batch_start\"") && strstr(output_capture,"\"kind\":\"batch_results\""));
     assert(strstr(output_capture,"\"kind\":\"batch_done\"") && strstr(output_capture,"\"state\":\"stopped\""));
     assert(!machine_mode && !heap_live);
+    output_capture[0]=0;test_clock=1000;
+    assert(start(2,batch_args)==0);fail_hop=true;test_task(NULL);fail_hop=false;
+    assert(!sw_active() && !machine_mode && !heap_live &&
+           strstr(output_capture,"channel_apply_failed") && strstr(output_capture,"\"state\":\"stopped\""));
     capabilities(0,NULL);assert(strstr(output_capture,"\"wardrive_batch_serial_v2\":true"));
     assert(strstr(output_capture,"\"wardrive_live_oui_v1\":true") &&
            strstr(output_capture,"\"remote_id_wifi_v1\":true") &&

@@ -5,7 +5,7 @@ bool uota_busy(void) { return false; }
 bool sw_prepare(void) { return true; }
 bool sw_radio_start(void) { return true; }
 bool sw_radio_stop(void) { return true; }
-void sw_radio_hop(unsigned index) { (void)index; }
+bool sw_radio_hop(unsigned index) { (void)index; return true; }
 
 static int operation_start(const cJSON *request, const char *token) {
     (void)request; (void)token; return SW_JOB_START_READY;

@@ -5,6 +5,7 @@ test_dir="$(mktemp -d /tmp/wdg-fw-test.XXXXXX)"
 trap 'rm -rf "$test_dir"' EXIT
 python3 extract_wifi_init.py "$test_dir"
 python3 extract_sw_radio_hooks.py "$test_dir"
+python3 extract_channel_hops.py "$test_dir"
 python3 extract_handshake_scope.py "$test_dir"
 python3 extract_hs_artifact.py "$test_dir"
 python3 extract_hs_client.py "$test_dir"
@@ -31,6 +32,8 @@ for source in test_serial.c test_hs_monitor.c test_capture_pool.c test_wifi_init
 done
 cc -std=c11 -Wno-unused-function -I "$test_dir" test_sw_radio_hooks.c -o "$test_dir/test-radio-hooks"
 "$test_dir/test-radio-hooks"
+cc -std=c11 -Wno-unused-function -I "$test_dir" test_channel_hops.c -o "$test_dir/test-channel-hops"
+"$test_dir/test-channel-hops"
 cc -std=c11 -I "$test_dir" test_zero_resources.c -o "$test_dir/test-zero-resources"
 "$test_dir/test-zero-resources"
 cc -std=c11 -I "$test_dir" test_sniffer_stop.c -o "$test_dir/test-sniffer-stop"

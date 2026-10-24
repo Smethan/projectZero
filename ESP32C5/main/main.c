@@ -167,7 +167,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.6"
+#define JANOS_VERSION "1.8.7"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -773,7 +773,7 @@ static char beacon_ssids[MAX_BEACON_SSIDS][33];
 static int beacon_ssid_count = 0;
 
 // Channel lists for 2.4GHz and 5GHz
-static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13};
+static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10};
 static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 149, 153, 157, 161, 165};
 #define NUM_CHANNELS_24GHZ (sizeof(channels_24ghz) / sizeof(channels_24ghz[0]))
 #define NUM_CHANNELS_5GHZ (sizeof(channels_5ghz) / sizeof(channels_5ghz[0]))
@@ -808,18 +808,18 @@ static TaskHandle_t boot_action_task_handle = NULL;
 // Dual-band channel list (2.4GHz + 5GHz like Marauder)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     // 5GHz channels
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
-    132, 136, 140, 144, 149, 153, 157, 161, 165
+    132, 136, 140, 149, 153, 157, 161, 165
 };
 static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
 
-/* Handshake capture excludes channel 144 because the supported XIAO C5's
- * ESP-IDF 6.0.1 returns ESP_ERR_INVALID_ARG when applying it. Keep the shared
- * dual_band_channels list unchanged for unrelated sniffer/detector features. */
+/* Channel 144 is excluded from tune lists pending a live probe on the XIAO C5.
+ * US operation also excludes 2.4 GHz channels 12-14 from active scan defaults.
+ * The channel_view lists remain display-only so scan results stay visible. */
 static const uint8_t hs_capture_default_channels[] = {
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
     132, 136, 140, 149, 153, 157, 161, 165
 };
@@ -837,9 +837,9 @@ static bool hs_capture_channel_supported(unsigned channel) {
 // ============================================================================
 
 static const uint8_t wdp_ch_24_primary[]   = {1, 6, 11};
-static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
+static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10};
 static const uint8_t wdp_ch_5_non_dfs[]    = {36, 40, 44, 48, 149, 153, 157, 161, 165};
-static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 169, 173, 177};
+static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 169, 173, 177};
 
 #define WDP_CH_24_PRIMARY_COUNT   (sizeof(wdp_ch_24_primary) / sizeof(wdp_ch_24_primary[0]))
 #define WDP_CH_24_SECONDARY_COUNT (sizeof(wdp_ch_24_secondary) / sizeof(wdp_ch_24_secondary[0]))
@@ -1702,7 +1702,6 @@ static void send_beacon_frame(const uint8_t *frame_buffer, int size) {
     }
 }
 
-static esp_err_t wifi_apply_extended_country(void);
 static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel);
 
 /**
@@ -2675,6 +2674,11 @@ static void ap_locator_shutdown(void);
 static void ap_locator_stop(void);
 // Sniffer Dog functions
 static int cmd_start_sniffer_dog(int argc, char **argv);
+static bool monitor_apply_channel(const char *mode, uint8_t requested);
+static void monitor_failure_cleanup(const char *mode);
+static bool monitor_enable_promiscuous(const char *mode,
+                                       const wifi_promiscuous_filter_t *filter,
+                                       wifi_promiscuous_cb_t callback);
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
@@ -4172,6 +4176,46 @@ static void ota_log_boot_info(void) {
     }
 }
 
+static esp_err_t wifi_apply_us_country(void) {
+    wifi_country_t country = { 0 };
+    esp_err_t err = esp_wifi_get_country(&country);
+    if (err == ESP_OK && memcmp(country.cc, "US", 2) == 0 &&
+        country.policy == WIFI_COUNTRY_POLICY_MANUAL) {
+        MY_LOG_INFO(TAG, "Wi-Fi country already US with fixed policy; skipping flash write.");
+        return ESP_OK;
+    }
+
+    if (err == ESP_OK) {
+        MY_LOG_INFO(TAG, "Wi-Fi country before US setup: code=%.2s policy=%d",
+                    country.cc, (int)country.policy);
+    } else {
+        MY_LOG_INFO(TAG, "Wi-Fi country precheck failed: %s; applying US",
+                    esp_err_to_name(err));
+    }
+
+    err = esp_wifi_set_country_code("US", false);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set fixed US Wi-Fi country: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    memset(&country, 0, sizeof(country));
+    err = esp_wifi_get_country(&country);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to read back Wi-Fi country after setting US: %s",
+                    esp_err_to_name(err));
+        return err;
+    }
+    if (memcmp(country.cc, "US", 2) != 0 ||
+        country.policy != WIFI_COUNTRY_POLICY_MANUAL) {
+        MY_LOG_INFO(TAG, "Wi-Fi country readback mismatch: code=%.2s policy=%d; expected US fixed",
+                    country.cc, (int)country.policy);
+        return ESP_FAIL;
+    }
+    MY_LOG_INFO(TAG, "Wi-Fi country verified: US, fixed policy.");
+    return ESP_OK;
+}
+
 // --- Wi-Fi initialization (STA only - uses less memory) ---
 // AP mode will be enabled dynamically when needed (Evil Twin, Portal)
 static esp_err_t wifi_init_ap_sta(void) {
@@ -4208,6 +4252,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     WIFI_TRY(esp_wifi_init(&cfg));
     driver_ready = true;
+    WIFI_TRY(wifi_apply_us_country());
     if (!wifi_event_handler_registered) {
         WIFI_TRY(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                       &wifi_event_handler, NULL, NULL));
@@ -4242,23 +4287,6 @@ failed:
     return ret;
 }
 
-static esp_err_t wifi_apply_extended_country(void)
-{
-    if(sw_job_owned())return ESP_OK;
-    wifi_country_t wifi_country = {
-        .cc = "PH",
-        .schan = 1,
-        .nchan = 14,
-        .policy = WIFI_COUNTRY_POLICY_AUTO,
-    };
-
-    esp_err_t err = esp_wifi_set_country(&wifi_country);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to set WiFi country for channels 1-13: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
 static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel)
 {
     uint8_t first = 1;
@@ -4272,8 +4300,8 @@ static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_
         if (country_first < 1) {
             country_first = 1;
         }
-        if (country_last > 13) {
-            country_last = 13;
+        if (country_last > 11) {
+            country_last = 11;
         }
         if (country_first <= country_last) {
             first = (uint8_t)country_first;
@@ -4312,8 +4340,6 @@ static bool ensure_wifi_mode(void)
                 MY_LOG_INFO(TAG, "WiFi init failed: %d", ret);
                 return false;
             }
-            
-            wifi_apply_extended_country();
             
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
@@ -6716,6 +6742,30 @@ static void wdp_ducb_update(int channel_idx, double reward) {
     wdp_ducb_discounted_total += 1.0;
 }
 
+static bool wdp_ducb_remove_channel(int channel_idx) {
+    if (channel_idx < 0 || channel_idx >= wdp_ducb_channel_count) return false;
+    int trailing = wdp_ducb_channel_count - channel_idx - 1;
+    if (trailing > 0) {
+        memmove(&wdp_ducb_channels[channel_idx], &wdp_ducb_channels[channel_idx + 1],
+                (size_t)trailing * sizeof(wdp_ducb_channels[0]));
+    }
+    wdp_ducb_channel_count--;
+    memset(&wdp_ducb_channels[wdp_ducb_channel_count], 0, sizeof(wdp_ducb_channels[0]));
+    return true;
+}
+
+static bool wdp_ducb_apply_channel(int channel_idx) {
+    if (channel_idx < 0 || channel_idx >= wdp_ducb_channel_count) return false;
+    const uint8_t requested = (uint8_t)wdp_ducb_channels[channel_idx].channel;
+    sw_channel_result_t result = sw_job_apply_channel_checked(requested);
+    if (result.status == SW_CHANNEL_OK) return true;
+    MY_LOG_INFO(TAG,
+                "Wardrive channel apply failed: requested=%u actual=%u sdk=%d; removing candidate",
+                result.requested_channel, result.actual_channel, result.sdk_error);
+    (void)wdp_ducb_remove_channel(channel_idx);
+    return false;
+}
+
 static int wdp_get_dwell_ms(wdp_channel_tier_t tier) {
     switch (tier) {
         case WDP_TIER_24_PRIMARY:   return WDP_DWELL_PRIMARY_MS;
@@ -6971,7 +7021,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_ducb_init(&g_wd_cfg);
 
     // No WiFi channels selected => BLE-only mode (no promiscuous, no channel hop).
-    const bool wifi_scan_enabled = (wdp_ducb_channel_count > 0);
+    bool wifi_scan_enabled = (wdp_ducb_channel_count > 0);
 
     if (wifi_scan_enabled) {
         // Match the band mode to the selected bands so set_channel can reach 5 GHz.
@@ -6991,9 +7041,11 @@ static void wardrive_promisc_task(void *pvParameters) {
         wifi_promiscuous_filter_t filter = {
             .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
         };
-        esp_wifi_set_promiscuous_filter(&filter);
-        esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-        esp_wifi_set_promiscuous(true);
+        if (!monitor_enable_promiscuous("Wardrive", &filter, wdp_promiscuous_cb)) {
+            (void)esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+            wifi_scan_enabled = false;
+            MY_LOG_INFO(TAG, "Wardrive WiFi setup failed; falling back to BLE-only if available.");
+        }
     }
 
     {
@@ -7018,6 +7070,11 @@ static void wardrive_promisc_task(void *pvParameters) {
     } else {
         MY_LOG_INFO(TAG, "BLE scan unavailable, logging WiFi only.");
         wdp_bt_enabled = false;
+    }
+
+    if (!wifi_scan_enabled && !wdp_bt_running) {
+        MY_LOG_INFO(TAG, "Wardrive has no usable WiFi or BLE scan source; ending cleanly.");
+        goto cleanup;
     }
 
     int64_t last_stats_time = esp_timer_get_time();
@@ -7069,7 +7126,20 @@ static void wardrive_promisc_task(void *pvParameters) {
             ch_idx = wdp_ducb_select_channel();
             channel = wdp_ducb_channels[ch_idx].channel;
             dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
-            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            if (!wdp_ducb_apply_channel(ch_idx)) {
+                if (wdp_ducb_channel_count == 0) {
+                    /* Leave radio capture before switching the cached state to BLE-only. */
+                    (void)esp_wifi_set_promiscuous(false);
+                    (void)esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+                    wifi_scan_enabled = false;
+                    MY_LOG_INFO(TAG, "No usable WiFi channels remain; continuing in BLE-only mode.");
+                    if (!wdp_bt_running) {
+                        MY_LOG_INFO(TAG, "BLE scan is inactive; ending wardrive cleanly.");
+                        break;
+                    }
+                }
+                continue;
+            }
         } else {
             dwell_ms = 1000;  // BLE-only: no channel hop, steady dwell
         }
@@ -7473,10 +7543,14 @@ bool sw_radio_start(void) {
     }
     return true;
 }
-void sw_radio_hop(unsigned index) {
-    static const uint8_t channels[] = {1,6,11,2,3,4,5,7,8,9,10,12,13,
-        36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
-    esp_wifi_set_channel(channels[index % sizeof(channels)], WIFI_SECOND_CHAN_NONE);
+bool sw_radio_hop(unsigned index) {
+    sw_channel_result_t result = sw_job_radio_hop_checked(index);
+    if (result.status != SW_CHANNEL_OK) {
+        MY_LOG_INFO(TAG, "Serial radio channel hop failed: requested=%u actual=%u sdk=%d",
+                    result.requested_channel, result.actual_channel, result.sdk_error);
+        return false;
+    }
+    return true;
 }
 bool sw_radio_stop(void) {
     if (!sw_saved_radio) return true;
@@ -12742,8 +12816,6 @@ static int start_beacon_spam_internal(void) {
         return 1;
     }
 
-    wifi_apply_extended_country();
-
     vTaskDelay(pdMS_TO_TICKS(100));
 
     err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -13139,8 +13211,16 @@ static int stop_operations(bool reset_wifi) {
             MY_LOG_INFO(TAG, "Sniffer Dog task forcefully stopped.");
         }
         
-        // Disable promiscuous mode
-        esp_wifi_set_promiscuous(false);
+        // Disable promiscuous mode before relinquishing this task's callback.
+        esp_err_t radio_err = esp_wifi_set_promiscuous(false);
+        if (radio_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to disable Sniffer Dog promiscuous mode: %s",
+                     esp_err_to_name(radio_err));
+        }
+        radio_err = esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (radio_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to clear Sniffer Dog callback: %s", esp_err_to_name(radio_err));
+        }
         
         // Reset channel state
         sniffer_dog_channel_index = 0;
@@ -13167,8 +13247,16 @@ static int stop_operations(bool reset_wifi) {
             MY_LOG_INFO(TAG, "Deauth Detector task forcefully stopped.");
         }
         
-        // Disable promiscuous mode
-        esp_wifi_set_promiscuous(false);
+        // Disable promiscuous mode before relinquishing this task's callback.
+        esp_err_t radio_err = esp_wifi_set_promiscuous(false);
+        if (radio_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to disable Deauth Detector promiscuous mode: %s",
+                     esp_err_to_name(radio_err));
+        }
+        radio_err = esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (radio_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to clear Deauth Detector callback: %s", esp_err_to_name(radio_err));
+        }
         
         // Reset channel state
         deauth_detector_channel_index = 0;
@@ -15559,17 +15647,29 @@ static int cmd_arp_ban(int argc, char **argv) {
 
 static void packet_monitor_shutdown(void) {
     if (packet_monitor_promiscuous_owned) {
-        esp_wifi_set_promiscuous(false);
+        esp_err_t err = esp_wifi_set_promiscuous(false);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to disable packet monitor promiscuous mode: %s",
+                        esp_err_to_name(err));
+        }
         packet_monitor_promiscuous_owned = false;
     }
 
     if (packet_monitor_callback_installed) {
-        esp_wifi_set_promiscuous_rx_cb(NULL);
+        esp_err_t err = esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to clear packet monitor callback: %s", esp_err_to_name(err));
+        }
         packet_monitor_callback_installed = false;
     }
 
     if (packet_monitor_has_prev_channel) {
-        esp_wifi_set_channel(packet_monitor_prev_primary, packet_monitor_prev_secondary);
+        esp_err_t err = esp_wifi_set_channel(packet_monitor_prev_primary,
+                                             packet_monitor_prev_secondary);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to restore packet monitor channel %u: %s",
+                        packet_monitor_prev_primary, esp_err_to_name(err));
+        }
         packet_monitor_has_prev_channel = false;
     }
 }
@@ -15849,7 +15949,13 @@ static int cmd_packet_monitor(int argc, char **argv) {
                        WIFI_PROMIS_FILTER_MASK_CTRL
     };
 
-    esp_wifi_set_promiscuous(false);
+    err = esp_wifi_set_promiscuous(false);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to disable promiscuous mode before packet monitor: %s",
+                    esp_err_to_name(err));
+        packet_monitor_shutdown();
+        return 1;
+    }
 
     err = esp_wifi_set_promiscuous_filter(&filter);
     if (err != ESP_OK) {
@@ -15858,12 +15964,17 @@ static int cmd_packet_monitor(int argc, char **argv) {
         return 1;
     }
 
-    err = esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to set channel %ld: %s", channel, esp_err_to_name(err));
+    sw_channel_result_t channel_result =
+        sw_job_apply_channel_checked((uint8_t)channel);
+    if (channel_result.status != SW_CHANNEL_OK) {
+        MY_LOG_INFO(TAG, "Packet monitor channel apply failed: requested=%u actual=%u sdk=%d",
+                    channel_result.requested_channel, channel_result.actual_channel,
+                    channel_result.sdk_error);
         packet_monitor_shutdown();
         return 1;
     }
+    MY_LOG_INFO(TAG, "Packet monitor channel applied: requested=%ld actual=%u sdk=%d",
+                channel, channel_result.actual_channel, channel_result.sdk_error);
 
     err = esp_wifi_set_promiscuous_rx_cb(packet_monitor_promiscuous_callback);
     if (err != ESP_OK) {
@@ -16339,6 +16450,9 @@ static void sniffer_setup_task(void *pvParameters) {
         (unsigned)sniffer_selected_channels[0] : (unsigned)dual_band_channels[0];
     sw_channel_result_t first_result = sw_job_apply_channel_checked((uint8_t)first);
     if (first_result.status != SW_CHANNEL_OK) {
+        MY_LOG_INFO(TAG, "Sniffer initial channel apply failed: requested=%u actual=%u sdk=%d",
+                    first_result.requested_channel, first_result.actual_channel,
+                    first_result.sdk_error);
         if (sw_job_owned()) sw_job_emit_channel_failure(first_result);
         goto done;
     }
@@ -17143,13 +17257,17 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
-    if (sniffer_dog_active) {
+    if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Sniffer Dog already active. Use 'stop' to stop it first.");
         return 1;
     }
     
     if (sniffer_active) {
         MY_LOG_INFO(TAG, "Regular sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (deauth_detector_active || deauth_detector_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth Detector is active. Use 'stop' to stop it first.");
         return 1;
     }
     
@@ -17164,18 +17282,23 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
         ESP_LOGW(TAG, "Failed to set LED for Sniffer Dog: %s", esp_err_to_name(led_err));
     }
     
-    // Set promiscuous filter
-    esp_wifi_set_promiscuous_filter(&sniffer_filter);
-    
-    // Enable promiscuous mode with sniffer_dog callback
-    esp_wifi_set_promiscuous_rx_cb(sniffer_dog_promiscuous_callback);
-    esp_wifi_set_promiscuous(true);
-    
-    // Initialize dual-band channel hopping
+    // Apply and verify the initial channel before enabling packet reception.
     sniffer_dog_channel_index = 0;
-    sniffer_dog_current_channel = dual_band_channels[0];
-    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    const uint8_t first_channel = (uint8_t)dual_band_channels[0];
+    if (!monitor_apply_channel("Sniffer Dog", first_channel)) {
+        sniffer_dog_active = false;
+        monitor_failure_cleanup("Sniffer Dog");
+        return 1;
+    }
+    sniffer_dog_current_channel = first_channel;
     sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+
+    if (!monitor_enable_promiscuous("Sniffer Dog", &sniffer_filter,
+                                    sniffer_dog_promiscuous_callback)) {
+        sniffer_dog_active = false;
+        monitor_failure_cleanup("Sniffer Dog");
+        return 1;
+    }
     
     // Create channel hopping task
     BaseType_t task_created = xTaskCreate(
@@ -17190,13 +17313,7 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     if (task_created != pdPASS) {
         MY_LOG_INFO(TAG, "Failed to create Sniffer Dog channel hopping task");
         sniffer_dog_active = false;
-        esp_wifi_set_promiscuous(false);
-        
-        // Return LED to idle
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after Sniffer Dog failure: %s", esp_err_to_name(led_err));
-        }
+        monitor_failure_cleanup("Sniffer Dog");
         
         return 1;
     }
@@ -17220,7 +17337,7 @@ static int cmd_deauth_detector(int argc, char **argv) {
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
-    if (deauth_detector_active) {
+    if (deauth_detector_active || deauth_detector_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Deauth detector already active. Use 'stop' to stop it first.");
         return 1;
     }
@@ -17230,7 +17347,7 @@ static int cmd_deauth_detector(int argc, char **argv) {
         return 1;
     }
     
-    if (sniffer_dog_active) {
+    if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Sniffer Dog is active. Use 'stop' to stop it first.");
         return 1;
     }
@@ -17350,25 +17467,28 @@ static int cmd_deauth_detector(int argc, char **argv) {
         ESP_LOGW(TAG, "Failed to set LED for Deauth Detector: %s", esp_err_to_name(led_err));
     }
     
-    // Set promiscuous filter for MGMT frames only (deauth is a management frame)
+    // Initialize and verify the initial channel before enabling packet reception.
+    deauth_detector_channel_index = 0;
+    const uint8_t first_channel = (uint8_t)(deauth_detector_selected_mode &&
+        deauth_detector_selected_channels_count > 0 ?
+        deauth_detector_selected_channels[0] : dual_band_channels[0]);
+    if (!monitor_apply_channel("Deauth Detector", first_channel)) {
+        deauth_detector_active = false;
+        monitor_failure_cleanup("Deauth Detector");
+        return 1;
+    }
+    deauth_detector_current_channel = first_channel;
+    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+
     wifi_promiscuous_filter_t mgmt_filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
     };
-    esp_wifi_set_promiscuous_filter(&mgmt_filter);
-    
-    // Enable promiscuous mode with deauth_detector callback
-    esp_wifi_set_promiscuous_rx_cb(deauth_detector_promiscuous_callback);
-    esp_wifi_set_promiscuous(true);
-    
-    // Initialize channel hopping
-    deauth_detector_channel_index = 0;
-    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
-        deauth_detector_current_channel = deauth_detector_selected_channels[0];
-    } else {
-        deauth_detector_current_channel = dual_band_channels[0];
+    if (!monitor_enable_promiscuous("Deauth Detector", &mgmt_filter,
+                                    deauth_detector_promiscuous_callback)) {
+        deauth_detector_active = false;
+        monitor_failure_cleanup("Deauth Detector");
+        return 1;
     }
-    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
-    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
     
     // Create channel hopping task (stack must be in internal RAM on ESP32-C5)
     BaseType_t task_created = xTaskCreate(
@@ -17383,13 +17503,7 @@ static int cmd_deauth_detector(int argc, char **argv) {
     if (task_created != pdPASS) {
         MY_LOG_INFO(TAG, "Failed to create Deauth Detector channel hopping task");
         deauth_detector_active = false;
-        esp_wifi_set_promiscuous(false);
-        
-        // Return LED to idle
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector failure: %s", esp_err_to_name(led_err));
-        }
+        monitor_failure_cleanup("Deauth Detector");
         
         return 1;
     }
@@ -24847,20 +24961,68 @@ done:
     atomic_fetch_sub(&sniffer_producers, 1);
 }
 
+static bool monitor_apply_channel(const char *mode, uint8_t requested) {
+    sw_channel_result_t result = sw_job_apply_channel_checked(requested);
+    if (result.status == SW_CHANNEL_OK) return true;
+    MY_LOG_INFO(TAG, "%s channel apply failed: requested=%u actual=%u sdk=%d",
+                mode, result.requested_channel, result.actual_channel, result.sdk_error);
+    if (sw_job_owned()) {
+        sw_job_emit_channel_failure(result);
+        (void)sw_job_request_cleanup(sw_job_token(), "channel_apply_failed");
+    }
+    return false;
+}
+
+static void monitor_failure_cleanup(const char *mode) {
+    esp_err_t err = esp_wifi_set_promiscuous(false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed to disable promiscuous mode: %s", mode, esp_err_to_name(err));
+    }
+    err = esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed to clear promiscuous callback: %s", mode, esp_err_to_name(err));
+    }
+    err = led_set_idle();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed to restore idle LED: %s", mode, esp_err_to_name(err));
+    }
+}
+
+static bool monitor_enable_promiscuous(const char *mode,
+                                       const wifi_promiscuous_filter_t *filter,
+                                       wifi_promiscuous_cb_t callback) {
+    esp_err_t err = esp_wifi_set_promiscuous_filter(filter);
+    if (err == ESP_OK) err = esp_wifi_set_promiscuous_rx_cb(callback);
+    if (err == ESP_OK) err = esp_wifi_set_promiscuous(true);
+    if (err == ESP_OK) return true;
+    MY_LOG_INFO(TAG, "%s promiscuous setup failed: %s", mode, esp_err_to_name(err));
+    esp_err_t cleanup_err = esp_wifi_set_promiscuous(false);
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed to disable promiscuous mode after setup error: %s",
+                 mode, esp_err_to_name(cleanup_err));
+    }
+    cleanup_err = esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed to clear callback after setup error: %s",
+                 mode, esp_err_to_name(cleanup_err));
+    }
+    return false;
+}
+
 static void sniffer_dog_channel_hop(void) {
     if (!sniffer_dog_active) {
         return;
     }
-    
-    // Use dual-band channel hopping
-    sniffer_dog_current_channel = dual_band_channels[sniffer_dog_channel_index];
-    
-    sniffer_dog_channel_index++;
-    if (sniffer_dog_channel_index >= dual_band_channels_count) {
-        sniffer_dog_channel_index = 0;
+
+    const uint8_t requested = (uint8_t)dual_band_channels[
+        sniffer_dog_channel_index % dual_band_channels_count];
+    if (!monitor_apply_channel("Sniffer Dog", requested)) {
+        sniffer_dog_active = false;
+        monitor_failure_cleanup("Sniffer Dog");
+        return;
     }
-    
-    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_current_channel = requested;
+    sniffer_dog_channel_index = (sniffer_dog_channel_index + 1) % dual_band_channels_count;
     sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
 }
 
@@ -25061,27 +25223,21 @@ static void deauth_detector_channel_hop(void) {
     if (!deauth_detector_active) {
         return;
     }
-    
-    // Check if we're in selected channels mode
-    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
-        // Use selected channels only
-        deauth_detector_current_channel = deauth_detector_selected_channels[deauth_detector_channel_index];
-        
-        deauth_detector_channel_index++;
-        if (deauth_detector_channel_index >= deauth_detector_selected_channels_count) {
-            deauth_detector_channel_index = 0;
-        }
-    } else {
-        // Use dual-band channel hopping (all channels)
-        deauth_detector_current_channel = dual_band_channels[deauth_detector_channel_index];
-        
-        deauth_detector_channel_index++;
-        if (deauth_detector_channel_index >= dual_band_channels_count) {
-            deauth_detector_channel_index = 0;
-        }
+
+    const bool selected = deauth_detector_selected_mode &&
+                          deauth_detector_selected_channels_count > 0;
+    const int channel_count = selected ? deauth_detector_selected_channels_count :
+                                         dual_band_channels_count;
+    const uint8_t requested = (uint8_t)(selected ?
+        deauth_detector_selected_channels[deauth_detector_channel_index % channel_count] :
+        dual_band_channels[deauth_detector_channel_index % channel_count]);
+    if (!monitor_apply_channel("Deauth Detector", requested)) {
+        deauth_detector_active = false;
+        monitor_failure_cleanup("Deauth Detector");
+        return;
     }
-    
-    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_detector_current_channel = requested;
+    deauth_detector_channel_index = (deauth_detector_channel_index + 1) % channel_count;
     deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
 }
 
@@ -25106,7 +25262,7 @@ static void deauth_detector_task(void *pvParameters) {
         if (time_expired) {
             deauth_detector_channel_hop();
             // Reset LED to yellow after channel hop (in case it was red from deauth detection)
-            (void)led_set_color(255, 255, 0);
+            if (deauth_detector_active) (void)led_set_color(255, 255, 0);
         }
         
         // OLED update (~500ms)
