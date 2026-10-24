@@ -82,15 +82,17 @@ static void dummy_callback(void *packet, wifi_promiscuous_pkt_type_t type) {
 #include "channel_hops_under_test.inc"
 
 int main(void) {
-    bool saw_140 = false, saw_149 = false;
+    bool saw_140 = false, saw_144 = false, saw_149 = false;
     for (int i = 0; i < dual_band_channels_count; i++) {
-        assert(dual_band_channels[i] != 144);
         assert(dual_band_channels[i] < 12 || dual_band_channels[i] > 14);
         saw_140 |= dual_band_channels[i] == 140;
+        saw_144 |= dual_band_channels[i] == 144;
         saw_149 |= dual_band_channels[i] == 149;
     }
-    assert(saw_140 && saw_149);
-    for (unsigned i = 0; i < sizeof(wdp_ch_5_dfs); i++) assert(wdp_ch_5_dfs[i] != 144);
+    assert(saw_140 && saw_149 && saw_144 == (bool)PROJECTZERO_XIAO_US_CH144);
+    bool wdp_has_144 = false;
+    for (unsigned i = 0; i < sizeof(wdp_ch_5_dfs); i++) wdp_has_144 |= wdp_ch_5_dfs[i] == 144;
+    assert(wdp_has_144 == (bool)PROJECTZERO_XIAO_US_CH144);
 
     wdp_ducb_channels[0] = (wdp_ducb_channel_t){.channel=140,.tier=WDP_TIER_5_DFS,.total_pulls=7};
     wdp_ducb_channels[1] = (wdp_ducb_channel_t){.channel=144,.tier=WDP_TIER_5_DFS,.total_pulls=2};

@@ -26,14 +26,21 @@ cc -std=c11 -I stubs -I ../../ESP32C5/components/frame_analyzer/include \
     ../../ESP32C5/components/frame_analyzer/frame_analyzer_parser.c \
     -o "$test_dir/test-legacy-hccapx"
 "$test_dir/test-legacy-hccapx"
-for source in test_serial.c test_hs_monitor.c test_capture_pool.c test_wifi_init.c test_country.c test_hs_targets.c test_handshake_scope.c test_hs_scan_lifecycle.c test_hs_exchange.c test_hs_artifact.c test_hs_client.c test_hs_ap.c test_hs_fcs.c test_pcapng_serializer.c; do
+for source in test_serial.c test_hs_monitor.c test_capture_pool.c test_wifi_init.c test_country.c test_hs_targets.c test_hs_scan_lifecycle.c test_hs_exchange.c test_hs_artifact.c test_hs_client.c test_hs_ap.c test_hs_fcs.c test_pcapng_serializer.c; do
     cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -I "$test_dir" -I stubs -I ../../ESP32C5/main -I ../../ESP32C5/components/pcap_serializer/include "$source" -o "$test_dir/test"
     "$test_dir/test"
 done
 cc -std=c11 -Wno-unused-function -I "$test_dir" test_sw_radio_hooks.c -o "$test_dir/test-radio-hooks"
 "$test_dir/test-radio-hooks"
-cc -std=c11 -Wno-unused-function -I "$test_dir" test_channel_hops.c -o "$test_dir/test-channel-hops"
-"$test_dir/test-channel-hops"
+for xiao_us_144 in 0 1; do
+    cc -std=c11 -D_POSIX_C_SOURCE=200809L -DPROJECTZERO_XIAO_US_CH144=$xiao_us_144 \
+        -Wno-unused-function -I "$test_dir" -I stubs -I ../../ESP32C5/main \
+        test_handshake_scope.c -o "$test_dir/test-handshake-scope"
+    "$test_dir/test-handshake-scope"
+    cc -std=c11 -DPROJECTZERO_XIAO_US_CH144=$xiao_us_144 -Wno-unused-function \
+        -I "$test_dir" test_channel_hops.c -o "$test_dir/test-channel-hops"
+    "$test_dir/test-channel-hops"
+done
 cc -std=c11 -I "$test_dir" test_zero_resources.c -o "$test_dir/test-zero-resources"
 "$test_dir/test-zero-resources"
 cc -std=c11 -I "$test_dir" test_sniffer_stop.c -o "$test_dir/test-sniffer-stop"
@@ -56,7 +63,8 @@ for zero_profile in 0 1; do
     "$test_dir/test-device-info"
 done
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -DCONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO=0 \
-    -DCONFIG_SPIRAM=1 -Wno-unused-function -I ../vendor/cjson -I stubs \
+    -DCONFIG_SPIRAM=1 -DCONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=1 \
+    -Wno-unused-function -I ../vendor/cjson -I stubs \
     -I ../../ESP32C5/main test_jobs.c ../vendor/cjson/cJSON.c -lm -o "$test_dir/test-jobs-psram"
 "$test_dir/test-jobs-psram"
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wno-unused-function -Wno-deprecated-declarations \

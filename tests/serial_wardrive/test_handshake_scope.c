@@ -149,13 +149,13 @@ int main(void) {
     reset_state();
     ducb_init();
     assert(ducb_channel_count==HS_CAPTURE_DEFAULT_CHANNEL_COUNT);
-    bool saw140=false,saw149=false;
+    bool saw140=false,saw144=false,saw149=false;
     for(int i=0;i<ducb_channel_count;i++) {
-        assert(ducb_channels[i].channel!=144);
         if(ducb_channels[i].channel==140)saw140=true;
+        if(ducb_channels[i].channel==144)saw144=true;
         if(ducb_channels[i].channel==149)saw149=true;
     }
-    assert(saw140&&saw149);
+    assert(saw140&&saw149&&saw144==(bool)PROJECTZERO_XIAO_US_CH144);
 
     configured_job_channels[0]=6;
     configured_job_channels[1]=36;
@@ -282,7 +282,12 @@ int main(void) {
     assert_error("target_channel", 4, first);
     reset_state();
     hs_scan_snapshot.records[0].primary = 144;
+#if PROJECTZERO_XIAO_US_CH144
+    assert(invoke(4, first) == 0 && start_calls == 1 && started_serial);
+    assert(started_targets.count == 1 && started_targets.channel[0] == 144);
+#else
     assert_error("target_channel", 4, first);
+#endif
 
     reset_state();
     forced_start_result = 1;

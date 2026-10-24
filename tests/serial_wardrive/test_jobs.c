@@ -57,6 +57,14 @@ static int submit(const char *token,const char *operation,const char *band,const
                    const char *channels,const char *targets,const char *exclude,const char *options) {
     return submit_boot(boot_id,token,operation,band,ble,channels,targets,exclude,options);
 }
+static int submit_implicit_channels(const char *token,const char *operation,
+                                    const char *band,const char *options) {
+    char json[4097], payload[5500];
+    snprintf(json,sizeof(json),"{\"boot_id\":\"%s\",\"op\":\"%s\",\"band\":\"%s\",\"ble\":\"off\",\"dwell_ms\":160,\"targets\":[],\"exclude\":[],\"options\":%s,\"live_ouis\":[]}",
+        boot_id,operation,band,options);
+    encode(json,payload);char *argv[]={"job_start",(char *)token,payload};
+    return job_start(3,argv);
+}
 #define ALL "{\"storage\":\"serial\",\"scope\":\"all\"}"
 #define SELECTED "{\"storage\":\"serial\",\"scope\":\"selected\"}"
 #define TARGET "[{\"bssid\":\"02:11:22:33:44:55\",\"channel\":6,\"auth\":3,\"ssid_hex\":\"4142\"}]"
@@ -149,7 +157,11 @@ int main(void) {
     output_capture[0]=0;
     assert(device_info(1,NULL)==0 && strstr(output_capture,"\"boot_state\":\"ready\"") &&
            strstr(output_capture,"\"boot_reason\":\"normal\""));
+#if PROJECTZERO_XIAO_US_CH144
+    assert(strstr(output_capture,"140,144,149"));
+#else
     assert(strstr(output_capture,"140,149") && !strstr(output_capture,"140,144,149"));
+#endif
     output_capture[0]=0;
     assert(capabilities(1,NULL)==0 && strstr(output_capture,"\"c5_jobs_v1\":true"));
     sw_register_radio_busy_probe(busy_probe);
@@ -316,28 +328,58 @@ int main(void) {
     assert(valid_channel(36) && !valid_channel(40));
     assert(submit("mask-rejected","wardrive","wifi5","off","[40]","[]","[]",ALL)==1);
     assert(!sw_active()&&!heap_live);
+    test_country.wifi_5g_channel_mask=CHANNEL_TO_BIT(144);
+    assert(valid_channel(144)==(bool)PROJECTZERO_XIAO_US_CH144);
     test_country.policy=WIFI_COUNTRY_POLICY_AUTO;assert(valid_channel(40));
     test_country_available=false;
     assert(!valid_channel(12) && !valid_channel(13) && !valid_channel(14));
-    assert(!valid_channel(144) && valid_channel(140) && valid_channel(149));
-    bool legacy_140=false, legacy_149=false;
+    assert(valid_channel(144)==(bool)PROJECTZERO_XIAO_US_CH144 &&
+           valid_channel(140) && valid_channel(149));
+    bool legacy_140=false, legacy_144=false, legacy_149=false;
     for (unsigned hop_index=0;hop_index<64;hop_index++) {
         sw_channel_result_t hop=sw_job_radio_hop_checked(hop_index);
-        assert(hop.status==SW_CHANNEL_OK && hop.requested_channel!=144 &&
+        assert(hop.status==SW_CHANNEL_OK &&
                hop.requested_channel!=12 && hop.requested_channel!=13 &&
                hop.requested_channel!=14);
         legacy_140|=hop.requested_channel==140;
+        legacy_144|=hop.requested_channel==144;
         legacy_149|=hop.requested_channel==149;
     }
-    assert(legacy_140 && legacy_149);
+    assert(legacy_140 && legacy_149 && legacy_144==(bool)PROJECTZERO_XIAO_US_CH144);
     test_channel_result=42;
     assert(sw_job_radio_hop_checked(0).status==SW_CHANNEL_DRIVER_ERROR);
     test_channel_result=ESP_OK;
-    unsigned prepares_before_unsupported_channel=prepare_calls;
     output_capture[0]=0;
+#if PROJECTZERO_XIAO_US_CH144
+    assert(submit("supported-144","wardrive","wifi5","off","[144]","[]","[]",ALL)==0);
+    assert(sw_active() && sw_job_owner_matches("supported-144"));
+    test_task(NULL);
+    assert(!sw_active() && !heap_live && strstr(output_capture,"\"kind\":\"started\""));
+    output_capture[0]=0;
+    assert(submit_implicit_channels("default-144","handshake","both",ALL)==0);
+    bool default_has_144=false;
+    for (unsigned i=0;i<job_channel_count;i++) default_has_144|=job_channels[i]==144;
+    assert(default_has_144 && sw_active() && sw_job_owner_matches("default-144"));
+    test_task(NULL);
+    assert(!sw_active() && !heap_live);
+    assert(submit_implicit_channels("default-144-5g","handshake","wifi5",ALL)==0);
+    default_has_144=false;
+    for (unsigned i=0;i<job_channel_count;i++) default_has_144|=job_channels[i]==144;
+    assert(default_has_144);
+    test_task(NULL);
+    assert(!sw_active() && !heap_live);
+    assert(submit_implicit_channels("default-24","handshake","wifi24",ALL)==0);
+    default_has_144=false;
+    for (unsigned i=0;i<job_channel_count;i++) default_has_144|=job_channels[i]==144;
+    assert(!default_has_144);
+    test_task(NULL);
+    assert(!sw_active() && !heap_live);
+#else
+    unsigned prepares_before_unsupported_channel=prepare_calls;
     assert(submit("unsupported-144","wardrive","wifi5","off","[144]","[]","[]",ALL)==1);
     assert(!sw_active()&&!heap_live&&strstr(output_capture,"invalid_request"));
     assert(prepare_calls==prepares_before_unsupported_channel); /* rejected before radio setup */
+#endif
     test_channel_result=1;output_capture[0]=0;
     assert(submit("bad-channel","wardrive","wifi24","off","[6]","[]","[]",ALL)==0);
     test_task(NULL);assert(!sw_active()&&!heap_live);

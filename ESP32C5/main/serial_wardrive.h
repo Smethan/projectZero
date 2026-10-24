@@ -4,6 +4,17 @@
 #include <stddef.h>
 #include "esp_console.h"
 #include "esp_wifi.h"
+
+/* Channel 144 is enabled only for the tested XIAO profile: native USB,
+ * external PSRAM, and not the Waveshare Zero board. */
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) && CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG && \
+    defined(CONFIG_SPIRAM) && CONFIG_SPIRAM && \
+    (!defined(CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO) || !CONFIG_PROJECTZERO_BOARD_WAVESHARE_ZERO)
+#define PROJECTZERO_XIAO_US_CH144 1
+#else
+#define PROJECTZERO_XIAO_US_CH144 0
+#endif
+
 struct cJSON;
 typedef int (*sw_job_operation_handler_t)(const struct cJSON *request, const char *token);
 typedef int (*sw_job_operation_stop_t)(const char *token);

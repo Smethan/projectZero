@@ -774,7 +774,14 @@ static int beacon_ssid_count = 0;
 
 // Channel lists for 2.4GHz and 5GHz
 static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10};
-static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 149, 153, 157, 161, 165};
+static const uint8_t channels_5ghz[] = {
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+    132, 136, 140,
+#if PROJECTZERO_XIAO_US_CH144
+    144,
+#endif
+    149, 153, 157, 161, 165
+};
 #define NUM_CHANNELS_24GHZ (sizeof(channels_24ghz) / sizeof(channels_24ghz[0]))
 #define NUM_CHANNELS_5GHZ (sizeof(channels_5ghz) / sizeof(channels_5ghz[0]))
 
@@ -811,17 +818,26 @@ static const int dual_band_channels[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     // 5GHz channels
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
-    132, 136, 140, 149, 153, 157, 161, 165
+    132, 136, 140,
+#if PROJECTZERO_XIAO_US_CH144
+    144,
+#endif
+    149, 153, 157, 161, 165
 };
 static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
 
-/* Channel 144 is excluded from tune lists pending a live probe on the XIAO C5.
- * US operation also excludes 2.4 GHz channels 12-14 from active scan defaults.
- * The channel_view lists remain display-only so scan results stay visible. */
+/* The US XIAO profile's v1.8.7 candidate (build d595cd0854b6200e) read back
+ * fixed US country and packet_monitor 144 read back primary 144 (ESP_OK).
+ * Keep channel 144 disabled on other profiles; verify managed HS separately.
+ * US operation excludes 2.4 GHz channels 12-14 from active defaults. */
 static const uint8_t hs_capture_default_channels[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
     36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
-    132, 136, 140, 149, 153, 157, 161, 165
+    132, 136, 140,
+#if PROJECTZERO_XIAO_US_CH144
+    144,
+#endif
+    149, 153, 157, 161, 165
 };
 #define HS_CAPTURE_DEFAULT_CHANNEL_COUNT \
     (sizeof(hs_capture_default_channels) / sizeof(hs_capture_default_channels[0]))
@@ -839,7 +855,13 @@ static bool hs_capture_channel_supported(unsigned channel) {
 static const uint8_t wdp_ch_24_primary[]   = {1, 6, 11};
 static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10};
 static const uint8_t wdp_ch_5_non_dfs[]    = {36, 40, 44, 48, 149, 153, 157, 161, 165};
-static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 169, 173, 177};
+static const uint8_t wdp_ch_5_dfs[]        = {
+    52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+#if PROJECTZERO_XIAO_US_CH144
+    144,
+#endif
+    169, 173, 177
+};
 
 #define WDP_CH_24_PRIMARY_COUNT   (sizeof(wdp_ch_24_primary) / sizeof(wdp_ch_24_primary[0]))
 #define WDP_CH_24_SECONDARY_COUNT (sizeof(wdp_ch_24_secondary) / sizeof(wdp_ch_24_secondary[0]))

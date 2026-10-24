@@ -1,5 +1,20 @@
 # Smethan fork firmware
 
+## 1.8.7 candidate — US Wi-Fi channel initialization — 2026-10-24
+
+- Set the US country at Wi-Fi initialization. Keep US 2.4 GHz channels 12–14
+  excluded. Re-enable channel 144 only for the XIAO profile; WROOM and Zero
+  profiles remain conservative.
+- A live XIAO `packet_monitor` test directly tuned to US primary channel 144
+  and read it back successfully with `ESP_OK`. This confirms that direct tune
+  path only; full managed HS Capture and a controlled AP/client exchange remain
+  unverified.
+- Check standalone and legacy channel hops, pruning invalid channels and
+  reporting tune failures instead of silently continuing.
+
+This is a source candidate; it has not been published or installed. The 1.8.6
+notes below record the earlier channel 144 failure and remain historical.
+
 ## 1.8.6 — C5 handshake channel application — 2026-10-24
 
 - Accept the ESP-IDF-selected secondary channel when a managed C5 job applies a
