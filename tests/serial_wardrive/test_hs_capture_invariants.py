@@ -44,6 +44,16 @@ psram_init = function("static bool init_psram_buffers(void)")
 scan_complete = function("static void hs_scan_complete(bool success)")
 attack_task = function("static void handshake_attack_task_sniffer(void)")
 
+# Managed HS capture checks the first channel before publishing readiness and
+# checks every D-UCB hop through the same SDK readback helper.
+initial_channel = attack_task.index(
+    "sw_channel_result_t first_result=sw_job_apply_channel_checked("
+)
+hop_channel = attack_task.index(
+    "sw_channel_result_t channel_result=sw_job_apply_channel_checked("
+)
+assert initial_channel < hop_channel
+
 # The driver callback only validates/routes packets and copies them into bounded
 # queues.  Parsing, serializer growth, exchange state, AP state, storage, and
 # output remain owned by the capture task.

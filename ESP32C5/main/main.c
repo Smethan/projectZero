@@ -167,7 +167,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.5"
+#define JANOS_VERSION "1.8.6"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -774,7 +774,7 @@ static int beacon_ssid_count = 0;
 
 // Channel lists for 2.4GHz and 5GHz
 static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13};
-static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 149, 153, 157, 161, 165};
 #define NUM_CHANNELS_24GHZ (sizeof(channels_24ghz) / sizeof(channels_24ghz[0]))
 #define NUM_CHANNELS_5GHZ (sizeof(channels_5ghz) / sizeof(channels_5ghz[0]))
 
@@ -814,6 +814,23 @@ static const int dual_band_channels[] = {
     132, 136, 140, 144, 149, 153, 157, 161, 165
 };
 static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
+
+/* Handshake capture excludes channel 144 because the supported XIAO C5's
+ * ESP-IDF 6.0.1 returns ESP_ERR_INVALID_ARG when applying it. Keep the shared
+ * dual_band_channels list unchanged for unrelated sniffer/detector features. */
+static const uint8_t hs_capture_default_channels[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+    132, 136, 140, 149, 153, 157, 161, 165
+};
+#define HS_CAPTURE_DEFAULT_CHANNEL_COUNT \
+    (sizeof(hs_capture_default_channels) / sizeof(hs_capture_default_channels[0]))
+
+static bool hs_capture_channel_supported(unsigned channel) {
+    for (size_t i = 0; i < HS_CAPTURE_DEFAULT_CHANNEL_COUNT; i++)
+        if (hs_capture_default_channels[i] == channel) return true;
+    return false;
+}
 
 // ============================================================================
 // Wardrive Promisc: Kismet-style tiered channel lists + D-UCB
@@ -6529,10 +6546,12 @@ static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
 static void ducb_init(void) {
     uint8_t job_channels[40];
     size_t job_channel_count=sw_job_copy_channels(job_channels,sizeof(job_channels));
-    ducb_channel_count = job_channel_count ? (int)job_channel_count : dual_band_channels_count;
+    ducb_channel_count = job_channel_count ? (int)job_channel_count :
+        (int)HS_CAPTURE_DEFAULT_CHANNEL_COUNT;
     ducb_discounted_total = 0.0;
     for (int i = 0; i < ducb_channel_count; i++) {
-        ducb_channels[i].channel = job_channel_count ? job_channels[i] : dual_band_channels[i];
+        ducb_channels[i].channel = job_channel_count ? job_channels[i] :
+            hs_capture_default_channels[i];
         ducb_channels[i].discounted_reward = 0.0;
         ducb_channels[i].discounted_pulls = 0.0;
         ducb_channels[i].total_pulls = 0;
@@ -9458,9 +9477,8 @@ static ZERO_STACK_NOINLINE int cmd_handshake_scope(int argc,char **argv) {
                     found=&hs_scan_snapshot.records[j];break;
                 }
             if(!found||found->authmode==WIFI_AUTH_OPEN||found->authmode==WIFI_AUTH_WEP)return hs_scope_error(argv[1],"target_unavailable");
-            bool channel_ok=false;
-            for(int j=0;j<dual_band_channels_count;j++)if(dual_band_channels[j]==found->primary)channel_ok=true;
-            if(!channel_ok)return hs_scope_error(argv[1],"target_channel");
+            if(!hs_capture_channel_supported(found->primary))
+                return hs_scope_error(argv[1],"target_channel");
             targets.channel[i]=found->primary;
         }
     }

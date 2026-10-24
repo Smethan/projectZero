@@ -84,9 +84,72 @@ int main(void) {
     assert(dispatch(3,initializing_job)==1 && prepare_calls==initializing_prepares && !sw_job_owned());
     assert(dispatch(0,NULL)==1); /* argc is checked before argv[0]. */
     sw_set_boot_state(true,"normal",true);
+    /* Exercise the production checked channel helper with SDK readback faults.
+     * C5 may report an automatic secondary on 5 GHz, while 2.4 GHz must stay
+     * HT20 and every managed hop must remain inside its declared plan. */
+    const uint8_t radio_plan[]={6,36};
+    assert(sw_job_set_radio_plan(radio_plan,sizeof(radio_plan),160));
+    job_mode=true;
+    test_channel_result=ESP_OK;
+    test_channel_readback_result=ESP_OK;
+    test_channel_actual=36;
+    test_channel_secondary=WIFI_SECOND_CHAN_ABOVE;
+    sw_channel_result_t channel_check=sw_job_apply_channel_checked(36);
+    assert(channel_check.status==SW_CHANNEL_OK && channel_check.requested_channel==36 &&
+           channel_check.actual_channel==36);
+
+    test_channel_stale_readback=true;
+    test_channel_actual=40; /* SDK readback reports a different primary. */
+    channel_check=sw_job_apply_channel_checked(36);
+    assert(channel_check.status==SW_CHANNEL_READBACK_ERROR && channel_check.sdk_error==ESP_FAIL);
+
+    test_channel_stale_readback=false;
+    test_channel_actual=36;
+    test_channel_readback_result=21; /* SDK could not report the applied channel. */
+    channel_check=sw_job_apply_channel_checked(36);
+    assert(channel_check.status==SW_CHANNEL_READBACK_ERROR && channel_check.sdk_error==21);
+
+    test_channel_readback_result=ESP_OK;
+    test_channel_result=22; /* Channel set itself failed in the SDK. */
+    channel_check=sw_job_apply_channel_checked(36);
+    assert(channel_check.status==SW_CHANNEL_DRIVER_ERROR && channel_check.sdk_error==22);
+    test_channel_result=ESP_OK;
+    test_channel_actual=6;
+    test_channel_secondary=WIFI_SECOND_CHAN_NONE;
+    channel_check=sw_job_apply_channel_checked(6);
+    assert(channel_check.status==SW_CHANNEL_OK);
+    test_channel_secondary=WIFI_SECOND_CHAN_ABOVE;
+    channel_check=sw_job_apply_channel_checked(6);
+    assert(channel_check.status==SW_CHANNEL_READBACK_ERROR && channel_check.sdk_error==ESP_FAIL);
+
+    /* Also exercise the shared managed-hop entry point used by job workers. */
+    test_channel_actual=36;
+    test_channel_secondary=WIFI_SECOND_CHAN_ABOVE;
+    sw_channel_result_t hop_check=sw_job_radio_hop_checked(1);
+    assert(hop_check.status==SW_CHANNEL_OK && hop_check.requested_channel==36 &&
+           hop_check.actual_channel==36);
+
+    test_channel_stale_readback=true;
+    test_channel_actual=40;
+    hop_check=sw_job_radio_hop_checked(1);
+    assert(hop_check.status==SW_CHANNEL_READBACK_ERROR && hop_check.sdk_error==ESP_FAIL);
+    test_channel_stale_readback=false;
+
+    test_channel_secondary=WIFI_SECOND_CHAN_ABOVE;
+    hop_check=sw_job_radio_hop_checked(0);
+    assert(hop_check.status==SW_CHANNEL_READBACK_ERROR && hop_check.sdk_error==ESP_FAIL);
+
+    test_channel_secondary=WIFI_SECOND_CHAN_NONE;
+    channel_check=sw_job_apply_channel_checked(40); /* Valid RF channel, absent from this job. */
+    assert(channel_check.status==SW_CHANNEL_NOT_IN_PLAN && channel_check.sdk_error==ESP_ERR_INVALID_ARG);
+    job_mode=false;
+    job_channel_count=0;
+    test_channel_actual=0;
+    test_channel_secondary=WIFI_SECOND_CHAN_NONE;
     output_capture[0]=0;
     assert(device_info(1,NULL)==0 && strstr(output_capture,"\"boot_state\":\"ready\"") &&
            strstr(output_capture,"\"boot_reason\":\"normal\""));
+    assert(strstr(output_capture,"140,149") && !strstr(output_capture,"140,144,149"));
     output_capture[0]=0;
     assert(capabilities(1,NULL)==0 && strstr(output_capture,"\"c5_jobs_v1\":true"));
     sw_register_radio_busy_probe(busy_probe);
@@ -255,6 +318,12 @@ int main(void) {
     assert(!sw_active()&&!heap_live);
     test_country.policy=WIFI_COUNTRY_POLICY_AUTO;assert(valid_channel(40));
     test_country_available=false;assert(!valid_channel(13));
+    assert(!valid_channel(144) && valid_channel(140) && valid_channel(149));
+    unsigned prepares_before_unsupported_channel=prepare_calls;
+    output_capture[0]=0;
+    assert(submit("unsupported-144","wardrive","wifi5","off","[144]","[]","[]",ALL)==1);
+    assert(!sw_active()&&!heap_live&&strstr(output_capture,"invalid_request"));
+    assert(prepare_calls==prepares_before_unsupported_channel); /* rejected before radio setup */
     test_channel_result=1;output_capture[0]=0;
     assert(submit("bad-channel","wardrive","wifi24","off","[6]","[]","[]",ALL)==0);
     test_task(NULL);assert(!sw_active()&&!heap_live);

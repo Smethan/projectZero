@@ -53,8 +53,24 @@ static hs_target_set started_targets;
 static int forced_start_result;
 static char reported_storage[16];
 static char reported_error[32];
+typedef struct {
+    int channel;
+    double discounted_reward;
+    double discounted_pulls;
+    unsigned total_pulls;
+} ducb_channel_t;
+static ducb_channel_t ducb_channels[64];
+static int ducb_channel_count;
+static double ducb_discounted_total;
+static uint8_t configured_job_channels[40];
+static size_t configured_job_channel_count;
 
 static int64_t esp_timer_get_time(void) { return now_us; }
+static size_t sw_job_copy_channels(uint8_t *channels, size_t capacity) {
+    if (configured_job_channel_count > capacity) return 0;
+    memcpy(channels, configured_job_channels, configured_job_channel_count);
+    return configured_job_channel_count;
+}
 static int hs_scope_error(const char *storage, const char *error) {
     snprintf(reported_storage, sizeof(reported_storage), "%s", storage);
     snprintf(reported_error, sizeof(reported_error), "%s", error);
@@ -67,6 +83,7 @@ static int start_handshake_scoped(bool serial_storage, const hs_target_set *scop
     return forced_start_result;
 }
 
+#include "hs_capture_plan_under_test.inc"
 #include "handshake_scope_under_test.inc"
 
 static void mac(uint8_t out[6], unsigned last) {
@@ -100,11 +117,9 @@ static void reset_state(void) {
     hs_scan_snapshot.records[1].authmode = WIFI_AUTH_WPA_PSK;
     atomic_store(&hs_scan_output_active, false);
     atomic_store(&handshake_cleanup_active, false);
-    dual_band_channels[0] = 1;
-    dual_band_channels[1] = 6;
-    dual_band_channels[2] = 11;
-    dual_band_channels[3] = 149;
-    dual_band_channels_count = 4;
+    configured_job_channel_count=0;
+    ducb_channel_count=0;
+    ducb_discounted_total=0;
     start_calls = 0;
     forced_start_result = 0;
     memset(&started_targets, 0, sizeof(started_targets));
@@ -130,6 +145,24 @@ int main(void) {
                               "02:11:22:33:44:66,02:11:22:33:44:55"};
     const char *all_except[] = {"start_handshake_scope", "serial", "all-except",
                                 "02:11:22:33:44:55,02:11:22:33:44:66"};
+
+    reset_state();
+    ducb_init();
+    assert(ducb_channel_count==HS_CAPTURE_DEFAULT_CHANNEL_COUNT);
+    bool saw140=false,saw149=false;
+    for(int i=0;i<ducb_channel_count;i++) {
+        assert(ducb_channels[i].channel!=144);
+        if(ducb_channels[i].channel==140)saw140=true;
+        if(ducb_channels[i].channel==149)saw149=true;
+    }
+    assert(saw140&&saw149);
+
+    configured_job_channels[0]=6;
+    configured_job_channels[1]=36;
+    configured_job_channel_count=2;
+    ducb_init();
+    assert(ducb_channel_count==2 && ducb_channels[0].channel==6 &&
+           ducb_channels[1].channel==36);
 
     reset_state();
     assert(invoke(3, all_serial) == 0 && start_calls == 1 && started_serial);
@@ -245,7 +278,10 @@ int main(void) {
     assert_error("target_unavailable", 4, first);
 
     reset_state();
-    hs_scan_snapshot.records[0].primary = 13;
+    hs_scan_snapshot.records[0].primary = 35;
+    assert_error("target_channel", 4, first);
+    reset_state();
+    hs_scan_snapshot.records[0].primary = 144;
     assert_error("target_channel", 4, first);
 
     reset_state();

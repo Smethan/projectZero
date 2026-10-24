@@ -1,5 +1,26 @@
 # Smethan fork firmware
 
+## 1.8.6 — C5 handshake channel application — 2026-10-24
+
+- Accept the ESP-IDF-selected secondary channel when a managed C5 job applies a
+  5 GHz primary channel. Continue requiring the requested primary to read back
+  exactly, require no secondary channel on 2.4 GHz, and preserve driver and
+  readback errors as failures.
+- Exclude channel 144 from managed advertisements/plans, legacy serial radio
+  hops, and the no-job handshake fallback after ESP-IDF 6.0.1 returned
+  `ESP_ERR_INVALID_ARG` on the XIAO C5 when applying it. Reject selected-scope
+  handshake targets on 144 while retaining neighboring channels 140 and 149.
+  Other legacy scanner and detector channel tables are outside this handshake
+  repair and still require separate hardware verification.
+- Exercise successful 5 GHz automatic-secondary readback, wrong-primary
+  readback, SDK readback failure, unexpected 2.4 GHz secondary, and an
+  out-of-plan channel in the native job harness. Assert that active handshake
+  startup and later D-UCB hops use the checked helper.
+
+The native projectZero suite and pinned ESP-IDF 6.0.1 WROOM, XIAO, and Zero
+builds passed, including capture-stack checks. Physical acceptance is tracked
+separately; these software gates do not prove a real handshake or two-board run.
+
 ## 1.8.5 — Native USB boot and capability recovery — 2026-10-15
 
 - Avoid initializing PSRAM twice when ESP-IDF already initialized it during

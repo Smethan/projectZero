@@ -5,8 +5,15 @@ import sys
 
 
 def extract_function(source: str, signature: str) -> str:
-    start = source.index(signature)
-    brace = source.index("{", start)
+    search_from = 0
+    while True:
+        start = source.index(signature, search_from)
+        brace = source.find("{", start)
+        semicolon = source.find(";", start)
+        if brace < 0 or (semicolon >= 0 and semicolon < brace):
+            search_from = start + len(signature)
+            continue
+        break
     depth = 0
     for pos in range(brace, len(source)):
         if source[pos] == "{":
@@ -19,6 +26,22 @@ def extract_function(source: str, signature: str) -> str:
 
 
 source = Path("../../ESP32C5/main/main.c").read_text()
+
+channel_start = source.index("static const uint8_t hs_capture_default_channels[] =")
+channel_array_end = source.index("};", channel_start) + 2
+count_start = source.index(
+    "#define HS_CAPTURE_DEFAULT_CHANNEL_COUNT", channel_array_end
+)
+count_end = source.index("\n\n", count_start)
+channel_plan = (
+    source[channel_start:channel_array_end] + "\n" + source[count_start:count_end]
+)
+channel_helper = extract_function(source, "static bool hs_capture_channel_supported(")
+ducb_init = extract_function(source, "static void ducb_init(void)")
+Path(sys.argv[1], "hs_capture_plan_under_test.inc").write_text(
+    channel_plan + "\n" + channel_helper + "\n" + ducb_init + "\n"
+)
+
 body = extract_function(source, "int cmd_handshake_scope(int argc,char **argv)")
 Path(sys.argv[1], "handshake_scope_under_test.inc").write_text(body + "\n")
 

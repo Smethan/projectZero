@@ -986,7 +986,10 @@ static uint32_t request_hash(const char *data,size_t len) {
     return h?h:1;
 }
 static bool valid_channel(unsigned channel) {
-    static const uint8_t allowed[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+    /* ESP-IDF 6.0.1 on the supported XIAO C5 returns ESP_ERR_INVALID_ARG
+     * when applying channel 144. Keep it out of managed advertisements/plans,
+     * while retaining the neighboring supported channels. */
+    static const uint8_t allowed[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     bool listed=false;
     for(unsigned i=0;i<sizeof(allowed);i++) if(allowed[i]==channel) { listed=true;break; }
     if(!listed)return false;
@@ -1119,7 +1122,7 @@ sw_channel_result_t sw_job_radio_hop_checked(unsigned index) {
         return result;
     }
     static const uint8_t legacy_channels[]={1,6,11,2,3,4,5,7,8,9,10,12,13,
-        36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+        36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     uint8_t channel=job_mode?job_channels[index%job_channel_count]:legacy_channels[index%sizeof(legacy_channels)];
     return sw_job_apply_channel_checked(channel);
 }
@@ -1283,7 +1286,7 @@ static int device_info(int argc,char **argv) {
     const char *operation_limits="\"sae\":{\"targets\":1},\"sniffer\":{\"aps\":100,\"clients\":50,\"probes\":200},\"handshake\":{\"aps\":64,\"clients\":128,\"exchanges\":32}";
     const char *memory_limits="";
 #endif
-    static const uint8_t all_channels[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+    static const uint8_t all_channels[]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
     char channels[192];size_t channel_used=0;
     for(unsigned i=0;i<sizeof(all_channels);i++) {
         if(!valid_channel(all_channels[i]))continue;
@@ -1397,7 +1400,7 @@ static int job_start(int argc,char **argv) {
             job_channels[job_channel_count++]=value;
         }
     } else if(!none) {
-        static const uint8_t defaults[]={1,6,11,2,3,4,5,7,8,9,10,12,13,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
+        static const uint8_t defaults[]={1,6,11,2,3,4,5,7,8,9,10,12,13,36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165};
         for(unsigned i=0;i<sizeof(defaults);i++) if(valid_channel(defaults[i]) &&
             ((defaults[i]<=14&&(band24||both)) || (defaults[i]>14&&(band5||both)))) job_channels[job_channel_count++]=defaults[i];
     }
