@@ -26,6 +26,9 @@ bool sw_wifi_only_mode(void);
 bool sw_ble_only_mode(void);
 bool sw_stop(void);
 void sw_ble(const uint8_t *addr, uint8_t type, int rssi, uint8_t event, const uint8_t *data, size_t len);
+/* Wait until no NimBLE callback is still using this job's capture queues. */
+bool sw_ble_wait_quiescent(unsigned timeout_ms);
+void sw_ble_set_accepting(bool accepting);
 void sw_register(void);
 void sw_register_recovery(void);
 void sw_set_boot_state(bool ready, const char *reason, bool ota_available);

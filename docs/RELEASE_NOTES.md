@@ -1,5 +1,26 @@
 # Smethan fork firmware
 
+## 1.8.8 — managed BLE cleanup and capture diagnostics — 2026-10-29
+
+- Give each managed Wardrive BLE scan explicit ownership. Stop it with a checked
+  NimBLE cancellation and callback drain, then deinitialize the NimBLE host if
+  that job created it. Preserve an application-owned host and refuse a new job
+  when its scan is already active.
+- Keep the managed job and radio snapshot for a retry if BLE cancellation,
+  quiescence, or host deinitialization cannot be confirmed. Report the cleanup
+  stage instead of claiming a clean stop.
+- Emit bounded internal-memory snapshots at managed Wardrive and handshake task
+  transitions, and report `handshake_task_create_failed` when the handshake
+  worker cannot be allocated. A live XIAO diagnostic build of the preceding
+  source measured internal free memory falling from about 46 KiB to 17 KiB
+  after BLE-enabled Wardrive stopped; the next 12 KiB handshake task could not
+  be created. Wi-Fi-only Wardrive did not reproduce that failure.
+
+The native suite covers owned and borrowed BLE hosts, failed and delayed scan
+cancellation, callback quiescence, partial initialization, and stop retries.
+This release pairs with WatchDogsGo 0.10.8. The XIAO application-USB OTA and
+live repeat-run results are tracked separately from source/build checks.
+
 ## 1.8.7 — US Wi-Fi channel initialization — 2026-10-24
 
 - Set the US country at Wi-Fi initialization. Keep US 2.4 GHz channels 12–14

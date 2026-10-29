@@ -13,6 +13,8 @@ typedef struct { int filter_mask; } wifi_promiscuous_filter_t;
 #define WIFI_BAND_MODE_AUTO 1
 #define WIFI_MODE_NULL 0
 #define WIFI_SECOND_CHAN_NONE 0
+#define BLE_HS_EALREADY 1
+#define pdMS_TO_TICKS(x) (x)
 #define TAG "radio-test"
 static char last_log[160];
 #define MY_LOG_INFO(tag,fmt,...) snprintf(last_log,sizeof(last_log),fmt,##__VA_ARGS__)
@@ -27,21 +29,49 @@ static bool stale_channel_readback;
 static uint8_t test_channel=6;
 static unsigned set_channel_calls;
 static int nimble_result,scan_result;
+static bool scan_active,ble_quiescent=true,nimble_deinit_ok=true,partial_nimble_after_failed_init,scan_cancel_stuck;
+static bool ble_accepting;
+static int scan_cancel_result;
+static unsigned cancel_delay_polls;
 static unsigned get_band_calls,get_filter_calls,get_mode_calls,set_mode_calls,set_band_calls;
 static unsigned set_filter_calls,set_promisc_off_calls,set_cb_null_calls,bt_stop_calls;
-static unsigned nimble_calls,scan_calls;
+static unsigned nimble_calls,scan_calls,scan_cancel_calls,nimble_deinit_calls,ble_quiescence_calls;
 static int last_set_mode,last_set_band,last_filter_mask;
 static wifi_promiscuous_filter_t original_filter={.filter_mask=0x5a};
 static bool ensure_wifi_mode(void) { return ensure_wifi_ok; }
 static bool sw_wifi_only_mode(void) { return wifi_only || passive_hs || (job_mode && !collect_ble); }
 static bool sw_ble_only_mode(void) { return job_mode && !collect_wifi && collect_ble; }
 static void bt_stop_scan(void) { bt_stop_calls++; }
+static bool sw_ble_wait_quiescent(unsigned timeout_ms) {
+    (void)timeout_ms;ble_quiescence_calls++;return ble_quiescent;
+}
+static void sw_ble_set_accepting(bool accepting) { ble_accepting=accepting; }
+static int ble_gap_disc_active(void) { return scan_active?1:0; }
+static int ble_gap_disc_cancel(void) {
+    scan_cancel_calls++;
+    if(!scan_cancel_result&&!scan_cancel_stuck&&!cancel_delay_polls)scan_active=false;
+    return scan_cancel_result;
+}
+static void vTaskDelay(unsigned ticks) {
+    (void)ticks;
+    if(cancel_delay_polls && --cancel_delay_polls==0 && !scan_cancel_stuck)scan_active=false;
+}
+static bool bt_nimble_deinit(void) {
+    nimble_deinit_calls++;
+    if(!nimble_deinit_ok)return false;
+    nimble_initialized=false;return true;
+}
 static esp_err_t bt_nimble_init(void) {
     nimble_calls++;
-    if(nimble_result==ESP_OK)nimble_initialized=true;
+    if(nimble_result==ESP_OK || partial_nimble_after_failed_init)nimble_initialized=true;
     return nimble_result;
 }
-static int bt_start_scan_coex(void) { scan_calls++; return scan_result; }
+static int bt_start_scan_coex(void) {
+    scan_calls++;
+    if(scan_active)return -1;
+    if(scan_result==0)scan_active=true;
+    return scan_result;
+}
 static esp_err_t esp_wifi_get_band_mode(wifi_band_mode_t *value) {
     get_band_calls++; if(fail_get_band)return fail_get_band; *value=7; return ESP_OK;
 }
@@ -96,11 +126,16 @@ static void reset_fixture(void) {
     fail_set_mode=fail_restore_mode=fail_set_band=fail_restore_channel=0;
     stale_channel_readback=false;test_channel=6;set_channel_calls=0;
     nimble_result=scan_result=ESP_OK;
+    scan_active=false;scan_cancel_stuck=false;scan_cancel_result=0;cancel_delay_polls=0;
+    ble_quiescent=nimble_deinit_ok=true;partial_nimble_after_failed_init=false;ble_accepting=false;
     get_band_calls=get_filter_calls=get_mode_calls=set_mode_calls=set_band_calls=0;
     set_filter_calls=set_promisc_off_calls=set_cb_null_calls=bt_stop_calls=0;
     nimble_calls=scan_calls=0;last_set_mode=last_set_band=last_filter_mask=0;
+    scan_cancel_calls=nimble_deinit_calls=ble_quiescence_calls=0;
     last_log[0]=0;sw_saved_radio=false;sw_saved_mode_changed=false;
     sw_channel_restore_pending=false;
+    sw_nimble_owned=sw_ble_scan_owned=false;
+    sw_ble_cleanup_error_reported=sw_nimble_cleanup_error_reported=false;
 }
 
 static void assert_restored(bool restore_mode) {
@@ -148,18 +183,26 @@ int main(void) {
     reset_fixture(); nimble_result=41;
     assert(!sw_radio_start() && strstr(last_log,"nimble_init: 41") && sw_saved_radio);
     assert(nimble_calls==1 && !scan_calls);
-    assert(sw_saved_mode_changed);sw_radio_stop(); assert_restored(true);
+    assert(sw_saved_mode_changed);assert(sw_radio_stop()); assert(nimble_deinit_calls==1 && !nimble_initialized);assert_restored(true);
+
+    reset_fixture();nimble_result=41;partial_nimble_after_failed_init=true;nimble_deinit_ok=false;
+    assert(!sw_radio_start() && sw_saved_radio && nimble_initialized);
+    assert(!sw_radio_stop() && sw_saved_radio && sw_nimble_owned);
+    nimble_deinit_ok=true;assert(sw_radio_stop() && !sw_saved_radio && !sw_nimble_owned);
+    assert(nimble_deinit_calls==2);
 
     reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;scan_result=-7;
     assert(!sw_radio_start() && strstr(last_log,"ble_scan_coex: -7") && sw_saved_radio);
     assert(nimble_calls==1 && scan_calls==1 && nimble_initialized);
-    assert(sw_saved_mode_changed);sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(true);
+    scan_cancel_result=BLE_HS_EALREADY;
+    assert(sw_saved_mode_changed);assert(sw_radio_stop());
+    assert(scan_cancel_calls==1 && ble_quiescence_calls==1 && nimble_deinit_calls==1 && !nimble_initialized);assert_restored(true);
 
     reset_fixture(); wifi_only=true; nimble_initialized=true;
     assert(sw_radio_start());
-    assert(!nimble_calls && !scan_calls && bt_stop_calls==1);
+    assert(!nimble_calls && !scan_calls && bt_stop_calls==0);
     test_channel=11; /* Radio hopping changed the channel after the snapshot. */
-    sw_radio_stop(); assert_restored(true);
+    assert(sw_radio_stop()); assert(nimble_initialized && !nimble_deinit_calls && !scan_cancel_calls);assert_restored(true);
 
     reset_fixture(); wifi_only=true;
     assert(sw_radio_start());test_channel=11;fail_restore_channel=88;
@@ -173,13 +216,58 @@ int main(void) {
 
     reset_fixture(); ble_only=true;
     assert(sw_radio_start());
-    assert(nimble_calls==1 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL);
-    sw_radio_stop(); assert(bt_stop_calls==1); assert_restored(true);
+    assert(nimble_calls==1 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL && ble_accepting);
+    assert(sw_radio_stop()); assert(scan_cancel_calls==1 && nimble_deinit_calls==1 && !nimble_initialized);assert_restored(true);
+    assert(!ble_accepting);
 
     reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;nimble_initialized=true;
     assert(sw_radio_start());
-    assert(nimble_calls==1 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL && bt_stop_calls==1);
-    assert(sw_saved_mode_changed);sw_radio_stop(); assert(bt_stop_calls==2); assert_restored(true);
+    assert(nimble_calls==0 && scan_calls==1 && last_set_mode==WIFI_MODE_NULL && bt_stop_calls==0);
+    assert(sw_saved_mode_changed);assert(sw_radio_stop());
+    assert(scan_cancel_calls==1 && nimble_deinit_calls==0 && nimble_initialized);assert_restored(true);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start() && sw_ble_scan_owned && sw_nimble_owned);
+    scan_cancel_result=17;
+    assert(!sw_radio_stop() && sw_saved_radio && sw_ble_scan_owned && sw_nimble_owned);
+    assert(!ble_quiescence_calls && !nimble_deinit_calls);
+    scan_cancel_result=0;
+    assert(sw_radio_stop() && !sw_saved_radio && !sw_ble_scan_owned && !sw_nimble_owned);
+    assert(scan_cancel_calls==2 && ble_quiescence_calls==1 && nimble_deinit_calls==1 && !nimble_initialized);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start());ble_quiescent=false;
+    assert(!sw_radio_stop() && sw_saved_radio && sw_ble_scan_owned && sw_nimble_owned);
+    assert(!nimble_deinit_calls);
+    ble_quiescent=true;
+    assert(sw_radio_stop() && !sw_saved_radio && !sw_ble_scan_owned && !sw_nimble_owned);
+    assert(ble_quiescence_calls==2 && nimble_deinit_calls==1);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start());cancel_delay_polls=2;
+    assert(sw_radio_stop() && !scan_active && scan_cancel_calls==1);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start());scan_cancel_stuck=true;
+    unsigned mode_calls_before= set_mode_calls,band_calls_before=set_band_calls;
+    assert(!sw_radio_stop() && sw_saved_radio && sw_ble_scan_owned && sw_nimble_owned);
+    assert(set_mode_calls==mode_calls_before && set_band_calls==band_calls_before);
+    scan_cancel_stuck=false;scan_active=false;
+    assert(sw_radio_stop() && !sw_saved_radio);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;
+    assert(sw_radio_start());nimble_deinit_ok=false;
+    unsigned mode_before_deinit=set_mode_calls,band_before_deinit=set_band_calls;
+    assert(!sw_radio_stop() && sw_saved_radio && !sw_ble_scan_owned && sw_nimble_owned);
+    assert(set_mode_calls==mode_before_deinit && set_band_calls==band_before_deinit);
+    nimble_deinit_ok=true;
+    assert(sw_radio_stop() && !sw_saved_radio && !sw_nimble_owned && !nimble_initialized);
+    assert(scan_cancel_calls==1 && nimble_deinit_calls==2);
+
+    reset_fixture();job_mode=true;collect_wifi=true;collect_ble=true;nimble_initialized=true;scan_active=true;
+    assert(!sw_radio_start() && scan_active && !sw_ble_scan_owned && !sw_nimble_owned);
+    assert(!sw_saved_radio && !set_mode_calls && !set_band_calls);
+    assert(sw_radio_stop() && scan_active && !scan_cancel_calls && !nimble_deinit_calls);
 
     reset_fixture(); job_mode=true;collect_wifi=true;collect_ble=true;
     assert(sw_radio_start());fail_restore_mode=77;assert(!sw_radio_stop());

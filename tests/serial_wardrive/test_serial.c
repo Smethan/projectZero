@@ -5,8 +5,8 @@ static bool radio_ok=true, prepare_ok=true;
 static int stopped_radios, hops, prepare_calls;
 static bool inject_live, fail_hop;
 bool sw_prepare(void){prepare_calls++;return prepare_ok;}
-bool sw_radio_start(void){return radio_ok;}
-bool sw_radio_stop(void){stopped_radios++;return true;}
+bool sw_radio_start(void){sw_ble_set_accepting(!sw_wifi_only_mode());return radio_ok;}
+bool sw_radio_stop(void){sw_ble_set_accepting(false);stopped_radios++;return true;}
 bool sw_radio_hop(unsigned i){
     hops++;
     if(inject_live && atomic_load(&collecting)) {
@@ -189,6 +189,7 @@ int main(void){
     assert(strstr(output_capture,"wifi_mgmt"));assert(!strstr(output_capture,"\"kind\":\"wifi\""));
     xQueueReset(queue);beacon(8,20);assert(!uxQueueMessagesWaiting(queue));
     uint8_t a[]={1,0,0,0,0,0xc2},ad[]={4,9,'a','b','c'};
+    sw_ble_set_accepting(true); /* Production radio start opens the scan gate. */
     sw_ble(a,1,-60,0,ad,sizeof(ad));assert(xQueueReceive(queue,&o,0));emit(&o);
     assert(strstr(output_capture,"C2:00:00:00:00:01"));
     sw_ble(a,1,-61,0,ad,sizeof(ad));assert(!uxQueueMessagesWaiting(queue)); /* RSSI-only repeat */
@@ -200,6 +201,10 @@ int main(void){
     transport_limit=0;old=atomic_load(&drops);unsigned old_output=atomic_load(&loss_output);status("stats","");assert(atomic_load(&drops)==old+1 && atomic_load(&loss_output)==old_output+1);
     fresh();test_task(NULL);assert(!sw_active());assert(hops>0 && stopped_radios>0);
     assert(strstr(output_capture,"started") && strstr(output_capture,"stats") && strstr(output_capture,"stopped"));
+    unsigned stopped_ble_count=atomic_load(&ble_count);
+    uint8_t late_addr[]={1,0,0,0,0,0xc2},late_ad[]={4,9,'a','b','c'};
+    sw_ble(late_addr,1,-60,0,late_ad,sizeof(late_ad)); /* Late callback after queue teardown. */
+    assert(!atomic_load(&ble_callbacks) && atomic_load(&ble_count)==stopped_ble_count);
     fresh();fail_hop=true;test_task(NULL);fail_hop=false;
     assert(!sw_active() && strstr(output_capture,"channel_apply_failed") && strstr(output_capture,"stopped"));
     fresh();radio_ok=false;test_task(NULL);assert(!strstr(output_capture,"started"));assert(strstr(output_capture,"error") && strstr(output_capture,"stopped"));
@@ -251,6 +256,7 @@ int main(void){
     test_task(NULL);assert(!sw_active() && !heap_live && !hs_pool.ready);
     assert(strstr(output_capture,"radio_start_failed") && strstr(output_capture,"stopped"));
     fresh();assert(!sw_hs_mode());atomic_store(&stopping,true);test_task(NULL);
+    sw_ble_set_accepting(false); /* Wi-Fi-only mode must drop BLE observations. */
     char *wifi_args[]={"start_wardrive_wifi_serial","host-ble"};
     assert(start(2,wifi_args)==0 && sw_wifi_only_mode() && !sw_hs_mode());
     atomic_store(&collecting,true);output_capture[0]=0;

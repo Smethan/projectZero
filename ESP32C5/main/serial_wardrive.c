@@ -154,6 +154,8 @@ typedef struct {
 static capture_pool_t hs_pool;
 static unsigned packet_id;
 static atomic_uint drops, wifi_count, ble_count, producers;
+static atomic_uint ble_callbacks;
+static atomic_bool ble_accepting;
 static atomic_uint loss_queue, loss_age, loss_output, loss_saturation;
 static atomic_llong lease;
 static StaticQueue_t queue_storage;
@@ -457,11 +459,22 @@ static const char *wifi_auth_label(const observation *o) {
     }
 }
 void sw_ble(const uint8_t *addr,uint8_t type,int rssi,uint8_t event,const uint8_t *data,size_t len) {
-    if (sw_wifi_only_mode() || !collect_ble) return;
-    observation o={.kind=2,.addr_type=type,.rssi=rssi,.event=event,.len=len>62?62:len};
-    for(int i=0;i<6;i++) o.addr[i]=addr[5-i]; /* NimBLE is little-endian */
-    memcpy(o.data,data,o.len); atomic_fetch_add(&ble_count,1); offer(&o);
+    atomic_fetch_add(&ble_callbacks,1);
+    if (atomic_load(&ble_accepting) && !sw_wifi_only_mode() && collect_ble) {
+        observation o={.kind=2,.addr_type=type,.rssi=rssi,.event=event,.len=len>62?62:len};
+        for(int i=0;i<6;i++) o.addr[i]=addr[5-i]; /* NimBLE is little-endian */
+        memcpy(o.data,data,o.len); atomic_fetch_add(&ble_count,1); offer(&o);
+    }
+    atomic_fetch_sub(&ble_callbacks,1);
 }
+bool sw_ble_wait_quiescent(unsigned timeout_ms) {
+    for(unsigned waited=0;;) {
+        if(!atomic_load(&ble_callbacks))return true;
+        if(waited>=timeout_ms)return false;
+        vTaskDelay(pdMS_TO_TICKS(10));waited+=10;
+    }
+}
+void sw_ble_set_accepting(bool accepting) { atomic_store(&ble_accepting,accepting); }
 static ZERO_STACK_NOINLINE void emit_version(const observation *o,unsigned version,unsigned batch) {
     int64_t age=now_ms()-o->at;
     if(age>(version==2?20000:2000)) { note_loss(&loss_age,1); return; }

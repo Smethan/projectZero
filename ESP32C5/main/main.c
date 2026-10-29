@@ -167,7 +167,7 @@ static int stop_operations(bool reset_wifi);
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.7"
+#define JANOS_VERSION "1.8.8"
 
 #define OTA_GITHUB_OWNER "Smethan"
 #define OTA_GITHUB_REPO "projectZero"
@@ -2856,6 +2856,7 @@ static void ota_led_stop(void);
 static esp_err_t wifi_init_ap_sta(void);
 static esp_err_t bt_nimble_init(void);
 static bool bt_nimble_deinit(void);
+static bool bt_scan_cancel_and_wait(unsigned timeout_ms);
 static void bt_reset_counters(void);
 static void bt_format_addr(const uint8_t *addr, char *str);
 static int bt_start_scan(void);
@@ -7495,6 +7496,29 @@ static wifi_mode_t sw_saved_mode;
 static uint8_t sw_saved_channel;
 static wifi_second_chan_t sw_saved_second;
 static bool sw_channel_restore_pending;
+/* A serial job may borrow an application-owned NimBLE host. Resources it
+ * creates itself stay owned until scan cancellation and host deinit complete. */
+static bool sw_nimble_owned, sw_ble_scan_owned;
+static bool sw_ble_cleanup_error_reported, sw_nimble_cleanup_error_reported;
+
+/* In pinned NimBLE, explicit cancel is synchronous and does not emit
+ * DISC_COMPLETE. EALREADY means idle. Confirm no scan remains before cleanup. */
+static bool bt_scan_cancel_and_wait(unsigned timeout_ms)
+{
+    int rc=ble_gap_disc_cancel();
+    if(rc!=0 && rc!=BLE_HS_EALREADY) {
+        MY_LOG_INFO(TAG,"BLE scan cancel failed: %d",rc);
+        return false;
+    }
+    for(unsigned waited=0;;) {
+        if(!ble_gap_disc_active())return true;
+        if(waited>=timeout_ms)break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited+=20;
+    }
+    MY_LOG_INFO(TAG,"BLE scan remained active after cancel");
+    return false;
+}
 bool sw_radio_start(void) {
     /* Console ownership gate prevents new operations during this transition. */
     if (wardrive_active || wardrive_promisc_active || bt_scan_active ||
@@ -7502,12 +7526,19 @@ bool sw_radio_start(void) {
         MY_LOG_INFO(TAG, "Serial radio start failed at busy-operation gate");
         return false;
     }
+    sw_ble_set_accepting(false);
     if(sw_saved_radio) {
         sw_radio_stop();
         if(sw_saved_radio) {
             MY_LOG_INFO(TAG, "Serial radio start failed at pending radio restore");
             return false;
         }
+    }
+    /* Do not perturb Wi-Fi/radio state while an existing BLE owner is
+     * scanning. This capture cannot borrow an in-progress discovery. */
+    if(!sw_wifi_only_mode() && nimble_initialized && ble_gap_disc_active()) {
+        MY_LOG_INFO(TAG,"Serial radio start refused: BLE scan already owned");
+        return false;
     }
     if (!ensure_wifi_mode()) {
         MY_LOG_INFO(TAG, "Serial radio start failed at ensure_wifi_mode");
@@ -7536,10 +7567,10 @@ bool sw_radio_start(void) {
     sw_saved_radio = true;
     sw_saved_mode_changed = false;
     sw_channel_restore_pending = false;
+    sw_ble_cleanup_error_reported=sw_nimble_cleanup_error_reported=false;
     /* Serial capture jobs are receive-only, including combined Wi-Fi/BLE.
      * Drop STA/AP allocations and traffic before starting the shared-radio
      * BLE scan; sw_radio_stop restores the mode we saved above. */
-    if (nimble_initialized) bt_stop_scan();
     ret=esp_wifi_set_mode(WIFI_MODE_NULL);
     if(ret!=ESP_OK) {
         MY_LOG_INFO(TAG, "Serial radio start failed at set_null_mode: %d", ret);
@@ -7552,14 +7583,30 @@ bool sw_radio_start(void) {
         MY_LOG_INFO(TAG, "Serial radio start failed at set_auto_band: %d", ret);
         return false;
     }
+    sw_nimble_owned=false;
+    sw_ble_scan_owned=false;
     if (sw_wifi_only_mode()) return true;
-    ret=bt_nimble_init();
-    if(ret!=ESP_OK) {
-        MY_LOG_INFO(TAG, "Serial radio start failed at nimble_init: %d", ret);
+    if(!nimble_initialized) {
+        /* Mark ownership before init so partial init/sync failures are cleaned
+         * up by the same retryable stop path. */
+        sw_nimble_owned=true;
+        ret=bt_nimble_init();
+        if(ret!=ESP_OK) {
+            MY_LOG_INFO(TAG, "Serial radio start failed at nimble_init: %d", ret);
+            return false;
+        }
+    }
+    /* A scan already active on a borrowed host belongs to its existing owner.
+     * Refuse this capture instead of canceling or replacing that scan. */
+    if(ble_gap_disc_active()) {
+        MY_LOG_INFO(TAG,"Serial radio start refused: BLE scan already owned");
         return false;
     }
+    sw_ble_set_accepting(true);
+    sw_ble_scan_owned=true;
     int scan_rc=bt_start_scan_coex();
     if(scan_rc!=0) {
+        sw_ble_set_accepting(false);
         MY_LOG_INFO(TAG, "Serial radio start failed at ble_scan_coex: %d", scan_rc);
         return false;
     }
@@ -7576,10 +7623,37 @@ bool sw_radio_hop(unsigned index) {
 }
 bool sw_radio_stop(void) {
     if (!sw_saved_radio) return true;
+    sw_ble_set_accepting(false);
+    /* Keep the saved radio snapshot and job token if a capture scan cannot be
+     * proven quiescent. Do not restore Wi-Fi underneath a possibly active BLE
+     * scan; the worker retries this entire stop path. */
+    if(sw_ble_scan_owned) {
+        if(!bt_scan_cancel_and_wait(2000) || !sw_ble_wait_quiescent(2000)) {
+            MY_LOG_INFO(TAG,"Serial radio restore failed at BLE scan quiescence");
+            if(sw_job_owned()&&!sw_ble_cleanup_error_reported) {
+                sw_job_emit_lifecycle("error","stopping","\"message\":\"ble_scan_cleanup_pending\"");
+                sw_ble_cleanup_error_reported=true;
+            }
+            return false;
+        }
+        sw_ble_scan_owned=false;
+        sw_ble_cleanup_error_reported=false;
+    }
+    if(sw_nimble_owned) {
+        if(!bt_nimble_deinit()) {
+            MY_LOG_INFO(TAG,"Serial radio restore failed at NimBLE deinit");
+            if(sw_job_owned()&&!sw_nimble_cleanup_error_reported) {
+                sw_job_emit_lifecycle("error","stopping","\"message\":\"ble_host_cleanup_pending\"");
+                sw_nimble_cleanup_error_reported=true;
+            }
+            return false;
+        }
+        sw_nimble_owned=false;
+        sw_nimble_cleanup_error_reported=false;
+    }
     bool restored=true;
     if(esp_wifi_set_promiscuous(false)!=ESP_OK)restored=false;
     if(esp_wifi_set_promiscuous_rx_cb(NULL)!=ESP_OK)restored=false;
-    if (nimble_initialized) bt_stop_scan();
     if(esp_wifi_set_promiscuous_filter(&sw_saved_filter)!=ESP_OK)restored=false;
     if(esp_wifi_set_band_mode(sw_saved_band)!=ESP_OK)restored=false;
     if(sw_saved_mode_changed) {
@@ -13566,7 +13640,8 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
 static bool serial_job_radio_busy_probe(void)
 {
     wifi_ap_record_t connected;
-    return zig_recon_radio_busy(NULL, 0) || zig_recon_is_active() ||
+    return bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL ||
+        zig_recon_radio_busy(NULL, 0) || zig_recon_is_active() ||
         g_scan_in_progress || g_scan_cancel_pending || wifi_connect_attempt_active ||
         esp_wifi_sta_get_ap_info(&connected) == ESP_OK || portal_connected_clients > 0 ||
         sniffer_active || sniffer_setup_task_handle || sniffer_channel_task_handle ||
@@ -21617,6 +21692,7 @@ static void bt_stop_scan(void)
     ble_gap_disc_cancel();
 }
 
+
 /**
  * NimBLE host sync callback
  */
@@ -21732,9 +21808,10 @@ static bool bt_nimble_deinit(void)
     // Stop any active scanning
     bt_scan_active = false;
     bt_airtag_scan_active = false;
-    if(nimble_initialized)bt_stop_scan();
-    
-    // Wait for scan task to finish
+    if(nimble_initialized &&
+       (!bt_scan_cancel_and_wait(2000) || !sw_ble_wait_quiescent(2000)))return false;
+
+    // Wait for application-owned scanner task to finish before host stop.
     if (bt_scan_task_handle != NULL) {
         for (int i = 0; i < 20 && bt_scan_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
