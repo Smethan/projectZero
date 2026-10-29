@@ -9516,6 +9516,7 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
     MY_LOG_INFO(TAG, "Python app will parse and save .pcapng/.hccapx files automatically");
 
     // Start handshake attack task
+    if(sw_job_owned()) sw_job_emit_memory_snapshot("handshake_task_create");
     handshake_attack_active = true;
     BaseType_t result = xTaskCreate(
         handshake_attack_task,
@@ -9531,6 +9532,7 @@ static int start_handshake_scoped(bool serial_storage,const hs_target_set *scope
         handshake_attack_active = false;
         handshake_serial_mode = false;
         memset(&handshake_scope,0,sizeof(handshake_scope));
+        if(sw_job_owned()) (void)sw_job_fail_start(sw_job_token(),"handshake_task_create_failed");
         if(!hs_radio_restore() && sw_job_owned())
             (void)sw_job_fail_start(sw_job_token(),"radio_restore_failed");
         return 1;

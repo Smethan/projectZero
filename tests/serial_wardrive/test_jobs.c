@@ -86,6 +86,17 @@ int main(void) {
     output_capture[0]=0;
     assert(capabilities(1,NULL)==0 && strstr(output_capture,"\"c5_jobs_v1\":false") &&
            !strstr(output_capture,"wardrive_serial_v1"));
+    job_mode=true;snprintf(job_token,sizeof(job_token),"task-create-fail");
+    atomic_store(&external_job_starting,true);output_capture[0]=0;
+    assert(sw_job_fail_start(job_token,"handshake_task_create_failed"));
+    assert(strstr(output_capture,"\"message\":\"operation_start_failed\",\"start_reason\":\"handshake_task_create_failed\""));
+    assert(json_record_length()<=1000);
+    output_capture[0]=0;
+    sw_job_emit_memory_snapshot("handshake_task_create");
+    assert(strstr(output_capture,"\"message\":\"memory_snapshot\",\"stage\":\"handshake_task_create\""));
+    assert(strstr(output_capture,"\"internal_free\":") && strstr(output_capture,"\"internal_largest\":"));
+    assert(json_record_length()<=1000);
+    job_mode=false;atomic_store(&external_job_starting,false);atomic_store(&external_job_stopping,false);
     unsigned initializing_prepares=prepare_calls;
     char *initializing_job[]={"job_start","boot-gate","invalid"};
     output_capture[0]=0;
@@ -189,6 +200,10 @@ int main(void) {
     unsigned prepares_before_nonce=prepare_calls;
     output_capture[0]=0;
     assert(submit_boot("A1B2C3D4E5F60789","nonce-upper","handshake","wifi24","off","[6]",TARGET,"[]",SELECTED)==0);
+    assert(strstr(output_capture,"\"message\":\"memory_snapshot\",\"stage\":\"supervisor_create\""));
+    assert(strstr(output_capture,"\"internal_free\":") && strstr(output_capture,"\"internal_largest\":") &&
+           strstr(output_capture,"\"psram_free\":"));
+    assert(json_record_length()<=1000);
     assert(custom_starts==starts_before_nonce+1 && external_job_active);
     char *nonce_stop[]={"job_stop","nonce-upper"};
     test_auto_schedule=true;
@@ -210,7 +225,9 @@ int main(void) {
         assert(strstr(output_capture,"invalid_request") && !sw_active() && !heap_live);
     }
     assert(custom_starts==starts_before_nonce+2 && prepare_calls==prepares_before_nonce);
+    output_capture[0]=0;
     assert(submit("rx","wardrive","wifi24","off","[6]","[]","[]",ALL)==0);
+    assert(strstr(output_capture,"\"message\":\"memory_snapshot\",\"stage\":\"wardrive_start\""));
     assert(sw_active() && sw_wifi_only_mode() && prepare_calls==1);
     char *rx_status[]={"job_status","rx"};output_capture[0]=0;
     assert(job_status(2,rx_status)==0 && strstr(output_capture,"\"state\":\"starting\""));
@@ -229,7 +246,8 @@ int main(void) {
     assert(sw_active() && sw_job_owner_matches("rx"));
     output_capture[0]=0;test_task(NULL); /* lease expiry in production worker */
     assert(!sw_active() && !sw_job_owned() && !heap_live && radio_stops==1);
-    assert(strstr(output_capture,"\"kind\":\"started\"") && strstr(output_capture,"\"kind\":\"stopped\""));
+    assert(strstr(output_capture,"\"kind\":\"started\"") && strstr(output_capture,"\"kind\":\"stopped\"") &&
+           strstr(output_capture,"\"message\":\"memory_snapshot\",\"stage\":\"wardrive_stop\""));
     output_capture[0]=0;
     assert(submit("hs","hs_sniff","wifi24","off","[6]","[]","[]",ALL)==0);
     test_task(NULL);assert(!sw_active() && !heap_live);

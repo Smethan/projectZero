@@ -72,6 +72,8 @@ unsigned sw_job_dwell_ms(void);
 void sw_job_emit_data(const char *data_kind, const char *json_fields);
 void sw_job_emit_legacy_line(const char *line);
 void sw_job_emit_lifecycle(const char *kind, const char *state, const char *json_fields);
+/* Emit a bounded heap snapshot on the managed v3 stream at lifecycle edges. */
+void sw_job_emit_memory_snapshot(const char *stage);
 void sw_job_remember_terminal(void);
 /* Account a managed-operation capacity drop in the v3 losses object. */
 void sw_job_note_saturation(void);

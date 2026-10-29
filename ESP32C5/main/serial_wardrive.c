@@ -835,6 +835,7 @@ static ZERO_STACK_NOINLINE void worker(void *unused) {
         unsigned discarded=uxQueueMessagesWaiting(queue);
         note_loss(&loss_queue,discarded); xQueueReset(queue);
     }
+    if(job_mode) sw_job_emit_memory_snapshot("wardrive_stop");
     if(batch_mode) {
         atomic_store(&batch_phase,0);
         batch_close();
@@ -899,6 +900,7 @@ static int start(int argc,char **argv) {
         return 1;
     }
     atomic_store(&lease,now_ms()); atomic_store(&stopping,false); atomic_store(&radio_ready,false); atomic_store(&active,true);
+    if(job_mode) sw_job_emit_memory_snapshot("wardrive_start");
     if(xTaskCreate(worker,"serial_wardrive",6144,NULL,4,NULL)!=pdPASS) {
         capture_pool_close(&hs_pool);
         batch_close();
@@ -1230,6 +1232,16 @@ ZERO_STACK_NOINLINE void sw_job_emit_lifecycle(const char *kind,const char *stat
         atomic_load(&loss_queue),atomic_load(&loss_age),atomic_load(&loss_output),atomic_load(&loss_saturation),state,sniffer_fields,json_fields&&*json_fields?",":"",json_fields?json_fields:"");
     if(n<=0 || n>=(int)sizeof(line) || !serial_record_write(line,n,true))note_loss(&loss_output,1);
 }
+void sw_job_emit_memory_snapshot(const char *stage) {
+    if(!job_mode || !stage) return;
+    char fields[192];
+    snprintf(fields,sizeof(fields),"\"message\":\"memory_snapshot\",\"stage\":\"%s\",\"internal_free\":%u,\"internal_largest\":%u,\"psram_free\":%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    sw_job_emit_lifecycle("status",job_current_state(),fields);
+}
 void sw_job_remember_terminal(void) { if(job_mode) remember_terminal_job(job_token,job_request_hash); }
 static void finalize_external_host_stop(void) {
     bool expected=true;
@@ -1516,6 +1528,7 @@ static int job_start(int argc,char **argv) {
         snprintf(active_job_operation,sizeof(active_job_operation),"%s",operation);
         /* Allocate the lease/cleanup supervisor before any operation can touch
            the radio. It waits behind external_job_ready until start succeeds. */
+        sw_job_emit_memory_snapshot("supervisor_create");
         if(xTaskCreate(external_job_supervisor,"job_supervisor",6144,NULL,3,&external_supervisor_task)!=pdPASS) {
             external_supervisor_task=NULL; job_mode=false;
             atomic_store(&external_job_starting,false);
